@@ -28,7 +28,7 @@ impl Session {
         tracing::info!("Prefill: {} tokens", tokens.len());
         // TODO: implement forward pass via Metal graph
         self.tokens.extend_from_slice(tokens);
-        self.pos = tokens.len() as u32;
+        self.pos = self.tokens.len() as u32;
         Ok(vec![0.0; self.engine.config.n_vocab as usize])
     }
 

@@ -51,15 +51,14 @@ fn main() -> Result<()> {
 
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
-            write!(handle, "{}", engine.tokenizer.decode(token))?;
 
-            for _ in 1..args.max_tokens {
+            for _ in 0..args.max_tokens {
                 if token == engine.tokenizer.eos_token() {
                     break;
                 }
+                write!(handle, "{}", engine.tokenizer.decode(token))?;
                 let logits = session.eval_token(token)?;
                 token = Session::argmax(&logits);
-                write!(handle, "{}", engine.tokenizer.decode(token))?;
             }
             writeln!(handle)?;
         }
