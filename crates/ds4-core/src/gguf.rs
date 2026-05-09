@@ -32,7 +32,7 @@ impl Value {
     pub fn to_u32(&self) -> Option<u32> {
         match self {
             Self::U32(v) => Some(*v),
-            Self::U64(v) => Some(*v as u32),
+            Self::U64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -237,8 +237,10 @@ impl GgufContent {
         }
 
         // Read tensor count and metadata KV count
-        let tensor_count = read_u64(&mut cursor)? as usize;
-        let metadata_kv_count = read_u64(&mut cursor)? as usize;
+        let tensor_count = usize::try_from(read_u64(&mut cursor)?)
+            .map_err(|_| anyhow::anyhow!("tensor_count overflows usize"))?;
+        let metadata_kv_count = usize::try_from(read_u64(&mut cursor)?)
+            .map_err(|_| anyhow::anyhow!("metadata_kv_count overflows usize"))?;
 
         // Parse metadata
         let mut metadata = HashMap::new();
@@ -322,16 +324,20 @@ impl GgufMmap {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' not found"))?;
 
-        let start = self
-            .content
-            .data_offset
-            .checked_add(info.offset)
-            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' offset overflow"))?
-            as usize;
+        let start = usize::try_from(
+            self.content
+                .data_offset
+                .checked_add(info.offset)
+                .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' offset overflow"))?,
+        )
+        .map_err(|_| anyhow::anyhow!("Tensor '{name}' offset overflows usize"))?;
         let elem_count = info
             .dims
             .iter()
-            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+            .try_fold(1usize, |acc, &d| {
+                let d_usize = usize::try_from(d).ok()?;
+                acc.checked_mul(d_usize)
+            })
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' dimensions overflow"))?;
         let size = ggml_tensor_nbytes(elem_count, info.dtype)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' byte size overflow"))?;
@@ -360,7 +366,8 @@ fn read_u64(r: &mut Cursor<&[u8]>) -> Result<u64> {
 }
 
 fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
-    let len = read_u64(r)? as usize;
+    let len = usize::try_from(read_u64(r)?)
+        .map_err(|_| anyhow::anyhow!("String length overflows usize"))?;
     if len > MAX_GGUF_STRING_LEN {
         bail!("String too long: {len} bytes");
     }
@@ -370,6 +377,15 @@ fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
 }
 
 fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
+    read_value_inner(r, value_type, 0)
+}
+
+const MAX_ARRAY_DEPTH: usize = 16;
+
+fn read_value_inner(r: &mut Cursor<&[u8]>, value_type: u32, depth: usize) -> Result<Value> {
+    if depth > MAX_ARRAY_DEPTH {
+        bail!("Array nesting too deep (>{MAX_ARRAY_DEPTH})");
+    }
     match value_type {
         0 => Ok(Value::U8({
             let mut b = [0u8; 1];
@@ -405,14 +421,15 @@ fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
         })),
         8 => Ok(Value::String(read_string(r)?)),
         9 => {
-            let arr_type = read_u32(r)?;
-            let arr_len = read_u64(r)? as usize;
-            if arr_len > MAX_GGUF_ARRAY_LEN {
-                bail!("Array too long: {arr_len} elements");
+            let inner_type = read_u32(r)?;
+            let inner_len = usize::try_from(read_u64(r)?)
+                .map_err(|_| anyhow::anyhow!("Array length overflows usize"))?;
+            if inner_len > MAX_GGUF_ARRAY_LEN {
+                bail!("Array too long: {inner_len} elements");
             }
-            let mut arr = Vec::with_capacity(arr_len);
-            for _ in 0..arr_len {
-                arr.push(read_value(r, arr_type)?);
+            let mut arr = Vec::with_capacity(inner_len);
+            for _ in 0..inner_len {
+                arr.push(read_value_inner(r, inner_type, depth + 1)?);
             }
             Ok(Value::Array(arr))
         }

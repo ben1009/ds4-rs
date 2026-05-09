@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use ds4_core::engine::Engine;
 use ds4_core::session::Session;
 
-/// ds4-rs: DeepSeek V4 Flash inference engine for Apple Metal
+/// ds4-rs: DeepSeek V4 Flash inference engine for Linux
 #[derive(Parser)]
 #[command(name = "ds4", version)]
 struct Args {
@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     match args.prompt {
         Some(prompt) => {
             let mut session = Session::new(engine.clone(), args.ctx)?;
-            let tokens = engine.tokenizer.encode(&prompt);
+            let tokens = engine.tokenizer.encode(&prompt, true);
             tracing::info!("Prompt: {} tokens", tokens.len());
 
             let logits = session.prefill(&tokens)?;

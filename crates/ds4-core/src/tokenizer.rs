@@ -118,24 +118,38 @@ impl Tokenizer {
     }
 
     /// Encode text into token IDs using BPE.
-    pub fn encode(&self, text: &str) -> Vec<u32> {
-        if text.is_empty() {
+    /// If `add_bos` is true, prepend the BOS token.
+    pub fn encode(&self, text: &str, add_bos: bool) -> Vec<u32> {
+        if text.is_empty() && !add_bos {
             return Vec::new();
         }
 
         // Start with byte-level token IDs
         let mut pieces: Vec<u32> = text.bytes().map(|b| self.byte_to_id[b as usize]).collect();
 
-        // Iteratively merge the highest-priority adjacent pair
+        // Iteratively merge the highest-priority adjacent pair.
+        // Use swap_remove-style compaction: mark merged positions with u32::MAX
+        // and compact at the end of each pass.
         loop {
             if pieces.len() < 2 {
                 break;
             }
 
             let mut best_rank = usize::MAX;
-            let mut best_idx = 0;
+            let mut best_idx = 0usize;
             for i in 0..pieces.len() - 1 {
-                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], pieces[i + 1])) {
+                if pieces[i] == u32::MAX {
+                    continue;
+                }
+                let right = if i + 1 < pieces.len() {
+                    pieces[i + 1]
+                } else {
+                    continue;
+                };
+                if right == u32::MAX {
+                    continue;
+                }
+                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], right)) {
                     if rank < best_rank {
                         best_rank = rank;
                         best_idx = i;
@@ -147,12 +161,23 @@ impl Tokenizer {
                 break;
             }
 
-            let (_, merged_id) = self.merge_rank[&(pieces[best_idx], pieces[best_idx + 1])];
+            let right = pieces[best_idx + 1];
+            let (_, merged_id) = self.merge_rank[&(pieces[best_idx], right)];
             pieces[best_idx] = merged_id;
-            pieces.remove(best_idx + 1);
+            pieces[best_idx + 1] = u32::MAX;
         }
 
-        pieces
+        // Compact: remove sentinel values
+        pieces.retain(|&x| x != u32::MAX);
+
+        if add_bos {
+            let mut result = Vec::with_capacity(pieces.len() + 1);
+            result.push(self.bos_token);
+            result.extend_from_slice(&pieces);
+            result
+        } else {
+            pieces
+        }
     }
 
     /// Decode a token ID to its string representation.
