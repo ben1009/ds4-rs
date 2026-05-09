@@ -18,7 +18,7 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 
 | File | Responsibility |
 |------|---------------|
-| `context.rs` | `MetalContext::new()` — default device, command queue, compile shaders into one library, lazy pipeline cache (`RwLock<HashMap<String, Pipeline>>`) |
+| `context.rs` | `MetalContext::new()` — default device, command queue, compile shaders into one library, pre-compile all required pipelines at init (read-only `HashMap<String, Pipeline>` after init, no locking in hot path) |
 | `buffer.rs` | `MetalBuffer` — `alloc()`, `from_slice()`, `view()` (zero-copy sub-range), `from_mmap()` (no-copy wrap of mmap'd weights), `contents_mut()`, `read()`, `write()` |
 | `encoder.rs` | `ComputeEncoder` — `set_buffer()`, `set_bytes()`, `dispatch()`, `dispatch_2d()`, `linear_split()`, `set_params!` macro |
 | `tensor.rs` | `GpuTensor { buffer, shape, dtype }`, `DType` enum (F32, F16, I32, Q8_0, Q2_K, Q4_K, IQ2_XXS) |
@@ -103,7 +103,7 @@ Output head: HC reduction → norm → LM head → logits.
 ## Architecture Notes
 
 - **Metal bindings**: `objc2-metal` (NOT the deprecated `metal-rs`). This is what candle uses.
-- **Shader loading**: `include_str!` at compile time, compile all into one Metal library, lazy pipeline cache.
+- **Shader loading**: `include_str!` at compile time, compile all into one Metal library, pre-compile all pipelines during `Engine::open()` init. Pipeline map is read-only after init — no locking overhead during inference.
 - **Buffer binding**: `set_params!` macro + `EncoderParam` trait (following candle pattern).
-- **mmap weights**: GGUF file memory-mapped, Metal buffers wrap mmap regions with `newBufferWithBytesNoCopy` (zero-copy).
+- **mmap weights**: GGUF file memory-mapped, Metal buffers wrap mmap regions with `newBufferWithBytesNoCopy` (zero-copy). **Alignment fallback**: `newBufferWithBytesNoCopy` requires page alignment (4096 bytes) but GGUF tensors are typically 32-byte aligned. Strategy: attempt no-copy first; if alignment fails, fall back to `newBufferWithBytes_length_options` (which copies). Log a warning on fallback so users can detect copy overhead.
 - **Thread safety**: `Engine` is `Arc`-shared (read-only after init). `Session` is single-owner (Metal worker only).
