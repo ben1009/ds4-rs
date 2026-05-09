@@ -128,7 +128,7 @@ mod inner {
 
 #[cfg(not(target_os = "macos"))]
 mod inner {
-    
+    use anyhow::Result;
 
     /// Stub MetalBuffer for non-macOS platforms.
     pub struct MetalBuffer {
@@ -137,6 +137,41 @@ mod inner {
     }
 
     impl MetalBuffer {
+        pub fn alloc(_device: (), size: usize, _label: &str) -> Result<Self> {
+            Ok(Self { offset: 0, size })
+        }
+
+        pub fn from_slice<T: Copy>(_device: (), _data: &[T], _label: &str) -> Result<Self> {
+            Ok(Self {
+                offset: 0,
+                size: std::mem::size_of_val(_data),
+            })
+        }
+
+        /// # Safety
+        /// Stub — no actual memory access on non-macOS.
+        pub unsafe fn from_mmap_no_copy(
+            _device: (),
+            _ptr: std::ptr::NonNull<u8>,
+            size: usize,
+            _label: &str,
+        ) -> Result<Self> {
+            Ok(Self { offset: 0, size })
+        }
+
+        /// # Safety
+        /// Stub — no actual memory access on non-macOS.
+        pub unsafe fn contents_mut(&self) -> *mut u8 {
+            std::ptr::null_mut()
+        }
+
+        pub fn view(&self, offset: usize, size: usize) -> Self {
+            Self {
+                offset: self.offset + offset,
+                size,
+            }
+        }
+
         pub fn offset(&self) -> usize {
             self.offset
         }
@@ -145,11 +180,12 @@ mod inner {
             self.size
         }
 
-        pub fn view(&self, offset: usize, size: usize) -> Self {
-            Self {
-                offset: self.offset + offset,
-                size,
-            }
+        pub fn write(&self, _offset: usize, _data: &[u8]) {}
+
+        pub fn read(&self, _offset: usize, _dest: &mut [u8]) {}
+
+        pub fn contents(&self) -> *const u8 {
+            std::ptr::null()
         }
     }
 }
