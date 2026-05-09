@@ -6,6 +6,7 @@ use std::io::{Cursor, Read};
 use std::path::Path;
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
+const DEFAULT_ALIGNMENT: u64 = 32;
 
 /// GGUF value types.
 #[derive(Clone, Debug)]
@@ -30,6 +31,14 @@ impl Value {
         match self {
             Self::U32(v) => Some(*v),
             Self::U64(v) => Some(*v as u32),
+            _ => None,
+        }
+    }
+
+    pub fn to_u64(&self) -> Option<u64> {
+        match self {
+            Self::U64(v) => Some(*v),
+            Self::U32(v) => Some(*v as u64),
             _ => None,
         }
     }
@@ -129,6 +138,68 @@ impl GgmlType {
     }
 }
 
+/// Number of elements per quantization block for each GGML type.
+fn ggml_blck_size(dtype: GgmlType) -> usize {
+    match dtype {
+        GgmlType::F32 | GgmlType::F16 | GgmlType::I8 | GgmlType::I16 | GgmlType::I32 => 1,
+        GgmlType::Q4_0 | GgmlType::Q4_1 | GgmlType::Q5_0 | GgmlType::Q5_1 => 32,
+        GgmlType::Q8_0 | GgmlType::Q8_1 => 32,
+        GgmlType::Q2_K
+        | GgmlType::Q3_K
+        | GgmlType::Q4_K
+        | GgmlType::Q5_K
+        | GgmlType::Q6_K
+        | GgmlType::Q8_K => 256,
+        GgmlType::IQ2_XXS
+        | GgmlType::IQ2_XS
+        | GgmlType::IQ3_XXS
+        | GgmlType::IQ1_S
+        | GgmlType::IQ4_NL
+        | GgmlType::IQ3_S
+        | GgmlType::IQ2_S
+        | GgmlType::IQ4_XS => 256,
+    }
+}
+
+/// Byte size of one quantization block.
+fn ggml_type_size(dtype: GgmlType) -> usize {
+    match dtype {
+        GgmlType::F32 => 4,
+        GgmlType::F16 => 2,
+        GgmlType::Q4_0 => 18,
+        GgmlType::Q4_1 => 20,
+        GgmlType::Q5_0 => 22,
+        GgmlType::Q5_1 => 24,
+        GgmlType::Q8_0 => 34,
+        GgmlType::Q8_1 => 36,
+        GgmlType::Q2_K => 84,
+        GgmlType::Q3_K => 110,
+        GgmlType::Q4_K => 144,
+        GgmlType::Q5_K => 176,
+        GgmlType::Q6_K => 210,
+        GgmlType::Q8_K => 304,
+        GgmlType::IQ2_XXS => 56,
+        GgmlType::IQ2_XS => 64,
+        GgmlType::IQ3_XXS => 76,
+        GgmlType::IQ1_S => 28,
+        GgmlType::IQ4_NL => 52,
+        GgmlType::IQ3_S => 84,
+        GgmlType::IQ2_S => 64,
+        GgmlType::IQ4_XS => 64,
+        GgmlType::I8 => 1,
+        GgmlType::I16 => 2,
+        GgmlType::I32 => 4,
+    }
+}
+
+/// Compute byte size for a tensor with the given element count and dtype.
+/// For quantized types this accounts for block structure.
+fn ggml_tensor_nbytes(elem_count: usize, dtype: GgmlType) -> usize {
+    let blck = ggml_blck_size(dtype);
+    let n_blocks = elem_count.div_ceil(blck);
+    n_blocks * ggml_type_size(dtype)
+}
+
 /// Information about a tensor in the GGUF file.
 #[derive(Clone, Debug)]
 pub struct TensorInfo {
@@ -147,9 +218,9 @@ pub struct GgufContent {
 }
 
 impl GgufContent {
-    /// Parse a GGUF file from a byte slice.
+    /// Parse a GGUF file from a byte slice (the mmap).
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(bytes.to_vec());
+        let mut cursor = Cursor::new(bytes);
 
         // Read magic
         let magic = read_u32(&mut cursor)?;
@@ -176,6 +247,12 @@ impl GgufContent {
             metadata.insert(key, value);
         }
 
+        // Read alignment from metadata (default 32)
+        let alignment = metadata
+            .get("general.alignment")
+            .and_then(|v| v.to_u64())
+            .unwrap_or(DEFAULT_ALIGNMENT);
+
         // Parse tensor info
         let mut tensors = HashMap::new();
         for _ in 0..tensor_count {
@@ -201,9 +278,9 @@ impl GgufContent {
             );
         }
 
-        // Align to 32 bytes (GGUF spec)
+        // Align to the file's alignment (from metadata, default 32)
         let pos = cursor.position();
-        let data_offset = (pos + 31) & !31;
+        let data_offset = (pos + alignment - 1) & !(alignment - 1);
 
         let file_len = bytes.len() as u64;
 
@@ -223,13 +300,12 @@ pub struct GgufMmap {
 }
 
 impl GgufMmap {
-    /// Open and memory-map a GGUF file.
+    /// Open and memory-map a GGUF file. Uses mmap directly — no RAM copy.
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
-        let bytes = std::fs::read(path)?;
-        let content = GgufContent::parse(&bytes)?;
         // SAFETY: we rely on the file not being modified while mapped.
         let mmap = unsafe { Mmap::map(&file)? };
+        let content = GgufContent::parse(&mmap)?;
         Ok(Self { content, mmap })
     }
 
@@ -243,7 +319,7 @@ impl GgufMmap {
 
         let start = (self.content.data_offset + info.offset) as usize;
         let elem_count: usize = info.dims.iter().map(|&d| d as usize).product();
-        let size = elem_count * ggml_type_size(info.dtype);
+        let size = ggml_tensor_nbytes(elem_count, info.dtype);
         let end = start + size;
 
         if end > self.mmap.len() {
@@ -254,26 +330,26 @@ impl GgufMmap {
     }
 }
 
-fn read_u32(r: &mut Cursor<Vec<u8>>) -> Result<u32> {
+fn read_u32(r: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut buf = [0u8; 4];
     r.read_exact(&mut buf)?;
     Ok(u32::from_le_bytes(buf))
 }
 
-fn read_u64(r: &mut Cursor<Vec<u8>>) -> Result<u64> {
+fn read_u64(r: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut buf = [0u8; 8];
     r.read_exact(&mut buf)?;
     Ok(u64::from_le_bytes(buf))
 }
 
-fn read_string(r: &mut Cursor<Vec<u8>>) -> Result<String> {
+fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u64(r)? as usize;
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf)?)
 }
 
-fn read_value(r: &mut Cursor<Vec<u8>>, value_type: u32) -> Result<Value> {
+fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
     match value_type {
         0 => Ok(Value::U8({
             let mut b = [0u8; 1];
@@ -316,7 +392,6 @@ fn read_value(r: &mut Cursor<Vec<u8>>, value_type: u32) -> Result<Value> {
         })),
         11 => Ok(Value::String(read_string(r)?)),
         12 => {
-            // Array type
             let arr_type = read_u32(r)?;
             let arr_len = read_u64(r)? as usize;
             let mut arr = Vec::with_capacity(arr_len);
@@ -326,35 +401,5 @@ fn read_value(r: &mut Cursor<Vec<u8>>, value_type: u32) -> Result<Value> {
             Ok(Value::Array(arr))
         }
         _ => bail!("Unknown GGUF value type: {value_type}"),
-    }
-}
-
-fn ggml_type_size(dtype: GgmlType) -> usize {
-    match dtype {
-        GgmlType::F32 => 4,
-        GgmlType::F16 => 2,
-        GgmlType::Q4_0 => 18,
-        GgmlType::Q4_1 => 20,
-        GgmlType::Q5_0 => 22,
-        GgmlType::Q5_1 => 24,
-        GgmlType::Q8_0 => 34,
-        GgmlType::Q8_1 => 36,
-        GgmlType::Q2_K => 84,
-        GgmlType::Q3_K => 110,
-        GgmlType::Q4_K => 144,
-        GgmlType::Q5_K => 176,
-        GgmlType::Q6_K => 210,
-        GgmlType::Q8_K => 304,
-        GgmlType::IQ2_XXS => 56,
-        GgmlType::IQ2_XS => 64,
-        GgmlType::IQ3_XXS => 76,
-        GgmlType::IQ1_S => 28,
-        GgmlType::IQ4_NL => 52,
-        GgmlType::IQ3_S => 84,
-        GgmlType::IQ2_S => 64,
-        GgmlType::IQ4_XS => 64,
-        GgmlType::I8 => 1,
-        GgmlType::I16 => 2,
-        GgmlType::I32 => 4,
     }
 }

@@ -9,8 +9,8 @@ pub struct Tokenizer {
     #[allow(dead_code)]
     scores: Vec<f32>,
     token_to_id: HashMap<String, u32>,
-    #[allow(dead_code)]
-    merges: Vec<(String, String)>,
+    /// Merge pairs mapped to their priority (index in merges list).
+    merge_rank: HashMap<(String, String), usize>,
     bos_token: u32,
     eos_token: u32,
 }
@@ -60,6 +60,13 @@ impl Tokenizer {
             })
             .unwrap_or_default();
 
+        // Build merge rank: pair -> priority (lower = higher priority)
+        let merge_rank: HashMap<(String, String), usize> = merges
+            .iter()
+            .enumerate()
+            .map(|(i, (l, r))| ((l.clone(), r.clone()), i))
+            .collect();
+
         let mut token_to_id = HashMap::new();
         for (i, token) in tokens.iter().enumerate() {
             token_to_id.insert(token.clone(), i as u32);
@@ -78,57 +85,61 @@ impl Tokenizer {
         tracing::info!(
             "Tokenizer: {} tokens, {} merges",
             tokens.len(),
-            merges.len()
+            merge_rank.len()
         );
 
         Ok(Self {
             tokens,
             scores,
             token_to_id,
-            merges,
+            merge_rank,
             bos_token,
             eos_token,
         })
     }
 
     /// Encode text into token IDs using BPE.
+    /// Follows the standard BPE algorithm: iteratively merge the highest-priority
+    /// adjacent pair until no more merges apply.
     pub fn encode(&self, text: &str) -> Vec<u32> {
         if text.is_empty() {
             return Vec::new();
         }
 
         // Start with byte-level tokens
-        let mut tokens: Vec<String> = text.bytes().map(|b| format!("<0x{b:02X}>")).collect();
+        let mut pieces: Vec<String> = text.bytes().map(|b| format!("<0x{b:02X}>")).collect();
 
-        // Apply merges iteratively
+        // Iteratively merge the highest-priority adjacent pair
         loop {
-            if tokens.len() < 2 {
+            if pieces.len() < 2 {
                 break;
             }
 
-            // Find the best merge (lowest score = highest priority)
-            let mut best_merge_idx = usize::MAX;
-            let mut best_pair_idx = 0;
-            for i in 0..tokens.len() - 1 {
-                let pair = format!("{} {}", tokens[i], tokens[i + 1]);
-                if let Some(&merge_idx) = self.token_to_id.get(&pair) {
-                    if (merge_idx as usize) < best_merge_idx {
-                        best_merge_idx = merge_idx as usize;
-                        best_pair_idx = i;
+            // Find the adjacent pair with the lowest merge rank (highest priority)
+            let mut best_rank = usize::MAX;
+            let mut best_idx = 0;
+            for i in 0..pieces.len() - 1 {
+                let pair = (&pieces[i], &pieces[i + 1]);
+                if let Some(&rank) = self.merge_rank.get(&(pair.0.clone(), pair.1.clone())) {
+                    if rank < best_rank {
+                        best_rank = rank;
+                        best_idx = i;
                     }
                 }
             }
 
-            if best_merge_idx == usize::MAX {
-                break;
+            if best_rank == usize::MAX {
+                break; // No more merges possible
             }
 
-            let merged = format!("{}{}", tokens[best_pair_idx], tokens[best_pair_idx + 1]);
-            tokens[best_pair_idx] = merged;
-            tokens.remove(best_pair_idx + 1);
+            // Merge the best pair
+            let merged = format!("{}{}", pieces[best_idx], pieces[best_idx + 1]);
+            pieces[best_idx] = merged;
+            pieces.remove(best_idx + 1);
         }
 
-        tokens
+        // Convert pieces to token IDs
+        pieces
             .iter()
             .filter_map(|t| self.token_to_id.get(t).copied())
             .collect()
