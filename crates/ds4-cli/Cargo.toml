@@ -1,0 +1,16 @@
+[package]
+name = "ds4-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ds4"
+path = "src/main.rs"
+
+[dependencies]
+ds4-core = { path = "../ds4-core" }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
