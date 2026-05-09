@@ -44,14 +44,15 @@ impl ModelConfig {
             n_kv_head: get_u32("llama.attention.head_count_kv")?,
             n_layer: get_u32("llama.block_count")?,
             n_ff: get_u32("llama.feed_forward_length")?,
-            n_expert: get_u32("llama.expert_count").unwrap_or(0),
-            n_expert_used: get_u32("llama.expert_used_count").unwrap_or(0),
-            n_hc: get_u32("ds4.hc_count").unwrap_or(4),
+            n_expert: get_u32("llama.expert_count").ok().unwrap_or(0),
+            n_expert_used: get_u32("llama.expert_used_count").ok().unwrap_or(0),
+            n_hc: get_u32("ds4.hc_count").ok().unwrap_or(4),
             head_dim: get_u32("llama.attention.key_length")
                 .or_else(|_| get_u32("llama.attention.head_dim"))
-                .unwrap_or(n_embd / get_u32("llama.attention.head_count").unwrap_or(1)),
-            rope_theta: get_f32("llama.rope.freq_base").unwrap_or(10000.0),
-            ctx_size: get_u32("llama.context_length").unwrap_or(32768),
+                .ok()
+                .unwrap_or(n_embd / get_u32("llama.attention.head_count").ok().unwrap_or(1)),
+            rope_theta: get_f32("llama.rope.freq_base").ok().unwrap_or(10000.0),
+            ctx_size: get_u32("llama.context_length").ok().unwrap_or(32768),
         })
     }
 }

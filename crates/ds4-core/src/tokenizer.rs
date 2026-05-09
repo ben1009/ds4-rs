@@ -158,13 +158,20 @@ impl Tokenizer {
             .unwrap_or("")
     }
 
-    /// Decode a sequence of token IDs to text.
+    /// Decode a sequence of token IDs to text, converting byte-fallback tokens.
     pub fn decode_tokens(&self, token_ids: &[u32]) -> String {
-        token_ids
-            .iter()
-            .map(|&id| self.decode(id))
-            .collect::<String>()
-            .replace("<0x0A>", "\n")
+        let mut bytes = Vec::new();
+        for &id in token_ids {
+            let tok = self.decode(id);
+            if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
+                if let Ok(byte) = u8::from_str_radix(&tok[3..5], 16) {
+                    bytes.push(byte);
+                    continue;
+                }
+            }
+            bytes.extend_from_slice(tok.as_bytes());
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     pub fn bos_token(&self) -> u32 {

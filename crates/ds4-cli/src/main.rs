@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::io::Write;
 use std::path::PathBuf;
 
 use ds4_core::engine::Engine;
@@ -47,7 +48,10 @@ fn main() -> Result<()> {
             let logits = session.prefill(&tokens)?;
 
             let mut token = Session::argmax(&logits);
-            print!("{}", engine.tokenizer.decode(token));
+
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            write!(handle, "{}", engine.tokenizer.decode(token))?;
 
             for _ in 1..args.max_tokens {
                 if token == engine.tokenizer.eos_token() {
@@ -55,9 +59,9 @@ fn main() -> Result<()> {
                 }
                 let logits = session.eval_token(token)?;
                 token = Session::argmax(&logits);
-                print!("{}", engine.tokenizer.decode(token));
+                write!(handle, "{}", engine.tokenizer.decode(token))?;
             }
-            println!();
+            writeln!(handle)?;
         }
         None => {
             println!("Interactive mode not yet implemented. Use -p for one-shot generation.");

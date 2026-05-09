@@ -154,10 +154,10 @@ fn ggml_blck_size(dtype: GgmlType) -> usize {
         | GgmlType::IQ2_XS
         | GgmlType::IQ3_XXS
         | GgmlType::IQ1_S
-        | GgmlType::IQ4_NL
         | GgmlType::IQ3_S
         | GgmlType::IQ2_S
         | GgmlType::IQ4_XS => 256,
+        GgmlType::IQ4_NL => 32,
     }
 }
 
@@ -182,7 +182,7 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
         GgmlType::IQ2_XS => 64,
         GgmlType::IQ3_XXS => 76,
         GgmlType::IQ1_S => 28,
-        GgmlType::IQ4_NL => 52,
+        GgmlType::IQ4_NL => 18,
         GgmlType::IQ3_S => 84,
         GgmlType::IQ2_S => 64,
         GgmlType::IQ4_XS => 64,
@@ -280,7 +280,7 @@ impl GgufContent {
 
         // Align to the file's alignment (from metadata, default 32)
         let pos = cursor.position();
-        let data_offset = (pos + alignment - 1) & !(alignment - 1);
+        let data_offset = pos.div_ceil(alignment) * alignment;
 
         let file_len = bytes.len() as u64;
 
