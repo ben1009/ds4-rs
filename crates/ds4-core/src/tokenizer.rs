@@ -8,9 +8,12 @@ pub struct Tokenizer {
     tokens: Vec<String>,
     #[allow(dead_code)]
     scores: Vec<f32>,
+    #[allow(dead_code)]
     token_to_id: HashMap<String, u32>,
     /// Merge pairs (left_id, right_id) -> (rank, merged_id).
     merge_rank: HashMap<(u32, u32), (usize, u32)>,
+    /// Pre-computed byte token IDs for fast encode.
+    byte_to_id: [u32; 256],
     bos_token: u32,
     eos_token: u32,
 }
@@ -86,6 +89,13 @@ impl Tokenizer {
             .and_then(|v| v.to_u32())
             .unwrap_or(1);
 
+        // Pre-compute byte token IDs
+        let mut byte_to_id = [0u32; 256];
+        for b in 0u8..=255 {
+            let s = format!("<0x{b:02X}>");
+            byte_to_id[b as usize] = *token_to_id.get(&s).unwrap_or(&0);
+        }
+
         tracing::info!(
             "Tokenizer: {} tokens, {} merges",
             tokens.len(),
@@ -97,6 +107,7 @@ impl Tokenizer {
             scores,
             token_to_id,
             merge_rank,
+            byte_to_id,
             bos_token,
             eos_token,
         })
@@ -109,13 +120,7 @@ impl Tokenizer {
         }
 
         // Start with byte-level token IDs
-        let mut pieces: Vec<u32> = text
-            .bytes()
-            .map(|b| {
-                let s = format!("<0x{b:02X}>");
-                *self.token_to_id.get(&s).unwrap_or(&0)
-            })
-            .collect();
+        let mut pieces: Vec<u32> = text.bytes().map(|b| self.byte_to_id[b as usize]).collect();
 
         // Iteratively merge the highest-priority adjacent pair
         loop {
