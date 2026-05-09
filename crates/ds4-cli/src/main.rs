@@ -48,18 +48,20 @@ fn main() -> Result<()> {
             let logits = session.prefill(&tokens)?;
 
             let mut token = Session::argmax(&logits);
-
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
+            let mut generated = Vec::new();
 
             for _ in 0..args.max_tokens {
                 if token == engine.tokenizer.eos_token() {
                     break;
                 }
-                write!(handle, "{}", engine.tokenizer.decode(token))?;
+                generated.push(token);
                 let logits = session.eval_token(token)?;
                 token = Session::argmax(&logits);
             }
+
+            let stdout = std::io::stdout();
+            let mut handle = stdout.lock();
+            write!(handle, "{}", engine.tokenizer.decode_tokens(&generated))?;
             writeln!(handle)?;
         }
         None => {

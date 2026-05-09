@@ -318,7 +318,11 @@ impl GgufMmap {
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' not found"))?;
 
         let start = (self.content.data_offset + info.offset) as usize;
-        let elem_count: usize = info.dims.iter().map(|&d| d as usize).product();
+        let elem_count = info
+            .dims
+            .iter()
+            .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' dimensions overflow"))?;
         let size = ggml_tensor_nbytes(elem_count, info.dtype);
         let end = start + size;
 
@@ -344,6 +348,9 @@ fn read_u64(r: &mut Cursor<&[u8]>) -> Result<u64> {
 
 fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u64(r)? as usize;
+    if len > 1024 * 1024 {
+        bail!("String too long: {len} bytes");
+    }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
     Ok(String::from_utf8(buf)?)
@@ -394,6 +401,9 @@ fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
         12 => {
             let arr_type = read_u32(r)?;
             let arr_len = read_u64(r)? as usize;
+            if arr_len > 1024 * 1024 {
+                bail!("Array too long: {arr_len} elements");
+            }
             let mut arr = Vec::with_capacity(arr_len);
             for _ in 0..arr_len {
                 arr.push(read_value(r, arr_type)?);

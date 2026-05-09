@@ -120,6 +120,8 @@ mod inner {
     // Encoder stubs — no-op on non-macOS
 }
 
+#[cfg(target_os = "macos")]
+pub use inner::{ComputeEncoder, linear_split};
 
 #[macro_export]
 macro_rules! set_params {
