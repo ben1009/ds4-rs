@@ -41,22 +41,19 @@ impl Session {
     }
 
     /// Greedy argmax: select the token with highest logit.
-    /// NaN values are treated as less than any real value.
+    /// NaN values are ignored (never selected as maximum).
     pub fn argmax(logits: &[f32]) -> u32 {
         logits
             .iter()
             .enumerate()
-            .max_by(|(_, a), (_, b)| {
-                a.partial_cmp(b).unwrap_or_else(|| {
-                    if a.is_nan() {
-                        std::cmp::Ordering::Less
-                    } else {
-                        std::cmp::Ordering::Greater
-                    }
-                })
+            .fold((0u32, f32::NEG_INFINITY), |(idx_max, val_max), (idx, &val)| {
+                if val > val_max {
+                    (idx as u32, val)
+                } else {
+                    (idx_max, val_max)
+                }
             })
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0)
+            .0
     }
 
     pub fn pos(&self) -> u32 {

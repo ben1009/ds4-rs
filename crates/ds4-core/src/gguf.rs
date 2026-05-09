@@ -7,6 +7,8 @@ use std::path::Path;
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;
+const MAX_GGUF_STRING_LEN: usize = 1_048_576; // 1 MiB
+const MAX_GGUF_ARRAY_LEN: usize = 1_048_576; // 1 MiB
 
 /// GGUF value types.
 #[derive(Clone, Debug)]
@@ -179,13 +181,13 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
         GgmlType::Q6_K => 210,
         GgmlType::Q8_K => 304,
         GgmlType::IQ2_XXS => 66,
-        GgmlType::IQ2_XS => 64,
-        GgmlType::IQ3_XXS => 76,
-        GgmlType::IQ1_S => 28,
+        GgmlType::IQ2_XS => 74,
+        GgmlType::IQ3_XXS => 98,
+        GgmlType::IQ1_S => 34,
         GgmlType::IQ4_NL => 18,
-        GgmlType::IQ3_S => 84,
-        GgmlType::IQ2_S => 64,
-        GgmlType::IQ4_XS => 64,
+        GgmlType::IQ3_S => 110,
+        GgmlType::IQ2_S => 82,
+        GgmlType::IQ4_XS => 136,
         GgmlType::I8 => 1,
         GgmlType::I16 => 2,
         GgmlType::I32 => 4,
@@ -194,10 +196,10 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
 
 /// Compute byte size for a tensor with the given element count and dtype.
 /// For quantized types this accounts for block structure.
-fn ggml_tensor_nbytes(elem_count: usize, dtype: GgmlType) -> usize {
+fn ggml_tensor_nbytes(elem_count: usize, dtype: GgmlType) -> Option<usize> {
     let blck = ggml_blck_size(dtype);
     let n_blocks = elem_count.div_ceil(blck);
-    n_blocks * ggml_type_size(dtype)
+    n_blocks.checked_mul(ggml_type_size(dtype))
 }
 
 /// Information about a tensor in the GGUF file.
@@ -331,7 +333,8 @@ impl GgufMmap {
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' dimensions overflow"))?;
-        let size = ggml_tensor_nbytes(elem_count, info.dtype);
+        let size = ggml_tensor_nbytes(elem_count, info.dtype)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' byte size overflow"))?;
         let end = start
             .checked_add(size)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' byte range overflow"))?;
@@ -358,7 +361,7 @@ fn read_u64(r: &mut Cursor<&[u8]>) -> Result<u64> {
 
 fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
     let len = read_u64(r)? as usize;
-    if len > 1024 * 1024 {
+    if len > MAX_GGUF_STRING_LEN {
         bail!("String too long: {len} bytes");
     }
     let mut buf = vec![0u8; len];
@@ -404,7 +407,7 @@ fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
         9 => {
             let arr_type = read_u32(r)?;
             let arr_len = read_u64(r)? as usize;
-            if arr_len > 1024 * 1024 {
+            if arr_len > MAX_GGUF_ARRAY_LEN {
                 bail!("Array too long: {arr_len} elements");
             }
             let mut arr = Vec::with_capacity(arr_len);

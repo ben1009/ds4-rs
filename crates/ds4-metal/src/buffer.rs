@@ -101,7 +101,12 @@ mod inner {
         }
 
         pub fn write(&self, offset: usize, data: &[u8]) {
-            debug_assert!(offset + data.len() <= self.size);
+            assert!(
+                offset + data.len() <= self.size,
+                "write out of bounds: offset={offset} len={} size={}",
+                data.len(),
+                self.size
+            );
             unsafe {
                 let base = (self.buffer.contents() as *mut u8).add(self.offset + offset);
                 std::ptr::copy_nonoverlapping(data.as_ptr(), base, data.len());
@@ -109,7 +114,12 @@ mod inner {
         }
 
         pub fn read(&self, offset: usize, dest: &mut [u8]) {
-            debug_assert!(offset + dest.len() <= self.size);
+            assert!(
+                offset + dest.len() <= self.size,
+                "read out of bounds: offset={offset} len={} size={}",
+                dest.len(),
+                self.size
+            );
             unsafe {
                 let base = (self.buffer.contents() as *const u8).add(self.offset + offset);
                 std::ptr::copy_nonoverlapping(base, dest.as_mut_ptr(), dest.len());
