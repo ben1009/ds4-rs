@@ -1,7 +1,7 @@
 
 #[cfg(target_os = "macos")]
 mod inner {
-    use super::*;
+    use anyhow::Result;
     use objc2::rc::Retained;
     use objc2::runtime::ProtocolObject;
     use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};

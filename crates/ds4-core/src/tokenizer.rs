@@ -93,7 +93,11 @@ impl Tokenizer {
         let mut byte_to_id = [0u32; 256];
         for b in 0u8..=255 {
             let s = format!("<0x{b:02X}>");
-            byte_to_id[b as usize] = *token_to_id.get(&s).unwrap_or(&0);
+            if let Some(&id) = token_to_id.get(&s) {
+                byte_to_id[b as usize] = id;
+            } else {
+                tracing::warn!("Byte token {s} not in vocabulary, using ID 0");
+            }
         }
 
         tracing::info!(

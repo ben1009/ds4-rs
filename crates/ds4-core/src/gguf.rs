@@ -320,14 +320,21 @@ impl GgufMmap {
             .get(name)
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' not found"))?;
 
-        let start = (self.content.data_offset + info.offset) as usize;
+        let start = self
+            .content
+            .data_offset
+            .checked_add(info.offset)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' offset overflow"))?
+            as usize;
         let elem_count = info
             .dims
             .iter()
             .try_fold(1usize, |acc, &d| acc.checked_mul(d as usize))
             .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' dimensions overflow"))?;
         let size = ggml_tensor_nbytes(elem_count, info.dtype);
-        let end = start + size;
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| anyhow::anyhow!("Tensor '{name}' byte range overflow"))?;
 
         if end > self.mmap.len() {
             bail!("Tensor '{name}' extends past end of file");
