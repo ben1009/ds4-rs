@@ -150,7 +150,17 @@
       "Bash(vmstat *)",
       "Bash(dmesg *)",
       "Bash(journalctl *)",
-      "Bash(systemctl *)"
+      "Bash(systemctl *)",
+      "Bash(jq *)",
+      "Bash(find *)",
+      "Bash(grep *)",
+      "Bash(wc *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(cat *)",
+      "Bash(ls *)",
+      "Bash(pwd *)",
+      "Bash(echo *)"
     ]
   }
 }
