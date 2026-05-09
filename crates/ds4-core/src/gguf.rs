@@ -252,6 +252,9 @@ impl GgufContent {
             .get("general.alignment")
             .and_then(|v| v.to_u64())
             .unwrap_or(DEFAULT_ALIGNMENT);
+        if alignment == 0 {
+            bail!("Invalid alignment: 0");
+        }
 
         // Parse tensor info
         let mut tensors = HashMap::new();
@@ -380,25 +383,18 @@ fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
         })),
         4 => Ok(Value::U32(read_u32(r)?)),
         5 => Ok(Value::I32(read_u32(r)? as i32)),
-        6 => Ok(Value::U64(read_u64(r)?)),
-        7 => Ok(Value::I64(read_u64(r)? as i64)),
-        8 => Ok(Value::F32({
+        6 => Ok(Value::F32({
             let mut b = [0u8; 4];
             r.read_exact(&mut b)?;
             f32::from_le_bytes(b)
         })),
-        9 => Ok(Value::F64({
-            let mut b = [0u8; 8];
-            r.read_exact(&mut b)?;
-            f64::from_le_bytes(b)
-        })),
-        10 => Ok(Value::Bool({
+        7 => Ok(Value::Bool({
             let mut b = [0u8; 1];
             r.read_exact(&mut b)?;
             b[0] != 0
         })),
-        11 => Ok(Value::String(read_string(r)?)),
-        12 => {
+        8 => Ok(Value::String(read_string(r)?)),
+        9 => {
             let arr_type = read_u32(r)?;
             let arr_len = read_u64(r)? as usize;
             if arr_len > 1024 * 1024 {
@@ -410,6 +406,13 @@ fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
             }
             Ok(Value::Array(arr))
         }
+        10 => Ok(Value::U64(read_u64(r)?)),
+        11 => Ok(Value::I64(read_u64(r)? as i64)),
+        12 => Ok(Value::F64({
+            let mut b = [0u8; 8];
+            r.read_exact(&mut b)?;
+            f64::from_le_bytes(b)
+        })),
         _ => bail!("Unknown GGUF value type: {value_type}"),
     }
 }
