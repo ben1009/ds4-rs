@@ -141,7 +141,12 @@ impl Tokenizer {
         // Convert pieces to token IDs
         pieces
             .iter()
-            .filter_map(|t| self.token_to_id.get(t).copied())
+            .filter_map(|t| {
+                self.token_to_id.get(t).copied().or_else(|| {
+                    tracing::warn!("Token not in vocabulary: {t:?}");
+                    None
+                })
+            })
             .collect()
     }
 

@@ -17,13 +17,25 @@ pub enum DType {
 }
 
 impl DType {
-    pub fn size_in_bytes(&self) -> usize {
+    /// Number of elements per quantization block (1 for non-quantized types).
+    pub fn block_size(&self) -> usize {
+        match self {
+            Self::F32 | Self::F16 | Self::I32 | Self::U32 => 1,
+            Self::Q8_0 => 32,
+            Self::Q2_K | Self::Q4_K | Self::IQ2_XXS => 256,
+        }
+    }
+
+    /// Byte size of one quantization block.
+    pub fn block_type_size(&self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,
-            Self::I32 => 4,
-            Self::U32 => 4,
-            Self::Q8_0 | Self::Q2_K | Self::Q4_K | Self::IQ2_XXS => 1,
+            Self::I32 | Self::U32 => 4,
+            Self::Q8_0 => 34,
+            Self::Q2_K => 84,
+            Self::Q4_K => 144,
+            Self::IQ2_XXS => 66,
         }
     }
 }
@@ -41,7 +53,8 @@ impl TensorShape {
     }
 
     pub fn nbytes(&self) -> usize {
-        self.numel() * self.dtype.size_in_bytes()
+        let numel = self.numel();
+        numel.div_ceil(self.dtype.block_size()) * self.dtype.block_type_size()
     }
 }
 

@@ -178,7 +178,7 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
         GgmlType::Q5_K => 176,
         GgmlType::Q6_K => 210,
         GgmlType::Q8_K => 304,
-        GgmlType::IQ2_XXS => 56,
+        GgmlType::IQ2_XXS => 66,
         GgmlType::IQ2_XS => 64,
         GgmlType::IQ3_XXS => 76,
         GgmlType::IQ1_S => 28,
