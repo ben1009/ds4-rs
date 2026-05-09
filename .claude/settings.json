@@ -160,7 +160,8 @@
       "Bash(cat *)",
       "Bash(ls *)",
       "Bash(pwd *)",
-      "Bash(echo *)"
+      "Bash(echo *)",
+      "Bash(for *)"
     ]
   }
 }
