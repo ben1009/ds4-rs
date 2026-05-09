@@ -50,7 +50,12 @@ impl ModelConfig {
             head_dim: get_u32("llama.attention.key_length")
                 .or_else(|_| get_u32("llama.attention.head_dim"))
                 .ok()
-                .unwrap_or(n_embd / get_u32("llama.attention.head_count").ok().unwrap_or(1)),
+                .unwrap_or_else(|| {
+                    n_embd / get_u32("llama.attention.head_count")
+                        .ok()
+                        .filter(|&v| v != 0)
+                        .unwrap_or(1)
+                }),
             rope_theta: get_f32("llama.rope.freq_base").ok().unwrap_or(10000.0),
             ctx_size: get_u32("llama.context_length").ok().unwrap_or(32768),
         })
