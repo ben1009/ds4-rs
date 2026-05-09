@@ -265,6 +265,9 @@ impl GgufContent {
         for _ in 0..tensor_count {
             let name = read_string(&mut cursor)?;
             let n_dims = read_u32(&mut cursor)? as usize;
+            if n_dims > 8 {
+                bail!("Tensor '{name}' has {n_dims} dims, expected <=8");
+            }
             let mut dims = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
                 dims.push(read_u64(&mut cursor)?);

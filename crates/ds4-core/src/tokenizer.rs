@@ -6,10 +6,6 @@ use crate::gguf::Value;
 /// BPE tokenizer loaded from GGUF metadata.
 pub struct Tokenizer {
     tokens: Vec<String>,
-    #[allow(dead_code)]
-    scores: Vec<f32>,
-    #[allow(dead_code)]
-    token_to_id: HashMap<String, u32>,
     /// Merge pairs (left_id, right_id) -> (rank, merged_id).
     merge_rank: HashMap<(u32, u32), (usize, u32)>,
     /// Pre-computed byte token IDs for fast encode.
@@ -33,7 +29,7 @@ impl Tokenizer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let scores: Vec<f32> = metadata
+        let _scores: Vec<f32> = metadata
             .get("tokenizer.ggml.scores")
             .and_then(|v| v.to_array())
             .ok_or_else(|| anyhow::anyhow!("Missing tokenizer.ggml.scores"))?
@@ -108,8 +104,6 @@ impl Tokenizer {
 
         Ok(Self {
             tokens,
-            scores,
-            token_to_id,
             merge_rank,
             byte_to_id,
             bos_token,
@@ -128,8 +122,6 @@ impl Tokenizer {
         let mut pieces: Vec<u32> = text.bytes().map(|b| self.byte_to_id[b as usize]).collect();
 
         // Iteratively merge the highest-priority adjacent pair.
-        // Use swap_remove-style compaction: mark merged positions with u32::MAX
-        // and compact at the end of each pass.
         loop {
             if pieces.len() < 2 {
                 break;
@@ -138,18 +130,7 @@ impl Tokenizer {
             let mut best_rank = usize::MAX;
             let mut best_idx = 0usize;
             for i in 0..pieces.len() - 1 {
-                if pieces[i] == u32::MAX {
-                    continue;
-                }
-                let right = if i + 1 < pieces.len() {
-                    pieces[i + 1]
-                } else {
-                    continue;
-                };
-                if right == u32::MAX {
-                    continue;
-                }
-                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], right)) {
+                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], pieces[i + 1])) {
                     if rank < best_rank {
                         best_rank = rank;
                         best_idx = i;
@@ -161,14 +142,10 @@ impl Tokenizer {
                 break;
             }
 
-            let right = pieces[best_idx + 1];
-            let (_, merged_id) = self.merge_rank[&(pieces[best_idx], right)];
+            let (_, merged_id) = self.merge_rank[&(pieces[best_idx], pieces[best_idx + 1])];
             pieces[best_idx] = merged_id;
-            pieces[best_idx + 1] = u32::MAX;
+            pieces.remove(best_idx + 1);
         }
-
-        // Compact: remove sentinel values
-        pieces.retain(|&x| x != u32::MAX);
 
         if add_bos {
             let mut result = Vec::with_capacity(pieces.len() + 1);
