@@ -2,29 +2,18 @@
 
 ## Overview
 
-Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to Rust. Single-model inference engine for DeepSeek V4 Flash on Apple Metal.
+Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to Rust. Single-model inference engine for DeepSeek V4 Flash. Linux-only target; Metal GPU backend deferred to future work.
 
 ## Phase 1: Core Engine + CLI
 
 **Goal:** Load model weights, run forward pass, generate tokens greedily via `ds4 -p "hello"`.
 
-### Step 1 — Workspace scaffold + MSL shaders
+### Step 1 — Workspace scaffold
 
 - `Cargo.toml` workspace root with dependencies
-- Create `crates/ds4-metal/`, `crates/ds4-core/`, `crates/ds4-cli/` with Cargo.toml stubs
-- Copy all 19 `.metal` shader files from ds4 into `metal/`
+- Create `crates/ds4-core/`, `crates/ds4-cli/` with Cargo.toml stubs
 
-### Step 2 — `ds4-metal` crate
-
-| File | Responsibility |
-|------|---------------|
-| `context.rs` | `MetalContext::new()` — default device, command queue, compile shaders into one library, pre-compile all required pipelines at init (read-only `HashMap<String, Pipeline>` after init, no locking in hot path) |
-| `buffer.rs` | `MetalBuffer` — `alloc()`, `from_slice()`, `view()` (zero-copy sub-range), `from_mmap()` (no-copy wrap of mmap'd weights), `contents_mut()`, `read()`, `write()` |
-| `encoder.rs` | `ComputeEncoder` — `set_buffer()`, `set_bytes()`, `dispatch()`, `dispatch_2d()`, `linear_split()`, `set_params!` macro |
-| `tensor.rs` | `GpuTensor { buffer, shape, dtype }`, `DType` enum (F32, F16, I32, Q8_0, Q2_K, Q4_K, IQ2_XXS) |
-| `shaders.rs` | `include_str!` all 19 `.metal` files, `combined_shader_source()` |
-
-### Step 3 — `ds4-core`: GGUF parser + config + model
+### Step 2 — `ds4-core`: GGUF parser + config + model
 
 | File | Responsibility |
 |------|---------------|
@@ -32,18 +21,18 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 | `config.rs` | `ModelConfig` — extract from GGUF metadata: `n_layer`, `n_embd`, `n_head`, `n_kv_head`, `head_dim`, `n_expert`, `n_expert_used`, `n_ff`, `n_hc`, `vocab_size`, `rope_theta` |
 | `model.rs` | `WeightMap` — mmap + tensor info lookup. `tensor(name) -> &[u8]`, `tensor_f32(name) -> &[f32]` |
 
-### Step 4 — `ds4-core`: tokenizer
+### Step 3 — `ds4-core`: tokenizer
 
 | File | Responsibility |
 |------|---------------|
 | `tokenizer.rs` | BPE tokenizer from GGUF vocab (`tokenizer.ggml.tokens`, `.scores`, `.merges`). `encode(text) -> Vec<u32>`, `decode(token_id) -> &str` |
 
-### Step 5 — `ds4-core`: engine + session
+### Step 4 — `ds4-core`: engine + session
 
 | File | Responsibility |
 |------|---------------|
-| `engine.rs` | `Engine::open(model_path)` — load GGUF, init MetalContext, build WeightMap |
-| `session.rs` | `Session::new(engine, ctx_size)` allocates GPU buffers. `eval_token(token) -> logits`, `prefill(tokens) -> logits`, `argmax(logits) -> token_id` |
+| `engine.rs` | `Engine::open(model_path)` — load GGUF, build WeightMap |
+| `session.rs` | `Session::new(engine, ctx_size)` allocates KV state. `eval_token(token) -> logits`, `prefill(tokens) -> logits`, `argmax(logits) -> token_id` |
 
 Forward pass per layer (43 layers):
 ```
@@ -52,7 +41,7 @@ HC split → norm → QKV proj → RoPE → KV store → attention → HC expand
 ```
 Output head: HC reduction → norm → LM head → logits.
 
-### Step 6 — `ds4-cli`: one-shot generation
+### Step 5 — `ds4-cli`: one-shot generation
 
 | File | Responsibility |
 |------|---------------|
@@ -61,7 +50,7 @@ Output head: HC reduction → norm → LM head → logits.
 ## Phase 2: Session + KV Cache
 
 - Multi-turn session lifecycle (create, eval, rewind, invalidate)
-- Raw KV ring buffer (sliding window in GPU memory)
+- Raw KV ring buffer (sliding window in memory)
 - Compressed KV store + ratio-4 indexer
 - On-disk KVC cache (48-byte header + session payload, binary-compatible with ds4)
 - Prefix matching for cache reuse
@@ -89,9 +78,6 @@ Output head: HC reduction → norm → LM head → logits.
 
 | Crate | Version | Purpose |
 |-------|---------|---------|
-| `objc2` | 0.6.3 | ObjC runtime |
-| `objc2-metal` | 0.3.2 | Metal GPU bindings |
-| `objc2-foundation` | 0.3.2 | Foundation types |
 | `anyhow` | 1 | Error handling |
 | `thiserror` | 2 | Error derive |
 | `tracing` | 0.1 | Logging |
@@ -102,8 +88,6 @@ Output head: HC reduction → norm → LM head → logits.
 
 ## Architecture Notes
 
-- **Metal bindings**: `objc2-metal` (NOT the deprecated `metal-rs`). This is what candle uses.
-- **Shader loading**: `include_str!` at compile time, compile all into one Metal library, pre-compile all pipelines during `Engine::open()` init. Pipeline map is read-only after init — no locking overhead during inference.
-- **Buffer binding**: `set_params!` macro + `EncoderParam` trait (following candle pattern).
-- **mmap weights**: GGUF file memory-mapped. **Alignment strategy**: Create a single large Metal buffer for the entire mmap region (which is page-aligned at the file level) and use byte offsets in `set_buffer()` for individual tensors. This avoids the 4096-byte per-tensor alignment requirement of `newBufferWithBytesNoCopy` and ensures zero-copy for all weights.
-- **Thread safety**: `Engine` is `Arc`-shared (read-only after init). `Session` is single-owner (Metal worker only).
+- **Linux-only**: No macOS/Metal support. GPU compute backend (Vulkan, CUDA, etc.) deferred to future work.
+- **mmap weights**: GGUF file memory-mapped for zero-copy weight access.
+- **Thread safety**: `Engine` is `Arc`-shared (read-only after init). `Session` is single-owner (inference worker only).

@@ -2,7 +2,6 @@
 resolver = "2"
 members = [
     "crates/ds4-core",
-    "crates/ds4-metal",
     "crates/ds4-cli",
 ]
 
@@ -12,11 +11,6 @@ edition = "2021"
 license = "MIT"
 
 [workspace.dependencies]
-# Metal bindings
-objc2 = "0.6.3"
-objc2-foundation = "0.3.2"
-objc2-metal = "0.3.2"
-
 # Error handling
 anyhow = "1"
 thiserror = "2"
