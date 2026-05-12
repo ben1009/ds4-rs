@@ -88,7 +88,8 @@ fn main() -> Result<()> {
             let eos = engine.tokenizer.eos_token();
 
             let logits = session.prefill(&tokens)?;
-            let mut token = Session::argmax(logits);
+            let mut token = Session::argmax(logits)
+                .ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
             let mut pending: Vec<u8> = Vec::new();
 
             for _ in 0..args.max_tokens {
@@ -99,7 +100,8 @@ fn main() -> Result<()> {
                 write_utf8(&mut handle, &mut pending, false)?;
                 handle.flush()?;
                 let logits = session.eval_token(token)?;
-                token = Session::argmax(logits);
+                token = Session::argmax(logits)
+                    .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
             }
             write_utf8(&mut handle, &mut pending, true)?;
             writeln!(handle)?;

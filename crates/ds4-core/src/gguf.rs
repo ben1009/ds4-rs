@@ -200,9 +200,12 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
 /// For quantized types this accounts for block structure.
 fn ggml_tensor_nbytes(elem_count: usize, dtype: GgmlType) -> Option<usize> {
     let blck = ggml_blck_size(dtype);
-    // Manual ceil-div so we don't require usize::div_ceil (Rust 1.73+).
-    #[allow(clippy::manual_div_ceil)]
-    let n_blocks = (elem_count + blck - 1) / blck;
+    // Overflow-safe ceil-div (and MSRV-safe vs usize::div_ceil).
+    let n_blocks = if elem_count == 0 {
+        0
+    } else {
+        (elem_count - 1) / blck + 1
+    };
     n_blocks.checked_mul(ggml_type_size(dtype))
 }
 
@@ -299,11 +302,13 @@ impl GgufContent {
         }
 
         // Align to the file's alignment (from metadata, default 32).
-        // Manual `(pos + alignment - 1) / alignment * alignment` so we don't
-        // require u64::div_ceil (Rust 1.73+).
+        // Overflow-safe ceil-div form.
         let pos = cursor.position();
-        #[allow(clippy::manual_div_ceil)]
-        let data_offset = (pos + alignment - 1) / alignment * alignment;
+        let data_offset = if pos == 0 {
+            0
+        } else {
+            ((pos - 1) / alignment + 1) * alignment
+        };
 
         let file_len = bytes.len() as u64;
 
