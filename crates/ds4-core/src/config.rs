@@ -62,3 +62,89 @@ impl ModelConfig {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+
+    fn base_metadata() -> HashMap<String, Value> {
+        let mut m = HashMap::new();
+        m.insert("llama.vocab_size".to_string(), Value::U32(32000));
+        m.insert("llama.embedding_length".to_string(), Value::U32(4096));
+        m.insert("llama.attention.head_count".to_string(), Value::U32(32));
+        m.insert("llama.attention.head_count_kv".to_string(), Value::U32(8));
+        m.insert("llama.block_count".to_string(), Value::U32(32));
+        m.insert("llama.feed_forward_length".to_string(), Value::U32(14336));
+        m
+    }
+
+    #[test]
+    fn mandatory_fields_parsed() {
+        let cfg = ModelConfig::from_metadata(&base_metadata()).unwrap();
+        assert_eq!(cfg.n_vocab, 32000);
+        assert_eq!(cfg.n_embd, 4096);
+        assert_eq!(cfg.n_head, 32);
+        assert_eq!(cfg.n_kv_head, 8);
+        assert_eq!(cfg.n_layer, 32);
+        assert_eq!(cfg.n_ff, 14336);
+    }
+
+    #[test]
+    fn optional_fields_have_defaults() {
+        let cfg = ModelConfig::from_metadata(&base_metadata()).unwrap();
+        assert_eq!(cfg.n_expert, 0);
+        assert_eq!(cfg.n_expert_used, 0);
+        assert_eq!(cfg.n_hc, 4);
+        assert_eq!(cfg.rope_theta, 10000.0);
+        assert_eq!(cfg.ctx_size, 32768);
+    }
+
+    #[test]
+    fn head_dim_derived_from_n_embd_over_n_head() {
+        // 4096 / 32 = 128
+        let cfg = ModelConfig::from_metadata(&base_metadata()).unwrap();
+        assert_eq!(cfg.head_dim, 128);
+    }
+
+    #[test]
+    fn head_dim_uses_key_length_when_present() {
+        let mut m = base_metadata();
+        m.insert("llama.attention.key_length".to_string(), Value::U32(256));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.head_dim, 256);
+    }
+
+    #[test]
+    fn head_dim_div_by_zero_falls_back_to_n_embd() {
+        let mut m = base_metadata();
+        m.insert("llama.attention.head_count".to_string(), Value::U32(0));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        // checked_div on 0 returns None, so head_dim falls back to n_embd.
+        assert_eq!(cfg.head_dim, 4096);
+    }
+
+    #[test]
+    fn optional_overrides_take_effect() {
+        let mut m = base_metadata();
+        m.insert("llama.expert_count".to_string(), Value::U32(64));
+        m.insert("llama.expert_used_count".to_string(), Value::U32(2));
+        m.insert("ds4.hc_count".to_string(), Value::U32(8));
+        m.insert("llama.rope.freq_base".to_string(), Value::F32(500000.0));
+        m.insert("llama.context_length".to_string(), Value::U32(16384));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.n_expert, 64);
+        assert_eq!(cfg.n_expert_used, 2);
+        assert_eq!(cfg.n_hc, 8);
+        assert_eq!(cfg.rope_theta, 500000.0);
+        assert_eq!(cfg.ctx_size, 16384);
+    }
+
+    #[test]
+    fn missing_mandatory_field_errors() {
+        let mut m = base_metadata();
+        m.remove("llama.vocab_size");
+        assert!(ModelConfig::from_metadata(&m).is_err());
+    }
+}

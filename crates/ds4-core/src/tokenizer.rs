@@ -315,4 +315,135 @@ mod tests {
         let out = t.encode("ABCD", false);
         assert_eq!(out, vec![ab, cd]);
     }
+
+    #[test]
+    fn encode_empty_no_bos() {
+        let t = tok(&[], &[]);
+        assert!(t.encode("", false).is_empty());
+    }
+
+    #[test]
+    fn encode_empty_with_bos() {
+        let t = tok(&[], &[]);
+        assert_eq!(t.encode("", true), vec![t.bos_token()]);
+    }
+
+    #[test]
+    fn encode_with_bos_prepends() {
+        let t = tok(&[], &[]);
+        let out = t.encode("A", true);
+        assert_eq!(out, vec![t.bos_token(), t.byte_to_id[b'A' as usize]]);
+    }
+
+    #[test]
+    fn encode_single_byte_no_merges_needed() {
+        // Single-byte input skips the heap loop entirely.
+        let t = tok(&[("<0x41>", "<0x42>")], &[]);
+        let out = t.encode("A", false);
+        assert_eq!(out, vec![t.byte_to_id[b'A' as usize]]);
+    }
+
+    #[test]
+    fn decode_out_of_range_returns_empty() {
+        let t = tok(&[], &[]);
+        assert_eq!(t.decode(u32::MAX), "");
+    }
+
+    #[test]
+    fn decode_tokens_converts_byte_fallback() {
+        let t = tok(&[], &[]);
+        // "Hi" -> bytes 0x48 0x69 -> decoded back to "Hi".
+        let ids = vec![t.byte_to_id[b'H' as usize], t.byte_to_id[b'i' as usize]];
+        assert_eq!(t.decode_tokens(&ids), "Hi");
+    }
+
+    #[test]
+    fn decode_tokens_preserves_literal_tokens() {
+        let t = tok(&[], &["hello"]);
+        let id = t.tokens.iter().position(|s| s == "hello").unwrap() as u32;
+        assert_eq!(t.decode_tokens(&[id]), "hello");
+    }
+
+    #[test]
+    fn append_token_bytes_byte_fallback_and_literal() {
+        let t = tok(&[], &["xy"]);
+        let mut out = Vec::new();
+        t.append_token_bytes(t.byte_to_id[b'A' as usize], &mut out);
+        let xy_id = t.tokens.iter().position(|s| s == "xy").unwrap() as u32;
+        t.append_token_bytes(xy_id, &mut out);
+        assert_eq!(out, b"Axy");
+    }
+
+    #[test]
+    fn vocab_size_matches() {
+        let t = tok(&[], &["a", "b", "c"]);
+        // 256 byte tokens + 3 extras
+        assert_eq!(t.vocab_size(), 259);
+    }
+
+    #[test]
+    fn eos_and_bos_accessors() {
+        let t = tok(&[], &[]);
+        assert_eq!(t.bos_token(), 0);
+        assert_eq!(t.eos_token(), 1);
+    }
+
+    #[test]
+    fn round_trip_encode_decode_bytes() {
+        let t = tok(&[], &[]);
+        let text = "Hello, world!";
+        let ids = t.encode(text, false);
+        assert_eq!(t.decode_tokens(&ids), text);
+    }
+
+    #[test]
+    fn from_metadata_builds_tokenizer() {
+        // Merges pair "<0x48>" and "<0x69>" → merged token is their concat
+        // "<0x48><0x69>" (that's how `format!("{l}{r}")` builds it inside
+        // from_metadata). So the encoder will emit a single merged id for
+        // the bytes of "Hi".
+        let mut tokens: Vec<Value> = (0u8..=255)
+            .map(|b| Value::String(format!("<0x{b:02X}>")))
+            .collect();
+        tokens.push(Value::String("<0x48><0x69>".to_string()));
+        let merges = vec![Value::String("<0x48> <0x69>".to_string())];
+
+        let mut m = std::collections::HashMap::new();
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+        m.insert("tokenizer.ggml.merges".to_string(), Value::Array(merges));
+        m.insert("tokenizer.ggml.bos_token_id".to_string(), Value::U32(7));
+        m.insert("tokenizer.ggml.eos_token_id".to_string(), Value::U32(11));
+
+        let t = Tokenizer::from_metadata(&m).unwrap();
+        assert_eq!(t.bos_token(), 7);
+        assert_eq!(t.eos_token(), 11);
+        assert_eq!(t.vocab_size(), 257);
+
+        let merged_id = 256u32;
+        assert_eq!(t.encode("Hi", false), vec![merged_id]);
+    }
+
+    #[test]
+    fn from_metadata_missing_byte_token_fails() {
+        // Build a vocab that is missing one byte-fallback token.
+        let mut tokens: Vec<Value> = (0u8..=254)
+            .map(|b| Value::String(format!("<0x{b:02X}>")))
+            .collect();
+        // Skip 0xFF — should cause construction to fail.
+        let mut m = std::collections::HashMap::new();
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens.clone()));
+
+        assert!(Tokenizer::from_metadata(&m).is_err());
+
+        // And when we include all 256, it succeeds.
+        tokens.push(Value::String("<0xFF>".to_string()));
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+        assert!(Tokenizer::from_metadata(&m).is_ok());
+    }
+
+    #[test]
+    fn from_metadata_missing_tokens_key_fails() {
+        let m = std::collections::HashMap::new();
+        assert!(Tokenizer::from_metadata(&m).is_err());
+    }
 }
