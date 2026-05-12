@@ -1,10 +1,8 @@
-use anyhow::Result;
-use std::path::Path;
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
-use crate::config::ModelConfig;
-use crate::model::WeightMap;
-use crate::tokenizer::Tokenizer;
+use anyhow::Result;
+
+use crate::{config::ModelConfig, model::WeightMap, tokenizer::Tokenizer};
 
 /// The inference engine. Holds loaded model weights and tokenizer.
 /// Immutable after creation — safe to share across threads via Arc.

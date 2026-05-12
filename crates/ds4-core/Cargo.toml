@@ -6,7 +6,5 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-thiserror = { workspace = true }
-tracing = { workspace = true }
 memmap2 = { workspace = true }
-zerocopy = { workspace = true }
+tracing = { workspace = true }

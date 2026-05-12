@@ -1,11 +1,14 @@
-use anyhow::{bail, Result};
-use memmap2::Mmap;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Cursor, Read};
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+};
 
-const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
+use anyhow::{Result, bail};
+use memmap2::Mmap;
+
+pub(crate) const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_GGUF_STRING_LEN: usize = 1_048_576; // 1 MiB
 const MAX_GGUF_ARRAY_LEN: usize = 1_048_576; // 1 Mi entries
@@ -219,6 +222,7 @@ pub struct TensorInfo {
 }
 
 /// Parsed GGUF file content.
+#[derive(Debug)]
 pub struct GgufContent {
     pub metadata: HashMap<String, Value>,
     pub tensors: HashMap<String, TensorInfo>,
@@ -472,5 +476,355 @@ fn read_value_inner(r: &mut Cursor<&[u8]>, value_type: u32, depth: usize) -> Res
             f64::from_le_bytes(b)
         })),
         _ => bail!("Unknown GGUF value type: {value_type}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- synthetic GGUF builder -------------------------------------------------
+
+    struct GgufBuilder {
+        buf: Vec<u8>,
+    }
+
+    impl GgufBuilder {
+        fn new() -> Self {
+            Self { buf: Vec::new() }
+        }
+
+        fn raw_u32(&mut self, v: u32) -> &mut Self {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+
+        fn raw_u64(&mut self, v: u64) -> &mut Self {
+            self.buf.extend_from_slice(&v.to_le_bytes());
+            self
+        }
+
+        fn raw_str(&mut self, s: &str) -> &mut Self {
+            self.raw_u64(s.len() as u64);
+            self.buf.extend_from_slice(s.as_bytes());
+            self
+        }
+
+        fn header(&mut self, tensor_count: u64, kv_count: u64) -> &mut Self {
+            self.raw_u32(GGUF_MAGIC);
+            self.raw_u32(3);
+            self.raw_u64(tensor_count);
+            self.raw_u64(kv_count);
+            self
+        }
+
+        fn kv_u32(&mut self, key: &str, value: u32) -> &mut Self {
+            self.raw_str(key);
+            self.raw_u32(4); // type U32
+            self.raw_u32(value);
+            self
+        }
+
+        fn kv_u64(&mut self, key: &str, value: u64) -> &mut Self {
+            self.raw_str(key);
+            self.raw_u32(10); // type U64
+            self.raw_u64(value);
+            self
+        }
+
+        fn kv_string(&mut self, key: &str, value: &str) -> &mut Self {
+            self.raw_str(key);
+            self.raw_u32(8); // type String
+            self.raw_str(value);
+            self
+        }
+
+        fn kv_bool(&mut self, key: &str, value: bool) -> &mut Self {
+            self.raw_str(key);
+            self.raw_u32(7); // type Bool
+            self.buf.push(u8::from(value));
+            self
+        }
+
+        fn tensor_info(&mut self, name: &str, dtype: u32, dims: &[u64], offset: u64) -> &mut Self {
+            self.raw_str(name);
+            self.raw_u32(dims.len() as u32);
+            for d in dims {
+                self.raw_u64(*d);
+            }
+            self.raw_u32(dtype);
+            self.raw_u64(offset);
+            self
+        }
+
+        fn align_to(&mut self, alignment: u64) -> &mut Self {
+            let pos = self.buf.len() as u64;
+            let padded = if pos == 0 {
+                0
+            } else {
+                ((pos - 1) / alignment + 1) * alignment
+            };
+            self.buf.resize(padded as usize, 0);
+            self
+        }
+
+        fn raw_bytes(&mut self, b: &[u8]) -> &mut Self {
+            self.buf.extend_from_slice(b);
+            self
+        }
+
+        fn build(self) -> Vec<u8> {
+            self.buf
+        }
+    }
+
+    // ---- parse() tests ----------------------------------------------------------
+
+    #[test]
+    fn parse_rejects_bad_magic() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(0xDEADBEEF).raw_u32(3).raw_u64(0).raw_u64(0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Invalid GGUF magic"));
+    }
+
+    #[test]
+    fn parse_rejects_unsupported_version() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(1).raw_u64(0).raw_u64(0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Unsupported GGUF version"));
+    }
+
+    #[test]
+    fn parse_rejects_too_many_tensors() {
+        let mut b = GgufBuilder::new();
+        b.header((MAX_GGUF_TENSOR_COUNT + 1) as u64, 0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Tensor count too large"));
+    }
+
+    #[test]
+    fn parse_rejects_too_many_kv() {
+        let mut b = GgufBuilder::new();
+        b.header(0, (MAX_GGUF_METADATA_KV_COUNT + 1) as u64);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Metadata KV count too large"));
+    }
+
+    #[test]
+    fn parse_rejects_zero_alignment() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 1).kv_u64("general.alignment", 0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Invalid alignment"));
+    }
+
+    #[test]
+    fn parse_rejects_bad_dtype() {
+        let mut b = GgufBuilder::new();
+        b.header(1, 0).tensor_info("bad", 9999, &[4], 0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Unknown GGML type"));
+    }
+
+    #[test]
+    fn parse_rejects_too_many_dims() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(1).raw_u64(0);
+        b.raw_str("t").raw_u32(9); // 9 dims — over the 8 limit
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("dims, expected <=8"));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_string() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_u64((MAX_GGUF_STRING_LEN + 1) as u64); // key length
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("String too long"));
+    }
+
+    #[test]
+    fn parse_rejects_string_past_eof() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_u64(100); // claim 100 bytes for the key, but only a few follow
+        b.raw_bytes(b"abc");
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        // Either the range check or read_exact can fire depending on whether
+        // enough bytes are present to even try the slice. Accept both.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("extends past end of file") || msg.contains("failed to fill whole buffer")
+        );
+    }
+
+    #[test]
+    fn parse_reads_all_value_types() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 4)
+            .kv_u32("u32", 42)
+            .kv_u64("u64", 0xFFFF_FFFF_FFFF)
+            .kv_string("str", "hello")
+            .kv_bool("flag", true);
+
+        let c = GgufContent::parse(&b.build()).unwrap();
+        assert_eq!(c.metadata.get("u32").unwrap().to_u32(), Some(42));
+        assert_eq!(
+            c.metadata.get("u64").unwrap().to_u64(),
+            Some(0xFFFF_FFFF_FFFF)
+        );
+        assert_eq!(
+            c.metadata.get("str").unwrap().to_string_val(),
+            Some("hello")
+        );
+        assert_eq!(c.metadata.get("flag").unwrap().to_bool(), Some(true));
+    }
+
+    #[test]
+    fn parse_with_tensor_and_read_data() {
+        // Build a GGUF with one F32 tensor of shape [4] = 16 bytes.
+        let mut b = GgufBuilder::new();
+        b.header(1, 1)
+            .kv_u32("general.alignment", 32)
+            .tensor_info("t", 0, &[4], 0);
+        b.align_to(32);
+        // 4 × f32 values
+        for v in [1.0f32, 2.0, 3.0, 4.0] {
+            b.raw_bytes(&v.to_le_bytes());
+        }
+        let bytes = b.build();
+
+        let c = GgufContent::parse(&bytes).unwrap();
+        assert_eq!(c.tensors.len(), 1);
+        let info = &c.tensors["t"];
+        assert_eq!(info.dtype, GgmlType::F32);
+        assert_eq!(info.dims, vec![4]);
+        assert_eq!(info.offset, 0);
+
+        // Wire up a fake GgufMmap via the public tensor_data path.
+        // GgufMmap wraps an owned Mmap; to test tensor_data we need a real file.
+        // Easier: validate data_offset + range math manually.
+        let start = c.data_offset as usize;
+        let slice = &bytes[start..start + 16];
+        let mut vs = [0f32; 4];
+        for (i, v) in vs.iter_mut().enumerate() {
+            *v = f32::from_le_bytes(slice[i * 4..(i + 1) * 4].try_into().unwrap());
+        }
+        assert_eq!(vs, [1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn parse_respects_custom_alignment() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 1).kv_u64("general.alignment", 64);
+        let bytes = b.build();
+        let c = GgufContent::parse(&bytes).unwrap();
+        assert_eq!(c.data_offset % 64, 0);
+        assert!(c.data_offset >= bytes.len() as u64);
+        assert!(c.data_offset < bytes.len() as u64 + 64);
+    }
+
+    // ---- helper & value-accessor tests -----------------------------------------
+
+    #[test]
+    fn value_accessors() {
+        assert_eq!(Value::U32(7).to_u32(), Some(7));
+        assert_eq!(Value::U64(7).to_u32(), Some(7));
+        assert_eq!(Value::U64(u64::MAX).to_u32(), None); // truncation rejected
+        assert_eq!(Value::U32(7).to_u64(), Some(7));
+        assert_eq!(Value::U64(9).to_u64(), Some(9));
+        assert_eq!(Value::F32(1.5).to_f32(), Some(1.5));
+        assert_eq!(Value::F64(1.5).to_f32(), Some(1.5));
+        assert_eq!(Value::String("x".into()).to_string_val(), Some("x"));
+        assert_eq!(Value::Bool(false).to_bool(), Some(false));
+        assert!(Value::Array(vec![Value::U32(1)]).to_array().is_some());
+        // Mismatched types return None.
+        assert_eq!(Value::String("x".into()).to_u32(), None);
+        assert_eq!(Value::U32(1).to_string_val(), None);
+        assert_eq!(Value::U32(1).to_bool(), None);
+        assert!(Value::U32(1).to_array().is_none());
+    }
+
+    #[test]
+    fn ggml_type_roundtrip() {
+        for v in 0..=26u32 {
+            if let Some(t) = GgmlType::from_u32(v) {
+                assert_eq!(t as u32, v);
+            }
+        }
+        assert!(GgmlType::from_u32(4).is_none()); // unused slot
+        assert!(GgmlType::from_u32(999).is_none());
+    }
+
+    #[test]
+    fn ggml_tensor_nbytes_block_math() {
+        // F32: 1 byte/elem * 4 bytes/block = 4 bytes/elem effectively.
+        assert_eq!(ggml_tensor_nbytes(4, GgmlType::F32), Some(16));
+        // Q8_0: 34 bytes per 32-element block.
+        assert_eq!(ggml_tensor_nbytes(32, GgmlType::Q8_0), Some(34));
+        assert_eq!(ggml_tensor_nbytes(64, GgmlType::Q8_0), Some(68));
+        // Partial block rounds up.
+        assert_eq!(ggml_tensor_nbytes(33, GgmlType::Q8_0), Some(68));
+        // Zero stays zero.
+        assert_eq!(ggml_tensor_nbytes(0, GgmlType::Q8_0), Some(0));
+        // Q8_K block is 256 elements × 292 bytes.
+        assert_eq!(ggml_tensor_nbytes(256, GgmlType::Q8_K), Some(292));
+    }
+
+    // ---- GgufMmap tests ---------------------------------------------------------
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn ggufmmap_open_and_tensor_data_roundtrip() {
+        use std::{
+            io::Write,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+        // Build a GGUF with two F32 tensors back-to-back.
+        let mut b = GgufBuilder::new();
+        b.header(2, 0)
+            .tensor_info("a", 0, &[2], 0)
+            .tensor_info("b", 0, &[3], 8); // a is 8 bytes, so b starts at offset 8
+        b.align_to(DEFAULT_ALIGNMENT);
+        for v in [10.0f32, 20.0] {
+            b.raw_bytes(&v.to_le_bytes());
+        }
+        for v in [1.5f32, 2.5, 3.5] {
+            b.raw_bytes(&v.to_le_bytes());
+        }
+        let bytes = b.build();
+
+        // Write to a tempfile and open via GgufMmap.
+        let path =
+            std::env::temp_dir().join(format!("ds4-gguf-test-{}-{}.bin", std::process::id(), seq,));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&bytes).unwrap();
+        }
+
+        let gguf = GgufMmap::open(&path).unwrap();
+        assert_eq!(gguf.content.tensors.len(), 2);
+
+        let a = gguf.tensor_data("a").unwrap();
+        assert_eq!(a.len(), 8);
+        let a0 = f32::from_le_bytes(a[0..4].try_into().unwrap());
+        assert_eq!(a0, 10.0);
+
+        let b_bytes = gguf.tensor_data("b").unwrap();
+        assert_eq!(b_bytes.len(), 12);
+
+        // Unknown tensor should error.
+        assert!(gguf.tensor_data("missing").is_err());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

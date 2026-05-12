@@ -1,10 +1,8 @@
+use std::{io::Write, path::PathBuf};
+
 use anyhow::Result;
 use clap::Parser;
-use std::io::Write;
-use std::path::PathBuf;
-
-use ds4_core::engine::Engine;
-use ds4_core::session::Session;
+use ds4_core::{engine::Engine, session::Session};
 
 /// Split `bytes` into (valid UTF-8 prefix length, invalid-sequence length).
 /// If invalid_len > 0, those bytes should be replaced with U+FFFD and drained
@@ -23,7 +21,11 @@ fn utf8_split(bytes: &[u8]) -> (usize, usize) {
 /// Drain valid UTF-8 chunks from `pending`, replacing any invalid sequences
 /// with U+FFFD. Trailing partial multi-byte sequences are left in `pending`
 /// unless `flush_partial` is true (end-of-stream).
-fn write_utf8<W: Write>(w: &mut W, pending: &mut Vec<u8>, flush_partial: bool) -> std::io::Result<()> {
+fn write_utf8<W: Write>(
+    w: &mut W,
+    pending: &mut Vec<u8>,
+    flush_partial: bool,
+) -> std::io::Result<()> {
     loop {
         let (valid, invalid) = utf8_split(pending);
         if valid > 0 {
