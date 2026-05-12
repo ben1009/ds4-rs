@@ -216,6 +216,6 @@ attention ones are larger (600–800). Each one builds and passes
 
 ## 7. What this PR contains
 
-This PR is design only — it adds this `docs/forward-pass-design.md` file and
+This PR is design only — it adds this `rfcs/0002-forward-pass.md` file and
 nothing else. Approval means "the plan is sound, start implementing".
 Actual code lands in the 12 PRs above, each reviewed independently.
