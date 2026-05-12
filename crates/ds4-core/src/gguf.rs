@@ -392,9 +392,19 @@ fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
     if len > MAX_GGUF_STRING_LEN {
         bail!("String too long: {len} bytes");
     }
-    let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    // Slice the underlying mmap directly — no copy into a temporary Vec.
+    let start = usize::try_from(r.position())
+        .map_err(|_| anyhow::anyhow!("Cursor position overflows usize"))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("String byte range overflow"))?;
+    let buf = r.get_ref();
+    if end > buf.len() {
+        bail!("String extends past end of file");
+    }
+    let s = String::from_utf8_lossy(&buf[start..end]).into_owned();
+    r.set_position(end as u64);
+    Ok(s)
 }
 
 fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
