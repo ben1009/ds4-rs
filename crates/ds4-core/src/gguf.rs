@@ -8,7 +8,9 @@ use std::path::Path;
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;
 const MAX_GGUF_STRING_LEN: usize = 1_048_576; // 1 MiB
-const MAX_GGUF_ARRAY_LEN: usize = 1_048_576; // 1 MiB
+const MAX_GGUF_ARRAY_LEN: usize = 1_048_576; // 1 Mi entries
+const MAX_GGUF_TENSOR_COUNT: usize = 1_048_576; // 1 Mi tensors
+const MAX_GGUF_METADATA_KV_COUNT: usize = 1_048_576; // 1 Mi KV pairs
 
 /// GGUF value types.
 #[derive(Clone, Debug)]
@@ -198,7 +200,9 @@ fn ggml_type_size(dtype: GgmlType) -> usize {
 /// For quantized types this accounts for block structure.
 fn ggml_tensor_nbytes(elem_count: usize, dtype: GgmlType) -> Option<usize> {
     let blck = ggml_blck_size(dtype);
-    let n_blocks = elem_count.div_ceil(blck);
+    // Manual ceil-div so we don't require usize::div_ceil (Rust 1.73+).
+    #[allow(clippy::manual_div_ceil)]
+    let n_blocks = (elem_count + blck - 1) / blck;
     n_blocks.checked_mul(ggml_type_size(dtype))
 }
 
@@ -239,8 +243,14 @@ impl GgufContent {
         // Read tensor count and metadata KV count
         let tensor_count = usize::try_from(read_u64(&mut cursor)?)
             .map_err(|_| anyhow::anyhow!("tensor_count overflows usize"))?;
+        if tensor_count > MAX_GGUF_TENSOR_COUNT {
+            bail!("Tensor count too large: {tensor_count}");
+        }
         let metadata_kv_count = usize::try_from(read_u64(&mut cursor)?)
             .map_err(|_| anyhow::anyhow!("metadata_kv_count overflows usize"))?;
+        if metadata_kv_count > MAX_GGUF_METADATA_KV_COUNT {
+            bail!("Metadata KV count too large: {metadata_kv_count}");
+        }
 
         // Parse metadata
         let mut metadata = HashMap::new();
@@ -288,9 +298,12 @@ impl GgufContent {
             );
         }
 
-        // Align to the file's alignment (from metadata, default 32)
+        // Align to the file's alignment (from metadata, default 32).
+        // Manual `(pos + alignment - 1) / alignment * alignment` so we don't
+        // require u64::div_ceil (Rust 1.73+).
         let pos = cursor.position();
-        let data_offset = pos.div_ceil(alignment) * alignment;
+        #[allow(clippy::manual_div_ceil)]
+        let data_offset = (pos + alignment - 1) / alignment * alignment;
 
         let file_len = bytes.len() as u64;
 
@@ -376,7 +389,7 @@ fn read_string(r: &mut Cursor<&[u8]>) -> Result<String> {
     }
     let mut buf = vec![0u8; len];
     r.read_exact(&mut buf)?;
-    Ok(String::from_utf8(buf)?)
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn read_value(r: &mut Cursor<&[u8]>, value_type: u32) -> Result<Value> {
