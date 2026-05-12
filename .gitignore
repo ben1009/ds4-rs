@@ -1,0 +1,5 @@
+/target
+*.gguf
+*.dylib
+*.so
+.DS_Store

@@ -1,0 +1,32 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ds4-core",
+    "crates/ds4-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Memory mapping
+memmap2 = "0.9"
+
+# Byte-level parsing
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# Concurrency
+parking_lot = "0.12"
