@@ -112,16 +112,17 @@ impl Tokenizer {
             let mut next: Vec<usize> = (0..n).map(|i| i + 1).collect();
             next[n - 1] = usize::MAX;
 
-            // Min-heap by merge rank, keyed by the left index of the pair.
-            // Stale entries are filtered when popped by re-checking the pair.
-            let mut heap: BinaryHeap<(Reverse<usize>, usize)> = BinaryHeap::new();
+            // Min-heap by (rank, left-index) so equal-rank ties break leftward,
+            // matching GPT-2 / llama.cpp BPE convention. Stale entries are
+            // filtered when popped by re-checking the pair.
+            let mut heap: BinaryHeap<(Reverse<usize>, Reverse<usize>)> = BinaryHeap::new();
             for i in 0..n - 1 {
                 if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], pieces[i + 1])) {
-                    heap.push((Reverse(rank), i));
+                    heap.push((Reverse(rank), Reverse(i)));
                 }
             }
 
-            while let Some((Reverse(rank), i)) = heap.pop() {
+            while let Some((Reverse(rank), Reverse(i))) = heap.pop() {
                 if pieces[i] == u32::MAX {
                     continue;
                 }
@@ -147,12 +148,12 @@ impl Tokenizer {
                 let p = prev[i];
                 if p != usize::MAX {
                     if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[p], pieces[i])) {
-                        heap.push((Reverse(nr), p));
+                        heap.push((Reverse(nr), Reverse(p)));
                     }
                 }
                 if k != usize::MAX {
                     if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[i], pieces[k])) {
-                        heap.push((Reverse(nr), i));
+                        heap.push((Reverse(nr), Reverse(i)));
                     }
                 }
             }
@@ -186,18 +187,25 @@ impl Tokenizer {
             .unwrap_or("")
     }
 
+    /// Append the bytes for one token ID to `out`, decoding byte-fallback
+    /// tokens (`<0xNN>`) into their raw byte. Lets the caller buffer and flush
+    /// only at UTF-8 boundaries when streaming.
+    pub fn append_token_bytes(&self, token_id: u32, out: &mut Vec<u8>) {
+        let tok = self.decode(token_id);
+        if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
+            if let Ok(byte) = u8::from_str_radix(&tok[3..5], 16) {
+                out.push(byte);
+                return;
+            }
+        }
+        out.extend_from_slice(tok.as_bytes());
+    }
+
     /// Decode a sequence of token IDs to text, converting byte-fallback tokens.
     pub fn decode_tokens(&self, token_ids: &[u32]) -> String {
         let mut bytes = Vec::new();
         for &id in token_ids {
-            let tok = self.decode(id);
-            if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
-                if let Ok(byte) = u8::from_str_radix(&tok[3..5], 16) {
-                    bytes.push(byte);
-                    continue;
-                }
-            }
-            bytes.extend_from_slice(tok.as_bytes());
+            self.append_token_bytes(id, &mut bytes);
         }
         String::from_utf8_lossy(&bytes).into_owned()
     }
@@ -265,5 +273,26 @@ mod tests {
         let t = tok(&[], &[]);
         let out = t.encode("A", false);
         assert_eq!(out, vec![t.byte_to_id[b'A' as usize]]);
+    }
+
+    #[test]
+    fn leftmost_wins_on_rank_tie() {
+        // Two disjoint merges with the same rank: when both pairs appear,
+        // the leftmost must merge first (GPT-2 / llama.cpp convention).
+        // Build a vocab where (A,B) and (C,D) are both rank 0.
+        let t = tok(&[("<0x41>", "<0x42>"), ("<0x43>", "<0x44>")], &[]);
+        // Force equal rank: the helper numbers merges by index, so they
+        // already differ. Patch merge_rank directly.
+        let mut t = t;
+        let ab = t.tokens.iter().position(|s| s == "<0x41><0x42>").unwrap() as u32;
+        let cd = t.tokens.iter().position(|s| s == "<0x43><0x44>").unwrap() as u32;
+        let a = t.byte_to_id[b'A' as usize];
+        let b = t.byte_to_id[b'B' as usize];
+        let c = t.byte_to_id[b'C' as usize];
+        let d = t.byte_to_id[b'D' as usize];
+        t.merge_rank.insert((a, b), (0, ab));
+        t.merge_rank.insert((c, d), (0, cd));
+        let out = t.encode("ABCD", false);
+        assert_eq!(out, vec![ab, cd]);
     }
 }

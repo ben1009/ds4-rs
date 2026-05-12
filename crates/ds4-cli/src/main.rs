@@ -6,6 +6,24 @@ use std::path::PathBuf;
 use ds4_core::engine::Engine;
 use ds4_core::session::Session;
 
+/// Length of the longest valid UTF-8 prefix of `bytes`. Any trailing partial
+/// multi-byte sequence is left for the next call so streaming output doesn't
+/// split characters across flushes.
+fn utf8_valid_prefix_len(bytes: &[u8]) -> usize {
+    match std::str::from_utf8(bytes) {
+        Ok(_) => bytes.len(),
+        Err(e) => {
+            if e.error_len().is_some() {
+                // Real invalid byte — flush everything up to and including it;
+                // from_utf8_lossy on the next flush will emit U+FFFD for it.
+                bytes.len()
+            } else {
+                e.valid_up_to()
+            }
+        }
+    }
+}
+
 /// ds4-rs: DeepSeek V4 Flash inference engine for Linux
 #[derive(Parser)]
 #[command(name = "ds4", version)]
@@ -51,15 +69,26 @@ fn main() -> Result<()> {
 
             let logits = session.prefill(&tokens)?;
             let mut token = Session::argmax(logits);
+            let mut pending: Vec<u8> = Vec::new();
 
             for _ in 0..args.max_tokens {
                 if token == eos {
                     break;
                 }
-                write!(handle, "{}", engine.tokenizer.decode_tokens(&[token]))?;
-                handle.flush()?;
+                engine.tokenizer.append_token_bytes(token, &mut pending);
+                let split = utf8_valid_prefix_len(&pending);
+                if split > 0 {
+                    handle.write_all(&pending[..split])?;
+                    handle.flush()?;
+                    pending.drain(..split);
+                }
                 let logits = session.eval_token(token)?;
                 token = Session::argmax(logits);
+            }
+            if !pending.is_empty() {
+                // Any trailing invalid bytes: replace with U+FFFD once.
+                let tail = String::from_utf8_lossy(&pending);
+                handle.write_all(tail.as_bytes())?;
             }
             writeln!(handle)?;
         }
