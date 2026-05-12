@@ -11,6 +11,10 @@ pub struct Tokenizer {
     merge_rank: HashMap<(u32, u32), (usize, u32)>,
     /// Pre-computed byte token IDs for fast encode.
     byte_to_id: [u32; 256],
+    /// Reverse of `byte_to_id`, indexed by token ID. `Some(b)` means the
+    /// token decodes to a single raw byte via byte-fallback; `None` means
+    /// it's a regular text token.
+    id_to_byte: Vec<Option<u8>>,
     bos_token: u32,
     eos_token: u32,
 }
@@ -70,13 +74,18 @@ impl Tokenizer {
             .and_then(|v| v.to_u32())
             .unwrap_or(1);
 
-        // Pre-compute byte token IDs. Missing byte tokens mean the vocab is
-        // incompatible — bail rather than silently collapsing bytes to id 0.
+        // Pre-compute byte token IDs and the reverse map. Missing byte tokens
+        // mean the vocab is incompatible — bail rather than silently collapsing
+        // bytes to id 0.
         let mut byte_to_id = [0u32; 256];
+        let mut id_to_byte: Vec<Option<u8>> = vec![None; tokens.len()];
         for b in 0u8..=255 {
             let s = format!("<0x{b:02X}>");
             match token_to_id.get(&s) {
-                Some(&id) => byte_to_id[b as usize] = id,
+                Some(&id) => {
+                    byte_to_id[b as usize] = id;
+                    id_to_byte[id as usize] = Some(b);
+                }
                 None => anyhow::bail!("Byte token {s} missing from vocabulary"),
             }
         }
@@ -91,6 +100,7 @@ impl Tokenizer {
             tokens,
             merge_rank,
             byte_to_id,
+            id_to_byte,
             bos_token,
             eos_token,
         })
@@ -191,14 +201,12 @@ impl Tokenizer {
     /// tokens (`<0xNN>`) into their raw byte. Lets the caller buffer and flush
     /// only at UTF-8 boundaries when streaming.
     pub fn append_token_bytes(&self, token_id: u32, out: &mut Vec<u8>) {
-        let tok = self.decode(token_id);
-        if tok.starts_with("<0x") && tok.ends_with('>') && tok.len() == 6 {
-            if let Ok(byte) = u8::from_str_radix(&tok[3..5], 16) {
-                out.push(byte);
-                return;
-            }
+        let idx = token_id as usize;
+        if let Some(Some(b)) = self.id_to_byte.get(idx) {
+            out.push(*b);
+            return;
         }
-        out.extend_from_slice(tok.as_bytes());
+        out.extend_from_slice(self.decode(token_id).as_bytes());
     }
 
     /// Decode a sequence of token IDs to text, converting byte-fallback tokens.
@@ -247,13 +255,17 @@ mod tests {
             merge_rank.insert((lid, rid), (i, mid));
         }
         let mut byte_to_id = [0u32; 256];
+        let mut id_to_byte: Vec<Option<u8>> = vec![None; tokens.len()];
         for b in 0u8..=255 {
-            byte_to_id[b as usize] = token_to_id[&format!("<0x{b:02X}>")];
+            let id = token_to_id[&format!("<0x{b:02X}>")];
+            byte_to_id[b as usize] = id;
+            id_to_byte[id as usize] = Some(b);
         }
         Tokenizer {
             tokens,
             merge_rank,
             byte_to_id,
+            id_to_byte,
             bos_token: 0,
             eos_token: 1,
         }
