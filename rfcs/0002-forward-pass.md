@@ -28,11 +28,12 @@ unblock greedy generation via `ds4 -p "..."`.
 
 **Out of scope (explicitly deferred):**
 
-- Ratio-4 / ratio-128 compressor, indexer, mixed-KV sliding-window attention
-  — the full ds4 attention is gated behind these. Phase 1 uses *raw* attention
-  over the full context (no sliding window, no compressor). This produces
-  correct logits below `sliding_window = 128` tokens and an approximation
-  beyond; acceptable for a greedy smoke test, not for production quality.
+- Ratio-4 / ratio-128 compressor, indexer, mixed-KV long-range attention —
+  the full ds4 attention is gated behind these. Phase 1 implements the
+  standard sliding-window + sink path (see §3.4); the effective context is
+  `sliding_window = 128` tokens. Anything older than 128 is masked, so
+  "context" past that point genuinely doesn't contribute. Phase 2 lands
+  the compressor + indexer so long-range context participates again.
 - FP8 E4M3 KV storage round-trip. KV is stored as plain `f32`.
 - Speculative decoding / MTP draft model (Phase 4).
 - SIMD, threading, or any GPU backend.
@@ -94,22 +95,35 @@ custom `Tensor` abstraction now costs complexity and buys us nothing —
 everything operates on `&[f32]` with hand-computed strides. If we later want
 SIMD or threading, it goes *inside* each op, not in a shared type.
 
-### 3.4 Raw attention only in Phase 1
+### 3.4 Attention: sliding window + sink, no compressor/indexer
 
 Full ds4 attention routes every layer through a ratio-4 or ratio-128
-compressor plus a top-k indexer that produces a boolean mask. That's a
-separate mini-attention module plus two extra projections per layer and is
-the single largest deviation from "standard transformer". For this phase we:
+compressor plus a top-k indexer that produces a boolean mask on the KV
+cache. That's a separate mini-attention module plus two extra projections
+per layer and is the single largest deviation from "standard transformer".
+Phase 1 defers that machinery to Phase 2.
 
-1. Compute Q, K, V normally per token.
-2. Apply partial RoPE on the last 64 dims of each head.
-3. Add the per-head sink logit into the softmax denominator.
-4. Dot-product over the full context (no sliding window, no compressor).
+What Phase 1 *does* implement per layer:
 
-This is correct for `pos < sliding_window = 128` and increasingly
-approximate past that. Default `ctx_size = 2048` (see §3.5) keeps prompts
-well inside that budget for a smoke-test run. Phase 2 lands the real
-attention.
+1. Q, K, V from the MLA path (compressed KV latent up-projected per head).
+2. Partial RoPE on the last 64 dims of each head; inverse RoPE on the
+   attention output before the grouped output projection.
+3. **Sliding-window mask: attend only to positions in
+   `[max(0, pos - sliding_window), pos]` where `sliding_window = 128`.**
+   Positions older than that are masked to `-inf` in the softmax input. This
+   matches the model's training distribution — skipping the mask would make
+   generation past 128 tokens out-of-distribution, not just numerically
+   approximate.
+4. Per-head sink logit added into the softmax denominator only (never
+   contributes a value row).
+5. Dot-product over the surviving positions, f32 accumulate.
+
+Without the compressor/indexer the *effective* context is still
+`sliding_window = 128` tokens in Phase 1 — the cache holds up to
+`ctx_size` latents but only the most recent 128 participate in attention.
+This matches the "standard transformer" part of ds4's attention correctly;
+the long-range attention path that relies on the compressor + indexer
+lands in Phase 2.
 
 ### 3.5 KV cache layout — MLA latent caching
 
@@ -180,8 +194,19 @@ So Phase 1 commits to **hand-rolled per-dtype dot kernels** instead:
 
 Each kernel is a single block-loop over contiguous memory, accumulates into
 `f32`, and is small enough (~30–60 lines) to audit against the ggml
-reference. The aggregate `matmul(weight_view, activation) -> out_row`
-wrapper in `ops/matmul.rs` dispatches on the `WeightView` dtype.
+reference.
+
+**Two matmul signatures, sharing the same dot kernels:**
+
+- `matmul_row(weight, act_row, out_row)` — single activation vector. Used
+  in decode (one token per call) and in activation-sensitive sites where
+  batching doesn't help.
+- `matmul_batch(weight, acts: [M, K], out: [M, N])` — multiple activation
+  rows against the *same* weight blocks. Used in prefill so we dequant each
+  weight block once per prompt rather than once per token. For an 8-token
+  prompt through the output head this is ~8× less memory traffic on the
+  dominant weight-read path. Still hand-rolled loops — no external sgemm —
+  just an outer loop over activation rows inside the block walk.
 
 No pre-materialised f32 weights. No extra dep. No threading in Phase 1 —
 that's Phase 3's problem once the hot sites are profiled.
@@ -263,8 +288,12 @@ attention ones are larger (600–800). Each one builds and passes
 
 ## 6. Known gaps / risks
 
-- **Attention approximation.** Raw attention over full context diverges from
-  the C reference once `pos ≥ 128`. Documented in §3.4. Phase 2 fixes it.
+- **Sliding-window-only context.** Phase 1 attention masks positions older
+  than `sliding_window = 128`. That matches the training distribution
+  bit-for-bit *inside* the window but means long-range dependencies (which
+  in full ds4 flow through the compressor + indexer) are invisible until
+  Phase 2 lands them. A 2048-token prompt will generate coherent output
+  but will ignore everything older than its last 128 tokens.
 - **FP8 KV round-trip.** Not implemented. This changes KV values slightly
   even on first write. The cross-reference vectors in §4.2 must be
   generated with FP8 *disabled* in the C build, or the tolerances raised
