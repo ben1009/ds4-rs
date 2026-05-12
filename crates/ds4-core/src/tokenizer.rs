@@ -1,5 +1,6 @@
 use anyhow::Result;
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 
 use crate::gguf::Value;
 
@@ -29,17 +30,6 @@ impl Tokenizer {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let _scores: Vec<f32> = metadata
-            .get("tokenizer.ggml.scores")
-            .and_then(|v| v.to_array())
-            .ok_or_else(|| anyhow::anyhow!("Missing tokenizer.ggml.scores"))?
-            .iter()
-            .map(|v| {
-                v.to_f32()
-                    .ok_or_else(|| anyhow::anyhow!("Invalid score value"))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
         let merges: Vec<(String, String)> = metadata
             .get("tokenizer.ggml.merges")
             .and_then(|v| v.to_array())
@@ -47,12 +37,7 @@ impl Tokenizer {
                 arr.iter()
                     .filter_map(|v| {
                         v.to_string_val().and_then(|s| {
-                            let parts: Vec<&str> = s.splitn(2, ' ').collect();
-                            if parts.len() == 2 {
-                                Some((parts[0].to_string(), parts[1].to_string()))
-                            } else {
-                                None
-                            }
+                            s.split_once(' ').map(|(l, r)| (l.to_string(), r.to_string()))
                         })
                     })
                     .collect()
@@ -85,14 +70,14 @@ impl Tokenizer {
             .and_then(|v| v.to_u32())
             .unwrap_or(1);
 
-        // Pre-compute byte token IDs
+        // Pre-compute byte token IDs. Missing byte tokens mean the vocab is
+        // incompatible — bail rather than silently collapsing bytes to id 0.
         let mut byte_to_id = [0u32; 256];
         for b in 0u8..=255 {
             let s = format!("<0x{b:02X}>");
-            if let Some(&id) = token_to_id.get(&s) {
-                byte_to_id[b as usize] = id;
-            } else {
-                tracing::warn!("Byte token {s} not in vocabulary, using ID 0");
+            match token_to_id.get(&s) {
+                Some(&id) => byte_to_id[b as usize] = id,
+                None => anyhow::bail!("Byte token {s} missing from vocabulary"),
             }
         }
 
@@ -118,33 +103,69 @@ impl Tokenizer {
             return Vec::new();
         }
 
-        // Start with byte-level token IDs
         let mut pieces: Vec<u32> = text.bytes().map(|b| self.byte_to_id[b as usize]).collect();
+        let n = pieces.len();
 
-        // Iteratively merge the highest-priority adjacent pair.
-        loop {
-            if pieces.len() < 2 {
-                break;
+        if n >= 2 {
+            // Doubly-linked list over piece indices; usize::MAX = end.
+            let mut prev: Vec<usize> = (0..n).map(|i| i.wrapping_sub(1)).collect();
+            let mut next: Vec<usize> = (0..n).map(|i| i + 1).collect();
+            next[n - 1] = usize::MAX;
+
+            // Min-heap by merge rank, keyed by the left index of the pair.
+            // Stale entries are filtered when popped by re-checking the pair.
+            let mut heap: BinaryHeap<(Reverse<usize>, usize)> = BinaryHeap::new();
+            for i in 0..n - 1 {
+                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], pieces[i + 1])) {
+                    heap.push((Reverse(rank), i));
+                }
             }
 
-            let mut best_rank = usize::MAX;
-            let mut best_idx = 0usize;
-            for i in 0..pieces.len() - 1 {
-                if let Some(&(rank, _)) = self.merge_rank.get(&(pieces[i], pieces[i + 1])) {
-                    if rank < best_rank {
-                        best_rank = rank;
-                        best_idx = i;
+            while let Some((Reverse(rank), i)) = heap.pop() {
+                if pieces[i] == u32::MAX {
+                    continue;
+                }
+                let j = next[i];
+                if j == usize::MAX {
+                    continue;
+                }
+                let Some(&(r, merged_id)) = self.merge_rank.get(&(pieces[i], pieces[j])) else {
+                    continue;
+                };
+                if r != rank {
+                    continue;
+                }
+
+                pieces[i] = merged_id;
+                let k = next[j];
+                next[i] = k;
+                if k != usize::MAX {
+                    prev[k] = i;
+                }
+                pieces[j] = u32::MAX;
+
+                let p = prev[i];
+                if p != usize::MAX {
+                    if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[p], pieces[i])) {
+                        heap.push((Reverse(nr), p));
+                    }
+                }
+                if k != usize::MAX {
+                    if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[i], pieces[k])) {
+                        heap.push((Reverse(nr), i));
                     }
                 }
             }
 
-            if best_rank == usize::MAX {
-                break;
+            let mut compacted = Vec::with_capacity(n);
+            let mut idx = 0usize;
+            while idx != usize::MAX {
+                if pieces[idx] != u32::MAX {
+                    compacted.push(pieces[idx]);
+                }
+                idx = next[idx];
             }
-
-            let (_, merged_id) = self.merge_rank[&(pieces[best_idx], pieces[best_idx + 1])];
-            pieces[best_idx] = merged_id;
-            pieces.remove(best_idx + 1);
+            pieces = compacted;
         }
 
         if add_bos {
@@ -191,5 +212,58 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.tokens.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tok(merges: &[(&str, &str)], extra: &[&str]) -> Tokenizer {
+        let mut tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        for (l, r) in merges {
+            tokens.push(format!("{l}{r}"));
+        }
+        for t in extra {
+            tokens.push((*t).to_string());
+        }
+        let mut token_to_id = HashMap::new();
+        for (i, t) in tokens.iter().enumerate() {
+            token_to_id.insert(t.clone(), i as u32);
+        }
+        let mut merge_rank = HashMap::new();
+        for (i, (l, r)) in merges.iter().enumerate() {
+            let lid = token_to_id[*l];
+            let rid = token_to_id[*r];
+            let mid = token_to_id[&format!("{l}{r}")];
+            merge_rank.insert((lid, rid), (i, mid));
+        }
+        let mut byte_to_id = [0u32; 256];
+        for b in 0u8..=255 {
+            byte_to_id[b as usize] = token_to_id[&format!("<0x{b:02X}>")];
+        }
+        Tokenizer {
+            tokens,
+            merge_rank,
+            byte_to_id,
+            bos_token: 0,
+            eos_token: 1,
+        }
+    }
+
+    #[test]
+    fn chained_merge() {
+        // A=<0x41>, B=<0x42>, C=<0x43>; (A,B)->AB, (AB,C)->ABC
+        let t = tok(&[("<0x41>", "<0x42>"), ("<0x41><0x42>", "<0x43>")], &[]);
+        let out = t.encode("ABC", false);
+        let abc_id = t.tokens.iter().position(|s| s == "<0x41><0x42><0x43>").unwrap() as u32;
+        assert_eq!(out, vec![abc_id]);
+    }
+
+    #[test]
+    fn no_merges_keeps_bytes() {
+        let t = tok(&[], &[]);
+        let out = t.encode("A", false);
+        assert_eq!(out, vec![t.byte_to_id[b'A' as usize]]);
     }
 }

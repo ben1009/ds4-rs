@@ -10,34 +10,39 @@ pub struct Session {
     pos: u32,
     #[allow(dead_code)]
     ctx_size: u32,
+    logits: Vec<f32>,
 }
 
 impl Session {
     pub fn new(engine: Arc<Engine>, ctx_size: u32) -> Result<Self> {
         tracing::info!("Creating session with ctx_size={ctx_size}");
+        let n_vocab = engine.config.n_vocab as usize;
         Ok(Self {
             engine,
             tokens: Vec::new(),
             pos: 0,
             ctx_size,
+            logits: vec![0.0; n_vocab],
         })
     }
 
     /// Run prefill for the entire prompt. Returns logits for the last token.
-    pub fn prefill(&mut self, tokens: &[u32]) -> Result<Vec<f32>> {
+    pub fn prefill(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         tracing::info!("Prefill: {} tokens", tokens.len());
-        // TODO: implement forward pass via Metal graph
+        // TODO: implement forward pass
         self.tokens.extend_from_slice(tokens);
         self.pos = self.tokens.len() as u32;
-        Ok(vec![0.0; self.engine.config.n_vocab as usize])
+        self.logits.fill(0.0);
+        Ok(&self.logits)
     }
 
     /// Evaluate one decode token. Returns logits for the next token.
-    pub fn eval_token(&mut self, token: u32) -> Result<Vec<f32>> {
+    pub fn eval_token(&mut self, token: u32) -> Result<&[f32]> {
         // TODO: implement single-token forward pass
         self.tokens.push(token);
         self.pos += 1;
-        Ok(vec![0.0; self.engine.config.n_vocab as usize])
+        self.logits.fill(0.0);
+        Ok(&self.logits)
     }
 
     /// Greedy argmax: select the token with highest logit.

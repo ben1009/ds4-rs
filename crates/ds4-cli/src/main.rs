@@ -45,23 +45,22 @@ fn main() -> Result<()> {
             let tokens = engine.tokenizer.encode(&prompt, true);
             tracing::info!("Prompt: {} tokens", tokens.len());
 
-            let logits = session.prefill(&tokens)?;
-
-            let mut token = Session::argmax(&logits);
-            let mut generated = Vec::new();
-
-            for _ in 0..args.max_tokens {
-                if token == engine.tokenizer.eos_token() {
-                    break;
-                }
-                generated.push(token);
-                let logits = session.eval_token(token)?;
-                token = Session::argmax(&logits);
-            }
-
             let stdout = std::io::stdout();
             let mut handle = stdout.lock();
-            write!(handle, "{}", engine.tokenizer.decode_tokens(&generated))?;
+            let eos = engine.tokenizer.eos_token();
+
+            let logits = session.prefill(&tokens)?;
+            let mut token = Session::argmax(logits);
+
+            for _ in 0..args.max_tokens {
+                if token == eos {
+                    break;
+                }
+                write!(handle, "{}", engine.tokenizer.decode_tokens(&[token]))?;
+                handle.flush()?;
+                let logits = session.eval_token(token)?;
+                token = Session::argmax(logits);
+            }
             writeln!(handle)?;
         }
         None => {
