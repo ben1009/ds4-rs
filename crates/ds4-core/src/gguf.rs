@@ -1,9 +1,12 @@
-use anyhow::{bail, Result};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Cursor, Read},
+    path::Path,
+};
+
+use anyhow::{Result, bail};
 use memmap2::Mmap;
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Cursor, Read};
-use std::path::Path;
 
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const DEFAULT_ALIGNMENT: u64 = 32;

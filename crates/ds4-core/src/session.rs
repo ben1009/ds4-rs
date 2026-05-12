@@ -1,5 +1,6 @@
-use anyhow::Result;
 use std::sync::Arc;
+
+use anyhow::Result;
 
 use crate::engine::Engine;
 
@@ -48,19 +49,16 @@ impl Session {
     /// Greedy argmax: select the token with highest logit.
     /// NaN values are ignored. Returns `None` if `logits` is empty.
     pub fn argmax(logits: &[f32]) -> Option<u32> {
-        let (idx, _) = logits
-            .iter()
-            .enumerate()
-            .fold(
-                (None, f32::NEG_INFINITY),
-                |(idx_max, val_max), (idx, &val)| {
-                    if val > val_max {
-                        (Some(idx as u32), val)
-                    } else {
-                        (idx_max, val_max)
-                    }
-                },
-            );
+        let (idx, _) = logits.iter().enumerate().fold(
+            (None, f32::NEG_INFINITY),
+            |(idx_max, val_max), (idx, &val)| {
+                if val > val_max {
+                    (Some(idx as u32), val)
+                } else {
+                    (idx_max, val_max)
+                }
+            },
+        );
         idx
     }
 

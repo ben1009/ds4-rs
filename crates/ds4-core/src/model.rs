@@ -1,8 +1,11 @@
-use anyhow::Result;
 use std::path::Path;
 
-use crate::config::ModelConfig;
-use crate::gguf::{GgufMmap, TensorInfo};
+use anyhow::Result;
+
+use crate::{
+    config::ModelConfig,
+    gguf::{GgufMmap, TensorInfo},
+};
 
 /// Memory-mapped model weights with named tensor lookup.
 /// The mmap stays alive as long as WeightMap exists.
@@ -40,7 +43,12 @@ impl WeightMap {
 
     /// List all tensor names.
     pub fn tensor_names(&self) -> Vec<&str> {
-        self.gguf.content.tensors.keys().map(|s| s.as_str()).collect()
+        self.gguf
+            .content
+            .tensors
+            .keys()
+            .map(|s| s.as_str())
+            .collect()
     }
 
     /// Access the underlying mmap.

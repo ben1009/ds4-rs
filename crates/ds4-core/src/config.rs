@@ -44,7 +44,7 @@ impl ModelConfig {
 
         let head_dim = get_u32("llama.attention.key_length")
             .or_else(|_| get_u32("llama.attention.head_dim"))
-            .unwrap_or_else(|_| if n_head == 0 { n_embd } else { n_embd / n_head });
+            .unwrap_or_else(|_| n_embd.checked_div(n_head).unwrap_or(n_embd));
 
         Ok(Self {
             n_vocab,

@@ -9,8 +9,8 @@ name = "ds4"
 path = "src/main.rs"
 
 [dependencies]
-ds4-core = { path = "../ds4-core" }
+anyhow = { workspace = true }
 clap = { workspace = true }
+ds4-core = { path = "../ds4-core" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-anyhow = { workspace = true }

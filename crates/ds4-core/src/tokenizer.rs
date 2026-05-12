@@ -1,6 +1,9 @@
+use std::{
+    cmp::Reverse,
+    collections::{BinaryHeap, HashMap},
+};
+
 use anyhow::Result;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
 
 use crate::gguf::Value;
 
@@ -41,7 +44,8 @@ impl Tokenizer {
                 arr.iter()
                     .filter_map(|v| {
                         v.to_string_val().and_then(|s| {
-                            s.split_once(' ').map(|(l, r)| (l.to_string(), r.to_string()))
+                            s.split_once(' ')
+                                .map(|(l, r)| (l.to_string(), r.to_string()))
                         })
                     })
                     .collect()
@@ -156,15 +160,15 @@ impl Tokenizer {
                 pieces[j] = u32::MAX;
 
                 let p = prev[i];
-                if p != usize::MAX {
-                    if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[p], pieces[i])) {
-                        heap.push((Reverse(nr), Reverse(p)));
-                    }
+                if p != usize::MAX
+                    && let Some(&(nr, _)) = self.merge_rank.get(&(pieces[p], pieces[i]))
+                {
+                    heap.push((Reverse(nr), Reverse(p)));
                 }
-                if k != usize::MAX {
-                    if let Some(&(nr, _)) = self.merge_rank.get(&(pieces[i], pieces[k])) {
-                        heap.push((Reverse(nr), Reverse(i)));
-                    }
+                if k != usize::MAX
+                    && let Some(&(nr, _)) = self.merge_rank.get(&(pieces[i], pieces[k]))
+                {
+                    heap.push((Reverse(nr), Reverse(i)));
                 }
             }
 
@@ -276,7 +280,11 @@ mod tests {
         // A=<0x41>, B=<0x42>, C=<0x43>; (A,B)->AB, (AB,C)->ABC
         let t = tok(&[("<0x41>", "<0x42>"), ("<0x41><0x42>", "<0x43>")], &[]);
         let out = t.encode("ABC", false);
-        let abc_id = t.tokens.iter().position(|s| s == "<0x41><0x42><0x43>").unwrap() as u32;
+        let abc_id = t
+            .tokens
+            .iter()
+            .position(|s| s == "<0x41><0x42><0x43>")
+            .unwrap() as u32;
         assert_eq!(out, vec![abc_id]);
     }
 
