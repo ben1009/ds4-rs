@@ -24,8 +24,14 @@ jobs:
             sudo apt install llvm
             # to fix buggy leak analyzer:
             # https://github.com/japaric/rust-san#unrealiable-leaksanitizer
-            sed -i '/\[features\]/i [profile.dev]' Cargo.toml
-            sed -i '/profile.dev/a opt-level = 1' Cargo.toml
+            # Append a dev profile with opt-level=1 so debug symbols survive.
+            # (The original `sed -i '/\[features\]/i ...'` was a no-op here
+            # because the workspace Cargo.toml has no [features] section.)
+            {
+              echo ''
+              echo '[profile.dev]'
+              echo 'opt-level = 1'
+            } >> Cargo.toml
             cat Cargo.toml
         name: Enable debug symbols
       - name: Rust Cache
@@ -40,7 +46,6 @@ jobs:
         if: always()
         run: cargo +nightly test --all-features --target x86_64-unknown-linux-gnu
         env:
-          LSAN_OPTIONS: "suppressions=lsan-suppressions.txt"
           RUSTFLAGS: "-Z sanitizer=leak"
   miri:
     runs-on: ubuntu-latest
