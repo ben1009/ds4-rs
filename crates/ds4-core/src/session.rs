@@ -122,7 +122,10 @@ mod tests {
         kv_u32(&mut buf, "llama.feed_forward_length", 32);
         kv_arr_string(&mut buf, "tokenizer.ggml.tokens", &tokens);
 
-        std::fs::File::create(path).unwrap().write_all(&buf).unwrap();
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
     }
 
     fn open_engine() -> Arc<Engine> {
@@ -169,6 +172,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn session_prefill_tracks_tokens_and_pos() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 128).unwrap();
@@ -182,6 +189,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn session_eval_token_appends_and_increments_pos() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 128).unwrap();
@@ -193,6 +204,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn session_engine_accessor_returns_same() {
         let engine = open_engine();
         let s = Session::new(engine.clone(), 64).unwrap();

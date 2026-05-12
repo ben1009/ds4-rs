@@ -431,7 +431,10 @@ mod tests {
             .collect();
         // Skip 0xFF — should cause construction to fail.
         let mut m = std::collections::HashMap::new();
-        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens.clone()));
+        m.insert(
+            "tokenizer.ggml.tokens".to_string(),
+            Value::Array(tokens.clone()),
+        );
 
         assert!(Tokenizer::from_metadata(&m).is_err());
 

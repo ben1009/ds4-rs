@@ -656,7 +656,9 @@ mod tests {
         // Either the range check or read_exact can fire depending on whether
         // enough bytes are present to even try the slice. Accept both.
         let msg = err.to_string();
-        assert!(msg.contains("extends past end of file") || msg.contains("failed to fill whole buffer"));
+        assert!(
+            msg.contains("extends past end of file") || msg.contains("failed to fill whole buffer")
+        );
     }
 
     #[test]
@@ -670,8 +672,14 @@ mod tests {
 
         let c = GgufContent::parse(&b.build()).unwrap();
         assert_eq!(c.metadata.get("u32").unwrap().to_u32(), Some(42));
-        assert_eq!(c.metadata.get("u64").unwrap().to_u64(), Some(0xFFFF_FFFF_FFFF));
-        assert_eq!(c.metadata.get("str").unwrap().to_string_val(), Some("hello"));
+        assert_eq!(
+            c.metadata.get("u64").unwrap().to_u64(),
+            Some(0xFFFF_FFFF_FFFF)
+        );
+        assert_eq!(
+            c.metadata.get("str").unwrap().to_string_val(),
+            Some("hello")
+        );
         assert_eq!(c.metadata.get("flag").unwrap().to_bool(), Some(true));
     }
 
@@ -769,6 +777,10 @@ mod tests {
     // ---- GgufMmap tests ---------------------------------------------------------
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn ggufmmap_open_and_tensor_data_roundtrip() {
         use std::{
             io::Write,
@@ -792,11 +804,8 @@ mod tests {
         let bytes = b.build();
 
         // Write to a tempfile and open via GgufMmap.
-        let path = std::env::temp_dir().join(format!(
-            "ds4-gguf-test-{}-{}.bin",
-            std::process::id(),
-            seq,
-        ));
+        let path =
+            std::env::temp_dir().join(format!("ds4-gguf-test-{}-{}.bin", std::process::id(), seq,));
         {
             let mut f = std::fs::File::create(&path).unwrap();
             f.write_all(&bytes).unwrap();
