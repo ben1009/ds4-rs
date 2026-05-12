@@ -19,8 +19,10 @@ unblock greedy generation via `ds4 -p "..."`.
 - HC (hyper-connection) split/mix using 20 Sinkhorn iterations.
 - Dequantisation for the weight dtypes actually used: F16, Q8_0, Q2_K, Q4_K,
   IQ2_XXS, IQ4_K. (One dequant path per dtype, no shortcuts.)
-- In-memory ring-buffer raw KV cache sized to `ctx_size`. No on-disk cache
-  (that's Phase 2), no FP8 round-trip on KV writes yet (see §6).
+- In-memory MLA latent KV cache (512-dim latent + 64-dim decoupled RoPE key
+  per token, per layer). Up-projection happens inside the attention kernel.
+  No on-disk cache (that's Phase 2), no FP8 round-trip on KV writes yet
+  (see §6).
 - Golden-vector tests against the C reference for selected ops and a short
   greedy prompt.
 
@@ -61,7 +63,7 @@ All new code under `crates/ds4-core/src/`.
 | `model/weights.rs` | Typed accessors: `WeightMap::q8_0("attn_q_a.weight")` → `Q8_0View<'a>`; one method per dtype. Wraps the existing `tensor_bytes(name)` API. |
 | `model/layer.rs` | `Layer { attn, moe, hc_attn, hc_ffn }` structs — just borrowed views, no owned data. Built once in `Engine::open`. |
 | `model/forward.rs` | The orchestration: `forward(engine, state, tokens) -> logits`. Linear, no trait abstractions. |
-| `model/kv_cache.rs` | `KvCache { keys: Vec<f32>, values: Vec<f32>, pos: usize }` — flat f32, shape `[n_layer, ctx, n_head=64, head_dim=512]` appended in place. |
+| `model/kv_cache.rs` | `KvCache { latent: Vec<f32>, k_pe: Vec<f32>, pos: usize }` — MLA latent storage. Shapes `[n_layer, ctx, 512]` and `[n_layer, ctx, 64]`, appended in place. Up-projection runs inside the attention kernel. |
 
 Naming sticks to the antirez/ds4 conventions so grepping cross-repo works.
 
@@ -105,19 +107,36 @@ the single largest deviation from "standard transformer". For this phase we:
 4. Dot-product over the full context (no sliding window, no compressor).
 
 This is correct for `pos < sliding_window = 128` and increasingly
-approximate past that. Prompt + 64 tokens fits comfortably under that budget
-for a smoke-test prompt. Phase 2 lands the real attention.
+approximate past that. Default `ctx_size = 2048` (see §3.5) keeps prompts
+well inside that budget for a smoke-test run. Phase 2 lands the real
+attention.
 
-### 3.5 KV cache layout
+### 3.5 KV cache layout — MLA latent caching
 
-Flat `Vec<f32>`, indexed by `[layer][pos][head][dim]`. Position 0 is the BOS
-token after prefill. We do not reuse or save across sessions in this phase
-(no disk cache until Phase 2), so no compression, no FP8.
+MLA's whole point is that K/V don't need to live in the cache as
+`[n_head × head_dim]` per token. The compressor projects each token down to
+a 512-dim latent (`attn_kv_a_norm` output) plus a 64-dim decoupled RoPE key
+(`k_pe`), and attention up-projects on the fly per query-head. So we cache
+the *latent*, not the materialised K/V.
 
-Pre-allocated at `Session::new` to `n_layer * ctx_size * n_head * head_dim`
-f32s. For 43 × 32768 × 64 × 512 × 4 B that's ~170 GB, so we'll cap
-`ctx_size` in this phase at something sane (4096) and document the
-restriction. Real deployments need compressed KV anyway.
+Per-token cache footprint (f32):
+
+| Tensor | Dim | Bytes/token |
+|--------|-----|-------------|
+| `kv_latent` (pre-expand) | 512 | 2 KiB |
+| `k_pe` (decoupled RoPE key) | 64 | 256 B |
+| **Total** | 576 | **2.25 KiB** |
+
+For `ctx_size = 4096` and 43 layers: `4096 × 43 × 2.25 KiB ≈ 396 MiB`.
+vs ~23 GiB for materialised K/V per-head — ~60× smaller.
+
+Layout: two flat `Vec<f32>`s per session, indexed `[layer][pos][dim]`.
+Up-projection runs inside the attention kernel using the same `attn_kv` /
+`attn_k_nope` / `attn_v` weights as prefill — there is no second copy.
+
+Default `ctx_size = 2048` (~200 MiB KV) for the Phase 1 smoke test;
+configurable up to 4096. We surface a clear error past that until Phase 2
+lands the compressor + indexer.
 
 ### 3.6 Non-tied output head
 
@@ -132,6 +151,26 @@ combine matrix produced per layer from the `hc_*_fn / _scale / _base`
 weights. 20 Sinkhorn iterations, unrolled, element-wise normalise rows then
 columns.
 
+### 3.8 Matmul: `matrixmultiply` on the hot path
+
+A naive triple-loop f32×f32 matmul against a 4096→129280 output head is
+~1 GFLOPs/token at best and takes ~10+ seconds per token on commodity CPUs —
+too slow even for a "correctness-only" smoke test. We pull in
+[`matrixmultiply`](https://crates.io/crates/matrixmultiply) (pure Rust,
+SIMD-microkernel, no BLAS dep) for the f32×f32 hot path:
+
+- f32 activations × f32 (dequant result) — handled by `matrixmultiply::sgemm`.
+- Quantised weight matmuls still walk blocks directly (no pre-dequant), but
+  accumulate into f32 with the same microkernel-shaped inner loop so the
+  hot path stays vectorised.
+
+No `rayon` / threading in Phase 1 — parallelism is a Phase 3 concern and
+would fragment the golden-vector tolerances. Single-threaded
+`matrixmultiply` is the sweet spot: tens of lines of plumbing, ~5–10×
+speedup, no behavioural change.
+
+Add `matrixmultiply = "0.3"` to `workspace.dependencies` in PR #1.
+
 ## 4. Testing strategy
 
 Three layers of tests. Each new op lands with a test in its own PR — none
@@ -145,21 +184,30 @@ a reference .gguf for these.
 
 ### 4.2 Cross-reference vectors against the C implementation
 
-Pick ~20 tensors/intermediates and dump them from antirez/ds4 under a
-single-threaded CPU build for a fixed 4-token prompt. Compare within
-`1e-4` relative tolerance. Candidates:
+**Vectors land alongside the op PR that produces them, not in a final
+"big bang" PR.** A single bit-exact vector per op guards that PR's
+correctness forever, and debugging a regression means staring at one op's
+diff, not the whole forward pass.
 
-- Token embedding lookup for the 4 tokens.
-- Output of `attn_q_a` × `attn_q_a_norm` × `attn_q_b` for layer 0.
-- KV projection output for layer 0.
-- Attention output pre-RoPE-inverse for layer 0.
-- MoE router probabilities (before biased top-k) for layer 3 (first top-k
-  layer).
-- Final logits for the 4th token.
+Per-PR vector ownership (maps to the commit roadmap in §5):
 
-These vectors live under `crates/ds4-core/tests/vectors/` as small binary
-files + a Python script that regenerates them from the C build. The
-regeneration script is not run in CI, only when we need to refresh.
+| PR | Vector |
+|----|--------|
+| 1 (Q8_0 matmul) | Dequant output for one Q8_0 block + one 32×K×M matmul result. |
+| 2 (RMSNorm) | `rms_norm(x, w, 1e-6)` for a 4096-wide slice. |
+| 3 (RoPE) | Rotated Q for a single head at positions 0, 1, 127. |
+| 4 (Q8_K pre-quant) | `ds4_quantize_row_q8_K` output for a 256-wide row. |
+| 5 (IQ2_XXS / Q2_K) | One full dot-product of a Q8_K row against an IQ2_XXS and a Q2_K block. |
+| 6 (Q4_K / IQ4_K) | Same shape as (5) for the Q4 variants. |
+| 7 (softmax / SwiGLU / HC Sinkhorn) | 20-iter Sinkhorn on a 4×4 matrix; `sqrt(softplus(x))` for 8 values. |
+| 9 (attention block) | Full layer-0 attention output on a 4-token prefill. |
+| 10 (MoE block) | Router probs + expert outputs for layer 3 on a single token. |
+| 11 (end-to-end forward) | Final logits for the 4th token of the fixed 4-token prompt. |
+
+Dumping these from antirez/ds4 needs a small patch that disables FP8 KV
+rounding (so our tolerances stay at `1e-4`) and writes each intermediate
+to a `.bin`. The patch + script live in `scripts/regen_vectors.sh`, run
+manually, not in CI.
 
 ### 4.3 End-to-end smoke test
 
@@ -189,7 +237,7 @@ Each bullet = one PR. Ordered for incremental landability.
 10. **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
     layer runs.
 11. **`model/forward.rs` + CLI wiring** — `ds4 -p` produces real logits;
-    lands the cross-reference vectors.
+    lands the final end-to-end reference vector.
 12. **End-to-end smoke test + PLAN.md update.**
 
 Roughly 12 PRs. The early ones are small (200–400 lines); the MoE and
@@ -208,11 +256,13 @@ attention ones are larger (600–800). Each one builds and passes
 - **Hash-layer routing (layers 0–2).** Requires loading `ffn_gate_tid2eid`
   (I32, 6 × n_vocab = 3 MB). Confirm the tensor exists in the GGUF we
   target before starting PR #10.
-- **Memory at high ctx_size.** As noted in §3.5 the raw KV is enormous;
-  we cap to 4096 tokens this phase and surface a clear error past that.
-- **Performance.** A naive triple-loop matmul over a 4096→129280 Q8_0 head
-  will be slow. Acceptable for Phase 1 (correctness-only); Phase 3 replaces
-  hot loops.
+- **Memory at high ctx_size.** MLA latent caching brings the default
+  2048-token KV to ~200 MiB and 4096 tokens to ~400 MiB (§3.5) —
+  manageable on a dev box. Anything past 4096 errors out until Phase 2
+  lands compressor + indexer.
+- **Performance.** Even with `matrixmultiply` the Phase 1 path is
+  correctness-focused, not production-fast. Expect seconds-per-token on
+  commodity CPUs; Phase 3 revisits hot loops.
 
 ## 7. What this PR contains
 
