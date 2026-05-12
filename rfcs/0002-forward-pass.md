@@ -49,12 +49,12 @@ All new code under `crates/ds4-core/src/`.
 
 | Module | Responsibility |
 |--------|---------------|
-| `tensor.rs` | Minimal `Tensor<'a>` — borrowed `&[f32]` view with shape + strides. Owned `OwnedTensor` for scratch buffers. No autograd, no broadcasting framework. Just shape-carrying slices. |
+| `tensor.rs` | Minimal `Tensor<'a>` — borrowed `&[f32]` view with shape + strides, plus safe indexing helpers (`offset(&[i, j, ...])`, `row(i)`, `view_2d`). No autograd, no broadcasting framework. Owned `OwnedTensor` for scratch buffers. |
 | `quant/mod.rs` | Dequant entry point: `dequant(dtype, bytes, out: &mut [f32])`. |
 | `quant/q8_0.rs` | Q8_0 block (34 B/32 elem) → f32. |
 | `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_k.rs` | K-quant and I-quant paths. Each is a direct port of the ggml reference with a test vector per block format. |
 | `quant/q8_k.rs` | f32 → Q8_K (activation pre-quant for IQ2_XXS/Q2_K matmuls). |
-| `ops/matmul.rs` | `matmul_f32(a: [M,K], b: [N,K], out: [M,N])`. Plus `matmul_mixed(a_q8k, b_iq2xxs, ...)` for routed experts. Naive triple loop, no blocking yet. |
+| `ops/matmul.rs` | `matmul(weight: WeightView, act: &[f32], out: &mut [f32])` — dispatches to per-dtype dot kernels (§3.8). Hand-rolled block loops, no external BLAS. |
 | `ops/norm.rs` | `rms_norm(x, weight, eps, out)` and `rms_norm_no_weight` used by HC pre/post and output head. |
 | `ops/rope.rs` | Partial RoPE on the last 64 dims of each 512-dim head, with YaRN scale. Two frequency bases: 10000 (attention) and 160000 (compressor — unused in Phase 1). |
 | `ops/softmax.rs` | Standard softmax + the `sqrt(softplus(logit))` router activation. |
@@ -63,7 +63,7 @@ All new code under `crates/ds4-core/src/`.
 | `model/weights.rs` | Typed accessors: `WeightMap::q8_0("attn_q_a.weight")` → `Q8_0View<'a>`; one method per dtype. Wraps the existing `tensor_bytes(name)` API. |
 | `model/layer.rs` | `Layer { attn, moe, hc_attn, hc_ffn }` structs — just borrowed views, no owned data. Built once in `Engine::open`. |
 | `model/forward.rs` | The orchestration: `forward(engine, state, tokens) -> logits`. Linear, no trait abstractions. |
-| `model/kv_cache.rs` | `KvCache { latent: Vec<f32>, k_pe: Vec<f32>, pos: usize }` — MLA latent storage. Shapes `[n_layer, ctx, 512]` and `[n_layer, ctx, 64]`, appended in place. Up-projection runs inside the attention kernel. |
+| `model/kv_cache.rs` | `KvCache { latent: Vec<f32>, k_pe: Vec<f32>, pos: usize }` — MLA latent storage, pre-allocated at `Session::new` to full `[n_layer, ctx, 512]` and `[n_layer, ctx, 64]`. Writes are O(1) per-layer slice mutations; `pos` is the watermark, no reallocation during generation. Up-projection runs inside the attention kernel. |
 
 Naming sticks to the antirez/ds4 conventions so grepping cross-repo works.
 
@@ -148,28 +148,43 @@ lands the compressor + indexer.
 Residual stream is 4 parallel `f32` vectors of width `n_embd = 4096`. Sub-
 layer output is reduced into the stream via a Sinkhorn-normalised 4×4
 combine matrix produced per layer from the `hc_*_fn / _scale / _base`
-weights. 20 Sinkhorn iterations, unrolled, element-wise normalise rows then
+weights. A plain 20-iteration loop: element-wise normalise rows, then
 columns.
 
-### 3.8 Matmul: `matrixmultiply` on the hot path
+### 3.8 Matmul: hand-rolled per-dtype dot kernels
 
-A naive triple-loop f32×f32 matmul against a 4096→129280 output head is
-~1 GFLOPs/token at best and takes ~10+ seconds per token on commodity CPUs —
-too slow even for a "correctness-only" smoke test. We pull in
-[`matrixmultiply`](https://crates.io/crates/matrixmultiply) (pure Rust,
-SIMD-microkernel, no BLAS dep) for the f32×f32 hot path:
+The hot matmuls are *quantised×f32*, not f32×f32:
 
-- f32 activations × f32 (dequant result) — handled by `matrixmultiply::sgemm`.
-- Quantised weight matmuls still walk blocks directly (no pre-dequant), but
-  accumulate into f32 with the same microkernel-shaped inner loop so the
-  hot path stays vectorised.
+| Site | Weight dtype | Count |
+|------|--------------|-------|
+| attn Q/KV/out projections | Q8_0 | 5 per layer × 43 layers |
+| MoE shared gate/up/down | Q8_0 | 3 per layer |
+| MoE routed gate/up | IQ2_XXS or IQ4_K | 2 × 6 per layer (top-k=6) |
+| MoE routed down | Q2_K or Q4_K | 1 × 6 per layer |
+| HC / router / compressor gates | F16 | ~4 per layer |
+| Output head | Q8_0 | 1 |
 
-No `rayon` / threading in Phase 1 — parallelism is a Phase 3 concern and
-would fragment the golden-vector tolerances. Single-threaded
-`matrixmultiply` is the sweet spot: tens of lines of plumbing, ~5–10×
-speedup, no behavioural change.
+A pre-built f32×f32 kernel like `matrixmultiply::sgemm` only helps sites
+where *both* inputs are already f32 — and there are essentially none. All
+the heavy sites need either a block-wise dequant dot product (Q8_0) or an
+activation pre-quantisation to Q8_K (for IQ2_XXS / Q2_K / IQ4_K / Q4_K),
+then a block-wise mixed dot product — the same pattern as ggml's
+`ggml_vec_dot_*` kernels.
 
-Add `matrixmultiply = "0.3"` to `workspace.dependencies` in PR #1.
+So Phase 1 commits to **hand-rolled per-dtype dot kernels** instead:
+
+- `dot_q8_0_f32` — Q8_0 block × f32 row → f32 scalar.
+- `dot_q8k_iq2xxs` / `dot_q8k_q2k` / `dot_q8k_iq4k` / `dot_q8k_q4k` —
+  Q8_K-quantised activation × quantised weight → f32 scalar.
+- `matmul_f16_f32` — F16 weights × f32 activation, dequant-while-iterating.
+
+Each kernel is a single block-loop over contiguous memory, accumulates into
+`f32`, and is small enough (~30–60 lines) to audit against the ggml
+reference. The aggregate `matmul(weight_view, activation) -> out_row`
+wrapper in `ops/matmul.rs` dispatches on the `WeightView` dtype.
+
+No pre-materialised f32 weights. No extra dep. No threading in Phase 1 —
+that's Phase 3's problem once the hot sites are profiled.
 
 ## 4. Testing strategy
 
@@ -219,9 +234,11 @@ must be deterministic.
 
 Each bullet = one PR. Ordered for incremental landability.
 
-1. **`quant/q8_0` + `ops/matmul` (f32×Q8_0)** — smallest useful slice, tests
-   on known block.
-2. **`tensor.rs` + `ops/rms_norm`** — trivial but unblocks the norm sites.
+1. **`tensor.rs` + `quant/q8_0` + `ops/matmul` (f32×Q8_0 dot kernel)** —
+   foundational Tensor type lands first so subsequent ops build on it.
+   Smallest useful slice: Q8_0 block dequant test + a `dot_q8_0_f32` unit
+   test on a known vector.
+2. **`ops/rms_norm`** — unblocks the norm sites.
 3. **`ops/rope` (partial + YaRN)** — isolated, tested with a hand-computed
    rotation.
 4. **`quant/q8_k` + Q8_K activation pre-quant path** — needed before the
@@ -260,9 +277,10 @@ attention ones are larger (600–800). Each one builds and passes
   2048-token KV to ~200 MiB and 4096 tokens to ~400 MiB (§3.5) —
   manageable on a dev box. Anything past 4096 errors out until Phase 2
   lands compressor + indexer.
-- **Performance.** Even with `matrixmultiply` the Phase 1 path is
+- **Performance.** The hand-rolled per-dtype dot kernels (§3.8) are
   correctness-focused, not production-fast. Expect seconds-per-token on
-  commodity CPUs; Phase 3 revisits hot loops.
+  commodity CPUs; Phase 3 revisits hot loops with SIMD / threading once
+  the golden vectors are locked in.
 
 ## 7. What this PR contains
 
