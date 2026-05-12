@@ -55,7 +55,7 @@ All new code under `crates/ds4-core/src/`.
 | `quant/q8_0.rs` | Q8_0 block (34 B/32 elem) → f32. |
 | `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_k.rs` | K-quant and I-quant paths. Each is a direct port of the ggml reference with a test vector per block format. |
 | `quant/q8_k.rs` | f32 → Q8_K (activation pre-quant for IQ2_XXS/Q2_K matmuls). |
-| `ops/matmul.rs` | `matmul(weight: WeightView, act: &[f32], out: &mut [f32])` — dispatches to per-dtype dot kernels (§3.8). Hand-rolled block loops, no external BLAS. |
+| `ops/matmul.rs` | Two signatures sharing dot kernels (§3.8): `matmul_row(weight: WeightView, act: &[f32], out: &mut [f32])` for decode; `matmul_batch(weight: WeightView, acts: &[f32], out: &mut [f32], m: usize)` for prefill. Dispatches to per-dtype dot kernels. Hand-rolled block loops, no external BLAS. |
 | `ops/norm.rs` | `rms_norm(x, weight, eps, out)` and `rms_norm_no_weight` used by HC pre/post and output head. |
 | `ops/rope.rs` | Partial RoPE on the last 64 dims of each 512-dim head, with YaRN scale. Two frequency bases: 10000 (attention) and 160000 (compressor — unused in Phase 1). |
 | `ops/softmax.rs` | Standard softmax + the `sqrt(softplus(logit))` router activation. |
@@ -110,10 +110,12 @@ What Phase 1 *does* implement per layer:
    attention output before the grouped output projection.
 3. **Sliding-window mask: attend only to positions in
    `[max(0, pos - sliding_window), pos]` where `sliding_window = 128`.**
-   Positions older than that are masked to `-inf` in the softmax input. This
-   matches the model's training distribution — skipping the mask would make
-   generation past 128 tokens out-of-distribution, not just numerically
-   approximate.
+   Positions older than that are masked to a large negative constant
+   (`-1e30` in f32) in the softmax input. We avoid true `-inf` so a fully-
+   masked row (shouldn't happen thanks to the sink logit, but defensively)
+   can't produce `NaN` after the exp/normalise. Skipping the mask would
+   make generation past 128 tokens out-of-distribution, not just
+   numerically approximate.
 4. Per-head sink logit added into the softmax denominator only (never
    contributes a value row).
 5. Dot-product over the surviving positions, f32 accumulate.
@@ -163,7 +165,9 @@ Residual stream is 4 parallel `f32` vectors of width `n_embd = 4096`. Sub-
 layer output is reduced into the stream via a Sinkhorn-normalised 4×4
 combine matrix produced per layer from the `hc_*_fn / _scale / _base`
 weights. A plain 20-iteration loop: element-wise normalise rows, then
-columns.
+columns. Each row / column sum gets a `+ 1e-9` epsilon before the divide
+so a degenerate weight matrix (all-zero row during init or pathological
+input) can't NaN the residual stream.
 
 ### 3.8 Matmul: hand-rolled per-dtype dot kernels
 
@@ -246,8 +250,12 @@ Per-PR vector ownership (maps to the commit roadmap in §5):
 
 Dumping these from antirez/ds4 needs a small patch that disables FP8 KV
 rounding (so our tolerances stay at `1e-4`) and writes each intermediate
-to a `.bin`. The patch + script live in `scripts/regen_vectors.sh`, run
-manually, not in CI.
+to a `.bin`. The patch + script land in `scripts/regen_vectors.sh` as part
+of **PR #1** — same PR that produces the first vectors. This is a hard
+prerequisite: without the script, PR #1's vector isn't reproducible and
+later PRs can't land their vectors either. The script is run manually, not
+in CI, but CI *does* check that the committed vectors still match on every
+PR by comparing their SHA against a manifest.
 
 ### 4.3 End-to-end smoke test
 
@@ -259,10 +267,13 @@ must be deterministic.
 
 Each bullet = one PR. Ordered for incremental landability.
 
-1. **`tensor.rs` + `quant/q8_0` + `ops/matmul` (f32×Q8_0 dot kernel)** —
-   foundational Tensor type lands first so subsequent ops build on it.
-   Smallest useful slice: Q8_0 block dequant test + a `dot_q8_0_f32` unit
-   test on a known vector.
+1. **`tensor.rs` + `quant/q8_0` + `ops/matmul` (f32×Q8_0 dot kernel) +
+   `scripts/regen_vectors.sh`** — foundational Tensor type lands first so
+   subsequent ops build on it. Smallest useful slice: Q8_0 block dequant
+   test + a `dot_q8_0_f32` unit test on a known vector. Ships the
+   vector-regeneration harness (C-side patch that disables FP8 KV + a
+   driver that dumps each op's intermediate) so every later PR can produce
+   its own reference vector deterministically.
 2. **`ops/rms_norm`** — unblocks the norm sites.
 3. **`ops/rope` (partial + YaRN)** — isolated, tested with a hand-computed
    rotation.
@@ -286,8 +297,6 @@ Roughly 12 PRs. The early ones are small (200–400 lines); the MoE and
 attention ones are larger (600–800). Each one builds and passes
 `cargo test --workspace` on its own.
 
-## 6. Known gaps / risks
-
 - **Sliding-window-only context.** Phase 1 attention masks positions older
   than `sliding_window = 128`. That matches the training distribution
   bit-for-bit *inside* the window but means long-range dependencies (which
@@ -310,6 +319,12 @@ attention ones are larger (600–800). Each one builds and passes
   correctness-focused, not production-fast. Expect seconds-per-token on
   commodity CPUs; Phase 3 revisits hot loops with SIMD / threading once
   the golden vectors are locked in.
+- **Phase 3 follow-ups intentionally skipped here.** Reviewers flagged
+  aligned `Tensor` allocations (for AVX-512) and cache-tiled `matmul_batch`
+  as future work. Both are real wins but both are SIMD/perf-shaped, so
+  they land after the Phase 1 golden vectors prove the kernels are
+  numerically correct. Logged as TODOs in the Phase 3 section of `PLAN.md`,
+  not plumbed into Phase 1 scope.
 
 ## 7. What this PR contains
 
