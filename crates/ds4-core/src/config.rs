@@ -35,29 +35,30 @@ impl ModelConfig {
                 .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))
         };
 
+        let n_vocab = get_u32("llama.vocab_size")?;
         let n_embd = get_u32("llama.embedding_length")?;
+        let n_head = get_u32("llama.attention.head_count")?;
+        let n_kv_head = get_u32("llama.attention.head_count_kv")?;
+        let n_layer = get_u32("llama.block_count")?;
+        let n_ff = get_u32("llama.feed_forward_length")?;
+
+        let head_dim = get_u32("llama.attention.key_length")
+            .or_else(|_| get_u32("llama.attention.head_dim"))
+            .unwrap_or_else(|_| if n_head == 0 { n_embd } else { n_embd / n_head });
 
         Ok(Self {
-            n_vocab: get_u32("llama.vocab_size")?,
+            n_vocab,
             n_embd,
-            n_head: get_u32("llama.attention.head_count")?,
-            n_kv_head: get_u32("llama.attention.head_count_kv")?,
-            n_layer: get_u32("llama.block_count")?,
-            n_ff: get_u32("llama.feed_forward_length")?,
-            n_expert: get_u32("llama.expert_count").ok().unwrap_or(0),
-            n_expert_used: get_u32("llama.expert_used_count").ok().unwrap_or(0),
-            n_hc: get_u32("ds4.hc_count").ok().unwrap_or(4),
-            head_dim: get_u32("llama.attention.key_length")
-                .or_else(|_| get_u32("llama.attention.head_dim"))
-                .ok()
-                .unwrap_or_else(|| {
-                    n_embd / get_u32("llama.attention.head_count")
-                        .ok()
-                        .filter(|&v| v != 0)
-                        .unwrap_or(1)
-                }),
-            rope_theta: get_f32("llama.rope.freq_base").ok().unwrap_or(10000.0),
-            ctx_size: get_u32("llama.context_length").ok().unwrap_or(32768),
+            n_head,
+            n_kv_head,
+            n_layer,
+            n_ff,
+            n_expert: get_u32("llama.expert_count").unwrap_or(0),
+            n_expert_used: get_u32("llama.expert_used_count").unwrap_or(0),
+            n_hc: get_u32("ds4.hc_count").unwrap_or(4),
+            head_dim,
+            rope_theta: get_f32("llama.rope.freq_base").unwrap_or(10000.0),
+            ctx_size: get_u32("llama.context_length").unwrap_or(32768),
         })
     }
 }
