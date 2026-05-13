@@ -67,21 +67,22 @@ pub fn quantize_block(x: &[f32], out: &mut [u8]) {
 
     let iscale = -128.0f32 / m;
 
-    // qs[i] = clamp_i8_upper(round_ties_even(iscale * x[i])).
-    // Lower bound is saturated by the f32→i8 range (iscale * m = -128).
-    for i in 0..BLOCK_SIZE {
-        let v = round_ties_even_i32(iscale * x[i]);
-        let clamped = v.min(127);
-        out[offset::QS + i] = clamped as i8 as u8;
-    }
-
-    // bsums[j] = i16 partial sum of 16 consecutive qs entries.
+    // Fuse quantisation + bsum in one pass over x/qs, 16 elements at a time.
+    // Each 16-wide slab of qs fills one entry of bsums, so we accumulate the
+    // sum as we write.
+    //
+    // Each qs entry is in [-128, 127] (after the `.min(127)` clamp); a sum
+    // over 16 of them lives in [-2048, 2032], which fits in i16 without any
+    // further clamping.
     for j in 0..16 {
-        let mut sum = 0i32;
-        for k in 0..16 {
-            sum += (out[offset::QS + j * 16 + k] as i8) as i32;
+        let x_slab = &x[j * 16..j * 16 + 16];
+        let qs_slab = &mut out[offset::QS + j * 16..offset::QS + (j + 1) * 16];
+        let mut bsum = 0i16;
+        for (qbyte, &xv) in qs_slab.iter_mut().zip(x_slab) {
+            let q = round_ties_even_i32(iscale * xv).min(127) as i8;
+            *qbyte = q as u8;
+            bsum += q as i16;
         }
-        let bsum = sum.clamp(i16::MIN as i32, i16::MAX as i32) as i16;
         let bytes = bsum.to_le_bytes();
         out[offset::BSUMS + j * 2] = bytes[0];
         out[offset::BSUMS + j * 2 + 1] = bytes[1];
@@ -97,16 +98,18 @@ pub fn quantize_block(x: &[f32], out: &mut [u8]) {
 /// multiple of `BLOCK_SIZE`; `out.len()` must be the corresponding multiple
 /// of `BYTES_PER_BLOCK`.
 pub fn quantize(x: &[f32], out: &mut [u8]) {
-    assert_eq!(
-        x.len() % BLOCK_SIZE,
-        0,
+    assert!(
+        x.len().is_multiple_of(BLOCK_SIZE),
         "q8_k::quantize: x len {} not multiple of {BLOCK_SIZE}",
         x.len(),
     );
     let n_blocks = x.len() / BLOCK_SIZE;
+    let expected = n_blocks
+        .checked_mul(BYTES_PER_BLOCK)
+        .expect("q8_k::quantize: output size overflowed usize");
     assert_eq!(
         out.len(),
-        n_blocks * BYTES_PER_BLOCK,
+        expected,
         "q8_k::quantize: out len {} != {n_blocks} * {BYTES_PER_BLOCK}",
         out.len(),
     );
