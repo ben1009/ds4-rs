@@ -34,6 +34,7 @@ Usage: $(basename "$0") <op>
 
 Available ops:
   q8_0        Regenerate Q8_0 dequant + matmul reference vectors.
+  q8_k        Regenerate Q8_K activation pre-quantisation reference vectors.
   rms_norm    Regenerate RMSNorm (weighted + no-weight) reference vectors.
   rope        Regenerate partial RoPE + YaRN reference vectors.
 EOF
@@ -58,6 +59,14 @@ regen_q8_0() {
     cd "$REPO_ROOT"
     cargo run --quiet -p ds4-core --example gen_vectors_q8_0
     summary q8_0_dequant.bin q8_0_matmul.bin
+}
+
+regen_q8_k() {
+    # Q8_K quantisation is a pure block transform — pick abs-max, scale,
+    # round-ties-even, clamp, sum bsums. Reproducible across platforms.
+    cd "$REPO_ROOT"
+    cargo run --quiet -p ds4-core --example gen_vectors_q8_k
+    summary q8_k_block.bin q8_k_multi_block.bin
 }
 
 regen_rms_norm() {
@@ -88,6 +97,9 @@ main() {
     case "$1" in
         q8_0)
             regen_q8_0
+            ;;
+        q8_k)
+            regen_q8_k
             ;;
         rms_norm)
             regen_rms_norm
