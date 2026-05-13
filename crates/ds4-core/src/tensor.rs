@@ -25,13 +25,18 @@ pub struct OwnedTensor {
 fn row_major_strides(shape: &[usize]) -> Vec<usize> {
     let mut strides = vec![1usize; shape.len()];
     for i in (0..shape.len().saturating_sub(1)).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
+        strides[i] = strides[i + 1]
+            .checked_mul(shape[i + 1])
+            .expect("Tensor: stride product overflowed usize");
     }
     strides
 }
 
 fn numel(shape: &[usize]) -> usize {
-    shape.iter().product()
+    shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .expect("Tensor: numel overflowed usize")
 }
 
 impl<'a> Tensor<'a> {

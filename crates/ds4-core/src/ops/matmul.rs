@@ -137,12 +137,18 @@ fn matmul_row_q8_0(
     }
 }
 
-/// Batched Q8_0 × f32 matmul: dequant each weight block exactly once per
-/// call and sweep the M activation rows across it.
+/// Batched Q8_0 × f32 matmul: dequant each weight block's f16 scale exactly
+/// once per call and sweep the M activation rows across it.
 ///
-/// This is the RFC 0002 §3.8 `matmul_batch` contract — for prefill we pay
-/// the f16→f32 scale + i8→f32 quant conversion once per weight block and
-/// reuse it across all M rows, rather than once per (row, block) pair.
+/// Arithmetic exactly mirrors the row kernel:
+///   `out[m, n] = sum_over_blocks( d_b * sum_i( q_i[b] * acts[m, col_b + i] ) )`
+/// so batch and row paths agree bit-for-bit (modulo intra-block integer
+/// summation order, which is identical).
+///
+/// This is the RFC 0002 §3.8 `matmul_batch` contract — prefill pays the
+/// f16→f32 conversion of each block's scale once and reuses the 32 i8
+/// quants across all M rows, rather than redecoding the scale + quants for
+/// every (row, block) pair.
 fn matmul_batch_q8_0(
     bytes: &[u8],
     out_features: usize,
@@ -169,28 +175,24 @@ fn matmul_batch_q8_0(
         bytes.len(),
     );
 
-    // Zero the accumulator — we add into out[row, n] block-by-block.
-    for v in out.iter_mut() {
-        *v = 0.0;
-    }
-
-    // Scratch buffer for one dequantised block, reused across all M rows.
-    let mut dequant = [0f32; q8_0::BLOCK_SIZE];
+    out.fill(0.0);
 
     for n in 0..out_features {
         let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
         for (block_idx, block) in wrow.chunks_exact(q8_0::BYTES_PER_BLOCK).enumerate() {
-            let block: &[u8; q8_0::BYTES_PER_BLOCK] = block.try_into().unwrap();
-            q8_0::dequant_block(block, &mut dequant);
+            let d = q8_0::f16_to_f32(u16::from_le_bytes([block[0], block[1]]));
+            // Borrow the 32 i8 quants directly; no f32 materialisation so the
+            // per-row inner product stays bit-identical to the row kernel.
+            let qs = &block[2..q8_0::BYTES_PER_BLOCK];
             let col_start = block_idx * q8_0::BLOCK_SIZE;
             for row in 0..m {
                 let act_chunk = &acts[row * in_features + col_start
                     ..row * in_features + col_start + q8_0::BLOCK_SIZE];
                 let mut acc = 0f32;
                 for i in 0..q8_0::BLOCK_SIZE {
-                    acc += dequant[i] * act_chunk[i];
+                    acc += (qs[i] as i8) as f32 * act_chunk[i];
                 }
-                out[row * out_features + n] += acc;
+                out[row * out_features + n] += d * acc;
             }
         }
     }
@@ -349,6 +351,60 @@ mod tests {
         matmul_batch(w, &acts, &mut batch_out, m);
 
         assert_eq!(batch_out, ref_out);
+    }
+
+    #[test]
+    fn matmul_batch_bit_exact_with_nonunit_scales() {
+        // Row and batch paths must agree bit-for-bit even when block scales
+        // are non-power-of-two f16 values — catches a reordering regression
+        // where the batch path accumulates `sum((d*q)*a)` instead of the
+        // row path's `d*sum(q*a)`.
+        let n = 2;
+        let k = 96; // 3 blocks per row, matches `scales.len()` below
+
+        // Non-power-of-two f16 scales so the two formulations round
+        // differently without a per-block rearrangement.
+        // 0.3 ≈ 0x3533, -0.7 ≈ 0xB99A, 1.5 = 0x3E00
+        let scales: [u16; 3] = [0x3533, 0xB99A, 0x3E00];
+
+        let mut bytes = Vec::new();
+        for r in 0..n {
+            for (b, scale) in scales.iter().enumerate() {
+                let mut block = [0u8; q8_0::BYTES_PER_BLOCK];
+                block[0..2].copy_from_slice(&scale.to_le_bytes());
+                for i in 0..q8_0::BLOCK_SIZE {
+                    // Mix of positive/negative quants; varies per row + col.
+                    let v = (r as i32 * 13 + b as i32 * 5 + i as i32 * 3).rem_euclid(256) - 128;
+                    block[2 + i] = v as u8;
+                }
+                bytes.extend_from_slice(&block);
+            }
+        }
+        let w = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+
+        let m = 4;
+        let acts: Vec<f32> = (0..(m * k))
+            .map(|i| ((i as f32) * 0.017 - 1.3).sin())
+            .collect();
+
+        let mut ref_out = vec![0f32; m * n];
+        for row in 0..m {
+            let mut r = vec![0f32; n];
+            matmul_row(w, &acts[row * k..(row + 1) * k], &mut r);
+            ref_out[row * n..(row + 1) * n].copy_from_slice(&r);
+        }
+
+        let mut batch_out = vec![0f32; m * n];
+        matmul_batch(w, &acts, &mut batch_out, m);
+
+        assert_eq!(
+            batch_out, ref_out,
+            "batch and row paths must be bit-identical across non-unit scales",
+        );
     }
 
     #[test]
