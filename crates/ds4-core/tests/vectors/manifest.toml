@@ -1,0 +1,23 @@
+# Reference vectors for ds4-core numerical tests.
+#
+# Each entry's SHA-256 must match the committed file byte-for-byte. CI
+# enforces this via `tests/manifest.rs`, so a vector can never change
+# silently.
+#
+# Regenerate with:
+#     bash scripts/regen_vectors.sh q8_0
+# and update the SHA column below via:
+#     sha256sum crates/ds4-core/tests/vectors/*.bin
+#
+# Regeneration is intentionally manual — not in CI — so changes to reference
+# vectors always show up as a reviewed diff.
+
+[[vectors]]
+path = "q8_0_dequant.bin"
+sha256 = "71022ee4a0d12ccbf4875235e3f8be3d7ce3d903884d8b81a2e9c42163f00ac5"
+source = "examples/gen_vectors_q8_0.rs — dequant() of 8 synthetic Q8_0 blocks"
+
+[[vectors]]
+path = "q8_0_matmul.bin"
+sha256 = "7d32b14e160d78f0dd27d3082598bd677e1b25e9ba850cb7db625fd7e920a844"
+source = "examples/gen_vectors_q8_0.rs — matmul_row on Q8_0 [4, 64] × f32 [64]"
