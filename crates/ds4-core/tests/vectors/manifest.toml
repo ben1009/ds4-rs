@@ -5,7 +5,7 @@
 # silently.
 #
 # Regenerate with:
-#     bash scripts/regen_vectors.sh q8_0
+#     bash scripts/regen_vectors.sh <op>
 # and update the SHA column below via:
 #     sha256sum crates/ds4-core/tests/vectors/*.bin
 #
@@ -21,3 +21,13 @@ source = "examples/gen_vectors_q8_0.rs — dequant() of 8 synthetic Q8_0 blocks"
 path = "q8_0_matmul.bin"
 sha256 = "7d32b14e160d78f0dd27d3082598bd677e1b25e9ba850cb7db625fd7e920a844"
 source = "examples/gen_vectors_q8_0.rs — matmul_row on Q8_0 [4, 64] × f32 [64]"
+
+[[vectors]]
+path = "rms_norm.bin"
+sha256 = "9aef2a2d479d6de0ce890d11403e75080f38b134595d7d63234207785641ed01"
+source = "examples/gen_vectors_rms_norm.rs — rms_norm(x[4096], w[4096], eps=1e-6)"
+
+[[vectors]]
+path = "rms_norm_no_weight.bin"
+sha256 = "80123bab696be44536057a2a4e243873d3c4701ff68fdd5103000e4191a03091"
+source = "examples/gen_vectors_rms_norm.rs — rms_norm_no_weight(x[4096], eps=1e-6)"
