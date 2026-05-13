@@ -5,6 +5,12 @@
 //! manifest bump will fail CI.
 //!
 //! See rfcs/0002-forward-pass.md §4.2.
+//!
+//! Skipped under miri — miri's default isolation blocks real filesystem
+//! opens, and this test's whole job is to walk `tests/vectors/` on the
+//! real FS. Native `cargo test` still runs it on every PR.
+
+#![cfg(not(miri))]
 
 use std::{fs, path::PathBuf};
 

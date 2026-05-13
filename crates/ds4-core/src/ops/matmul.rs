@@ -122,13 +122,14 @@ fn matmul_row_q8_0(
     );
     let blocks_per_row = in_features / q8_0::BLOCK_SIZE;
     let bytes_per_row = blocks_per_row * q8_0::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_row_q8_0: bytes budget overflowed usize");
     assert_eq!(
         bytes.len(),
-        out_features * bytes_per_row,
-        "matmul_row_q8_0: bytes len {} != {} * {}",
+        expected_bytes,
+        "matmul_row_q8_0: bytes len {} != {out_features} * {bytes_per_row}",
         bytes.len(),
-        out_features,
-        bytes_per_row,
     );
     for n in 0..out_features {
         let row = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
@@ -136,6 +137,12 @@ fn matmul_row_q8_0(
     }
 }
 
+/// Batched Q8_0 × f32 matmul: dequant each weight block exactly once per
+/// call and sweep the M activation rows across it.
+///
+/// This is the RFC 0002 §3.8 `matmul_batch` contract — for prefill we pay
+/// the f16→f32 scale + i8→f32 quant conversion once per weight block and
+/// reuse it across all M rows, rather than once per (row, block) pair.
 fn matmul_batch_q8_0(
     bytes: &[u8],
     out_features: usize,
@@ -152,11 +159,39 @@ fn matmul_batch_q8_0(
     );
     let blocks_per_row = in_features / q8_0::BLOCK_SIZE;
     let bytes_per_row = blocks_per_row * q8_0::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_batch_q8_0: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_batch_q8_0: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    // Zero the accumulator — we add into out[row, n] block-by-block.
+    for v in out.iter_mut() {
+        *v = 0.0;
+    }
+
+    // Scratch buffer for one dequantised block, reused across all M rows.
+    let mut dequant = [0f32; q8_0::BLOCK_SIZE];
+
     for n in 0..out_features {
         let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
-        for row in 0..m {
-            let act = &acts[row * in_features..(row + 1) * in_features];
-            out[row * out_features + n] = dot_q8_0_f32_row(wrow, act);
+        for (block_idx, block) in wrow.chunks_exact(q8_0::BYTES_PER_BLOCK).enumerate() {
+            let block: &[u8; q8_0::BYTES_PER_BLOCK] = block.try_into().unwrap();
+            q8_0::dequant_block(block, &mut dequant);
+            let col_start = block_idx * q8_0::BLOCK_SIZE;
+            for row in 0..m {
+                let act_chunk =
+                    &acts[row * in_features + col_start..row * in_features + col_start + q8_0::BLOCK_SIZE];
+                let mut acc = 0f32;
+                for i in 0..q8_0::BLOCK_SIZE {
+                    acc += dequant[i] * act_chunk[i];
+                }
+                out[row * out_features + n] += acc;
+            }
         }
     }
 }
