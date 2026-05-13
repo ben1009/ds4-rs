@@ -71,21 +71,30 @@ pub fn quantize_block(x: &[f32], out: &mut [u8]) {
     // Each 16-wide slab of qs fills one entry of bsums, so we accumulate the
     // sum as we write.
     //
-    // Each qs entry is in [-128, 127] (after the `.min(127)` clamp); a sum
-    // over 16 of them lives in [-2048, 2032], which fits in i16 without any
-    // further clamping.
-    for j in 0..16 {
-        let x_slab = &x[j * 16..j * 16 + 16];
-        let qs_slab = &mut out[offset::QS + j * 16..offset::QS + (j + 1) * 16];
+    // Each qs entry is in [-128, 127] (after the clamp); a sum over 16 of
+    // them lives in [-2048, 2032], which fits in i16 without any further
+    // clamping.
+    //
+    // Why `.clamp(-128, 127)` rather than `.min(127)`: if `m` is subnormal,
+    // `iscale` can overflow to ±inf, which takes `iscale * x[i]` to ±inf or
+    // NaN. Rust's saturating `as i32` cast maps -inf to `i32::MIN`, and the
+    // subsequent wrapping `as i8` would silently turn that into 0. The
+    // two-sided clamp pins it to -128 instead. Upper bound is `.min(127)`'s
+    // job under the typical path.
+    let (qs_out, tail) = out[offset::QS..].split_at_mut(BLOCK_SIZE);
+    let bsums_out = &mut tail[..32];
+    for (x_slab, (qs_slab, bsum_slab)) in x.chunks_exact(16).zip(
+        qs_out
+            .chunks_exact_mut(16)
+            .zip(bsums_out.chunks_exact_mut(2)),
+    ) {
         let mut bsum = 0i16;
         for (qbyte, &xv) in qs_slab.iter_mut().zip(x_slab) {
-            let q = round_ties_even_i32(iscale * xv).min(127) as i8;
+            let q = round_ties_even_i32(iscale * xv).clamp(-128, 127) as i8;
             *qbyte = q as u8;
             bsum += q as i16;
         }
-        let bytes = bsum.to_le_bytes();
-        out[offset::BSUMS + j * 2] = bytes[0];
-        out[offset::BSUMS + j * 2 + 1] = bytes[1];
+        bsum_slab.copy_from_slice(&bsum.to_le_bytes());
     }
 
     // d = 1/iscale = -m/128. Dequant = d * qs -> element with |max| rounds
