@@ -51,3 +51,13 @@ source = "examples/gen_vectors_rope.rs — DS4 YaRN at pos=127"
 path = "rope_yarn_inverse.bin"
 sha256 = "43ff1479782935da905268adae40c97580fc1820b920c3376b3b2ae5ee8751e7"
 source = "examples/gen_vectors_rope.rs — DS4 YaRN inverse at pos=127"
+
+[[vectors]]
+path = "q8_k_block.bin"
+sha256 = "c861004761a02989a6633d24da9fd812a720bd66bcea0e8d682a81f836ea4a96"
+source = "examples/gen_vectors_q8_k.rs — quantize_block of one 256-element input"
+
+[[vectors]]
+path = "q8_k_multi_block.bin"
+sha256 = "8298a39de9c83059aeca13cf03e581cb56cc98f7e6dc6853fad15d2317106d8d"
+source = "examples/gen_vectors_q8_k.rs — quantize() on 3 consecutive blocks with different scales"
