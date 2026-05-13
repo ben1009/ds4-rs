@@ -177,6 +177,23 @@ fn matmul_batch_q8_0(
 
     out.fill(0.0);
 
+    // Precompute per-row flat offsets once per call, with checked_mul so a
+    // pathological (m, in_features, out_features) tuple fails fast instead of
+    // silently wrapping usize. Also hoists `row * in_features` /
+    // `row * out_features` out of the innermost loop.
+    let mut act_row_off: Vec<usize> = Vec::with_capacity(m);
+    let mut out_row_off: Vec<usize> = Vec::with_capacity(m);
+    for row in 0..m {
+        act_row_off.push(
+            row.checked_mul(in_features)
+                .expect("matmul_batch_q8_0: act row offset overflowed usize"),
+        );
+        out_row_off.push(
+            row.checked_mul(out_features)
+                .expect("matmul_batch_q8_0: out row offset overflowed usize"),
+        );
+    }
+
     for n in 0..out_features {
         let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
         for (block_idx, block) in wrow.chunks_exact(q8_0::BYTES_PER_BLOCK).enumerate() {
@@ -186,13 +203,13 @@ fn matmul_batch_q8_0(
             let qs = &block[2..q8_0::BYTES_PER_BLOCK];
             let col_start = block_idx * q8_0::BLOCK_SIZE;
             for row in 0..m {
-                let act_chunk = &acts[row * in_features + col_start
-                    ..row * in_features + col_start + q8_0::BLOCK_SIZE];
+                let act_start = act_row_off[row] + col_start;
+                let act_chunk = &acts[act_start..act_start + q8_0::BLOCK_SIZE];
                 let mut acc = 0f32;
                 for i in 0..q8_0::BLOCK_SIZE {
                     acc += (qs[i] as i8) as f32 * act_chunk[i];
                 }
-                out[row * out_features + n] += d * acc;
+                out[out_row_off[row] + n] += d * acc;
             }
         }
     }

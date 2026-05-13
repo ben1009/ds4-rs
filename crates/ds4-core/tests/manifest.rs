@@ -71,30 +71,47 @@ fn parse_manifest(raw: &str) -> Vec<Entry> {
     let mut entries = Vec::new();
     let mut path: Option<String> = None;
     let mut sha: Option<String> = None;
+
+    let flush = |entries: &mut Vec<Entry>, path: &mut Option<String>, sha: &mut Option<String>| {
+        if path.is_some() || sha.is_some() {
+            let p = path
+                .take()
+                .expect("manifest: [[vectors]] block missing `path = ...`");
+            let s = sha
+                .take()
+                .expect("manifest: [[vectors]] block missing `sha256 = ...`");
+            entries.push(Entry { path: p, sha256: s });
+        }
+    };
+
     for line in raw.lines() {
         let trimmed = line.trim();
-        if trimmed == "[[vectors]]" {
-            if path.is_some() || sha.is_some() {
-                let p = path.take().expect("path before next [[vectors]]");
-                let s = sha.take().expect("sha256 before next [[vectors]]");
-                entries.push(Entry { path: p, sha256: s });
-            }
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some(v) = trimmed.strip_prefix("path = ") {
-            path = Some(unquote(v).to_string());
-        } else if let Some(v) = trimmed.strip_prefix("sha256 = ") {
-            sha = Some(unquote(v).to_string());
+        if trimmed == "[[vectors]]" {
+            flush(&mut entries, &mut path, &mut sha);
+            continue;
+        }
+        if let Some(v) = trimmed.strip_prefix("path") {
+            path = Some(parse_value(v).to_string());
+        } else if let Some(v) = trimmed.strip_prefix("sha256") {
+            sha = Some(parse_value(v).to_string());
         }
     }
-    if let (Some(p), Some(s)) = (path, sha) {
-        entries.push(Entry { path: p, sha256: s });
-    }
+    flush(&mut entries, &mut path, &mut sha);
     entries
 }
 
-fn unquote(s: &str) -> &str {
-    s.trim().trim_matches('"')
+/// Parse a `KEY = "value"` right-hand side. Tolerates arbitrary whitespace
+/// around the `=` and the surrounding quotes.
+fn parse_value(rhs: &str) -> &str {
+    let after_eq = rhs
+        .trim_start()
+        .strip_prefix('=')
+        .expect("manifest: expected `=` after key")
+        .trim();
+    after_eq.trim_matches('"')
 }
 
 fn hex(bytes: &[u8]) -> String {
