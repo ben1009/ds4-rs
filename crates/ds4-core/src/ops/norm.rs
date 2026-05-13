@@ -39,8 +39,8 @@ pub fn rms_norm(x: &[f32], weight: &[f32], eps: f32, out: &mut [f32]) {
         out.len(),
     );
     let scale = rms_scale(x, eps);
-    for i in 0..x.len() {
-        out[i] = x[i] * scale * weight[i];
+    for ((o, &xi), &wi) in out.iter_mut().zip(x).zip(weight) {
+        *o = xi * scale * wi;
     }
 }
 
@@ -55,8 +55,8 @@ pub fn rms_norm_no_weight(x: &[f32], eps: f32, out: &mut [f32]) {
         out.len(),
     );
     let scale = rms_scale(x, eps);
-    for i in 0..x.len() {
-        out[i] = x[i] * scale;
+    for (o, &xi) in out.iter_mut().zip(x) {
+        *o = xi * scale;
     }
 }
 
