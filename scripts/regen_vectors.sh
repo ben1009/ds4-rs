@@ -35,6 +35,7 @@ Usage: $(basename "$0") <op>
 Available ops:
   q8_0        Regenerate Q8_0 dequant + matmul reference vectors.
   rms_norm    Regenerate RMSNorm (weighted + no-weight) reference vectors.
+  rope        Regenerate partial RoPE + YaRN reference vectors.
 EOF
     exit 1
 }
@@ -68,6 +69,17 @@ regen_rms_norm() {
     summary rms_norm.bin rms_norm_no_weight.bin
 }
 
+regen_rope() {
+    # RoPE uses cos/sin on integer-derived inputs. The committed vectors are
+    # whatever the Rust impl produces on the regen host; the manifest SHA
+    # check enforces byte-stability on every CI run (not a cross-platform
+    # bit-exact guarantee — libm trig can round differently on non-x86).
+    # Regeneration stays manual, so any drift surfaces as a reviewed diff.
+    cd "$REPO_ROOT"
+    cargo run --quiet -p ds4-core --example gen_vectors_rope
+    summary rope_plain_pos127.bin rope_yarn_pos0.bin rope_yarn_pos127.bin rope_yarn_inverse.bin
+}
+
 main() {
     if [ $# -ne 1 ]; then
         usage
@@ -79,6 +91,9 @@ main() {
             ;;
         rms_norm)
             regen_rms_norm
+            ;;
+        rope)
+            regen_rope
             ;;
         -h|--help)
             usage

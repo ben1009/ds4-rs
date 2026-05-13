@@ -31,3 +31,23 @@ source = "examples/gen_vectors_rms_norm.rs — rms_norm(x[4096], w[4096], eps=1e
 path = "rms_norm_no_weight.bin"
 sha256 = "80123bab696be44536057a2a4e243873d3c4701ff68fdd5103000e4191a03091"
 source = "examples/gen_vectors_rms_norm.rs — rms_norm_no_weight(x[4096], eps=1e-6)"
+
+[[vectors]]
+path = "rope_plain_pos127.bin"
+sha256 = "2cc120dc7ef8bdfe1255242c665d98741c0da31224563bfe0420e9485481e363"
+source = "examples/gen_vectors_rope.rs — plain RoPE at pos=127, head[512], n_rot=64"
+
+[[vectors]]
+path = "rope_yarn_pos0.bin"
+sha256 = "7d46a9c15c7cf0c35b1e2e942ba24877c194a9b9fd8f54d306923d0a4b696945"
+source = "examples/gen_vectors_rope.rs — DS4 YaRN at pos=0 (identity check)"
+
+[[vectors]]
+path = "rope_yarn_pos127.bin"
+sha256 = "94458a2e40ddee9e0429b046bed8c9c4a4672c5c7506d4e01178535994a9aece"
+source = "examples/gen_vectors_rope.rs — DS4 YaRN at pos=127"
+
+[[vectors]]
+path = "rope_yarn_inverse.bin"
+sha256 = "e801576b56a3a175afa7242295017548cbe8e908337a49a14e3c6e444811980b"
+source = "examples/gen_vectors_rope.rs — DS4 YaRN inverse at pos=127"
