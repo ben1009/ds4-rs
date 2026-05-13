@@ -327,6 +327,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "miri's f32 cos/sin intrinsics are intentionally non-deterministic"
+    )]
     fn is_deterministic_across_runs() {
         let freqs = RopeFreqs::new(&ds4_params());
         let input: Vec<f32> = (0..512)
