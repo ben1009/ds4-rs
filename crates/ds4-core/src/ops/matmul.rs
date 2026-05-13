@@ -184,8 +184,8 @@ fn matmul_batch_q8_0(
             q8_0::dequant_block(block, &mut dequant);
             let col_start = block_idx * q8_0::BLOCK_SIZE;
             for row in 0..m {
-                let act_chunk =
-                    &acts[row * in_features + col_start..row * in_features + col_start + q8_0::BLOCK_SIZE];
+                let act_chunk = &acts[row * in_features + col_start
+                    ..row * in_features + col_start + q8_0::BLOCK_SIZE];
                 let mut acc = 0f32;
                 for i in 0..q8_0::BLOCK_SIZE {
                     acc += dequant[i] * act_chunk[i];
