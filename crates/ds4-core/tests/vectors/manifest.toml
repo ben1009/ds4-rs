@@ -44,10 +44,10 @@ source = "examples/gen_vectors_rope.rs — DS4 YaRN at pos=0 (identity check)"
 
 [[vectors]]
 path = "rope_yarn_pos127.bin"
-sha256 = "94458a2e40ddee9e0429b046bed8c9c4a4672c5c7506d4e01178535994a9aece"
+sha256 = "dce4ec82bda90c5861f310837fe42a1ac5000f9043bd88083ecc595ae2507ea9"
 source = "examples/gen_vectors_rope.rs — DS4 YaRN at pos=127"
 
 [[vectors]]
 path = "rope_yarn_inverse.bin"
-sha256 = "e801576b56a3a175afa7242295017548cbe8e908337a49a14e3c6e444811980b"
+sha256 = "43ff1479782935da905268adae40c97580fc1820b920c3376b3b2ae5ee8751e7"
 source = "examples/gen_vectors_rope.rs — DS4 YaRN inverse at pos=127"

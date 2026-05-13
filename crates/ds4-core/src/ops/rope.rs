@@ -95,6 +95,9 @@ pub fn apply_rope(head: &mut [f32], pos: usize, freqs: &RopeFreqs) {
 
 /// Inverse of [`apply_rope`] — applied to the attention *output* before the
 /// grouped output projection in DS4 (see RFC 0002 §3.4).
+///
+/// When `attn_factor != 1.0` the inverse applies `1/attn_factor` so
+/// `forward` followed by `inverse` is exactly the identity.
 pub fn apply_rope_inverse(head: &mut [f32], pos: usize, freqs: &RopeFreqs) {
     rotate_tail(head, pos, freqs, /* inverse= */ true);
 }
@@ -109,17 +112,20 @@ fn rotate_tail(head: &mut [f32], pos: usize, freqs: &RopeFreqs, inverse: bool) {
     let tail_start = head.len() - n_rot;
     let tail = &mut head[tail_start..];
     let pos = pos as f32;
-    let sign = if inverse { -1.0 } else { 1.0 };
+    let (sign, factor) = if inverse {
+        (-1.0, 1.0 / freqs.attn_factor)
+    } else {
+        (1.0, freqs.attn_factor)
+    };
 
-    for (i, &freq) in freqs.freqs.iter().enumerate() {
+    for (chunk, &freq) in tail.chunks_exact_mut(2).zip(freqs.freqs.iter()) {
         let theta = pos * freq;
-        let cos = theta.cos();
-        let sin = sign * theta.sin();
-
-        let x0 = tail[2 * i];
-        let x1 = tail[2 * i + 1];
-        tail[2 * i] = (x0 * cos - x1 * sin) * freqs.attn_factor;
-        tail[2 * i + 1] = (x0 * sin + x1 * cos) * freqs.attn_factor;
+        let (sin_t, cos_t) = theta.sin_cos();
+        let sin = sign * sin_t;
+        let x0 = chunk[0];
+        let x1 = chunk[1];
+        chunk[0] = (x0 * cos_t - x1 * sin) * factor;
+        chunk[1] = (x0 * sin + x1 * cos_t) * factor;
     }
 }
 
@@ -127,26 +133,28 @@ fn rotate_tail(head: &mut [f32], pos: usize, freqs: &RopeFreqs, inverse: bool) {
 
 fn apply_yarn_scaling(freqs: &mut [f32], n_rot: usize, base: f32, yarn: &YarnParams) {
     // Low/high correction dims: the pair of dim indices where the YaRN ramp
-    // transitions from full interpolation (low) to full extrapolation (high).
-    // These are computed from the model's orig_ctx and beta_fast/slow
-    // wavelength thresholds — see the YaRN paper §3.3 and DS4 ds4.c.
+    // transitions between full extrapolation and full interpolation. These
+    // are computed from the model's orig_ctx and beta_fast/slow wavelength
+    // thresholds — see the YaRN paper §3.3 and DS4 ds4.c.
     let low = yarn_correction_dim(yarn.beta_fast, n_rot, base, yarn.orig_ctx);
     let high = yarn_correction_dim(yarn.beta_slow, n_rot, base, yarn.orig_ctx);
     let low = low.floor();
     let high = high.ceil();
-    // Guard against a degenerate ramp (low >= high can occur with extreme
-    // settings); clamp to a minimum width of 1 so the ramp formula stays
-    // well-defined.
-    let ramp_width = (high - low).max(0.001);
+    // Guard against a degenerate ramp (low >= high can happen with extreme
+    // settings); clamp to a minimum width of 1 so the ramp stays
+    // well-defined without collapsing to a step function.
+    let ramp_width = (high - low).max(1.0);
 
     let inv_scale = 1.0 / yarn.scale_factor;
     for (i, freq) in freqs.iter_mut().enumerate() {
-        // Linear ramp on dim index; outside [low, high] the ramp saturates.
+        // Ramp grows with dim index. Low dims are high-frequency / short-
+        // wavelength — those should stay extrapolated (standard RoPE).
+        // High dims are low-frequency / long-wavelength and get interpolated
+        // (scaled by 1/scale_factor) to fit the extended context.
         let r = ((i as f32 - low) / ramp_width).clamp(0.0, 1.0);
-        // Interpolated (scaled) vs extrapolated (unscaled) frequency.
         let interp = *freq * inv_scale;
         let extrap = *freq;
-        *freq = interp * (1.0 - r) + extrap * r;
+        *freq = extrap * (1.0 - r) + interp * r;
     }
 }
 
@@ -154,10 +162,11 @@ fn apply_yarn_scaling(freqs: &mut [f32], n_rot: usize, base: f32, yarn: &YarnPar
 ///
 /// `n_rotations` is the wavelength threshold (`beta_fast` / `beta_slow`);
 /// the returned `d` is the dim index where that wavelength-to-ctx ratio
-/// crosses.
+/// crosses. Guards against `base = 1.0` (degenerate) by clamping the
+/// denominator away from zero.
 fn yarn_correction_dim(n_rotations: f32, n_rot: usize, base: f32, orig_ctx: f32) -> f32 {
     let numerator = (orig_ctx / (n_rotations * 2.0 * std::f32::consts::PI)).ln();
-    let denominator = base.ln();
+    let denominator = base.ln().max(1e-9);
     n_rot as f32 * numerator / (2.0 * denominator)
 }
 
@@ -245,12 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn yarn_ramp_interpolates_low_dims_and_preserves_high_dims() {
-        // YaRN scales low-frequency dims down toward 1/scale_factor and
-        // leaves high-frequency dims close to the plain RoPE schedule.
-        // For DS4 params the `high` correction dim (~33) exceeds n_rot/2
-        // (=32), so none of the cached dims are fully extrapolated — we
-        // instead assert the ratio trend.
+    fn yarn_ramp_extrapolates_low_dims_and_interpolates_high_dims() {
+        // YaRN keeps low-index / short-wavelength dims at standard RoPE
+        // (extrapolated, ratio = 1.0) and scales high-index / long-wavelength
+        // dims down toward 1/scale_factor. For DS4 params the ramp spans
+        // roughly [18, 33], so dim 0 is fully extrapolated and dim 31 is
+        // mostly interpolated.
         let plain = RopeFreqs::new(&plain_params(64, 10_000.0));
         let scaled = RopeFreqs::new(&ds4_params());
         assert_eq!(plain.freqs.len(), scaled.freqs.len());
@@ -259,24 +268,24 @@ mod tests {
         let ratio_low = scaled.freqs[0] / plain.freqs[0];
         let ratio_high = scaled.freqs[n - 1] / plain.freqs[n - 1];
 
-        // Dim 0 should be fully interpolated (ratio = 1/scale_factor).
+        // Dim 0 should be fully extrapolated (ratio = 1.0 exactly).
         assert!(
-            approx_eq(ratio_low, 1.0 / 16.0, 1e-4),
-            "dim 0 ratio = {ratio_low}, expected 1/16 for full interpolation",
+            approx_eq(ratio_low, 1.0, 1e-6),
+            "dim 0 ratio = {ratio_low}, expected 1.0 for full extrapolation",
         );
-        // Last dim should be dominated by extrapolation — ratio well above
-        // the mid-point between 1/16 and 1.
+        // Last dim should be dominated by interpolation — ratio well below
+        // the mid-point between 1 and 1/16.
         assert!(
-            ratio_high > 0.5,
-            "dim {} ratio = {ratio_high}, expected >> 0.5 for near-extrapolation",
+            ratio_high < 0.5,
+            "dim {} ratio = {ratio_high}, expected << 0.5 for near-interpolation",
             n - 1,
         );
-        // And strictly smaller than 1 (DS4 ramp doesn't reach full
-        // extrapolation inside the cached range).
+        // And strictly greater than 1/16 (DS4 ramp doesn't reach full
+        // interpolation inside the cached range).
         assert!(
-            ratio_high < 1.0,
-            "dim {} ratio = {ratio_high}, expected < 1.0",
-            n - 1
+            ratio_high > 1.0 / 16.0,
+            "dim {} ratio = {ratio_high}, expected > 1/16",
+            n - 1,
         );
     }
 
