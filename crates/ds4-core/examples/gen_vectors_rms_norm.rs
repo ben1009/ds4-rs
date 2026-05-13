@@ -67,12 +67,20 @@ fn write_f32_le(path: &Path, values: &[f32]) {
 /// Inputs that span positive + negative, small + large, with a few near-zero
 /// samples to exercise the denominator.
 fn deterministic_input(i: usize) -> f32 {
+    // Period-64 sawtooth mapped to [-2.0, +2.0].
     let phase = (i as i32 * 7 + 3).rem_euclid(64);
-    // Period-64 sawtooth mapped to [-2.0, +2.0], then multiplied by a slow
-    // envelope so the overall RMS is non-trivial and mid-range values
-    // dominate the reduction.
     let saw = (phase as f32 - 32.0) * (1.0 / 16.0);
-    let env = 1.0 + 0.5 * ((i as f32) * 0.003).cos();
+    // Slow triangular envelope in [0.5, 1.5] with period 256.
+    // Integer arithmetic keeps the whole generator cross-platform bit-exact —
+    // libm's f32 transcendentals are not guaranteed identical across
+    // Linux / Windows / macOS.
+    let tri_phase = (i as i32).rem_euclid(256);
+    let tri = if tri_phase <= 128 {
+        tri_phase as f32
+    } else {
+        (256 - tri_phase) as f32
+    };
+    let env = 0.5 + tri * (1.0 / 128.0);
     saw * env
 }
 

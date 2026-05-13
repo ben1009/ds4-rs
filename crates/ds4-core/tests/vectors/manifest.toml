@@ -24,10 +24,10 @@ source = "examples/gen_vectors_q8_0.rs — matmul_row on Q8_0 [4, 64] × f32 [64
 
 [[vectors]]
 path = "rms_norm.bin"
-sha256 = "9a36805f77062caa132047c0cb73b567207afbb3710f796cc86d34e289dfb029"
+sha256 = "9aef2a2d479d6de0ce890d11403e75080f38b134595d7d63234207785641ed01"
 source = "examples/gen_vectors_rms_norm.rs — rms_norm(x[4096], w[4096], eps=1e-6)"
 
 [[vectors]]
 path = "rms_norm_no_weight.bin"
-sha256 = "9ee2e9ce1932dad3013bec5e47673b2207a4099e40b315fc90db4210de79f06c"
+sha256 = "80123bab696be44536057a2a4e243873d3c4701ff68fdd5103000e4191a03091"
 source = "examples/gen_vectors_rms_norm.rs — rms_norm_no_weight(x[4096], eps=1e-6)"
