@@ -7,6 +7,7 @@
 #
 # Ops:
 #     q8_0        Q8_0 dequant + matmul_row reference vectors
+#     rms_norm    RMSNorm (weighted + no-weight) reference vectors
 #
 # After regeneration, update crates/ds4-core/tests/vectors/manifest.toml
 # with the new SHA-256 sums:
@@ -33,8 +34,20 @@ Usage: $(basename "$0") <op>
 
 Available ops:
   q8_0        Regenerate Q8_0 dequant + matmul reference vectors.
+  rms_norm    Regenerate RMSNorm (weighted + no-weight) reference vectors.
 EOF
     exit 1
+}
+
+summary() {
+    echo
+    echo "Done. SHAs:"
+    ( cd "$REPO_ROOT/crates/ds4-core/tests/vectors" && sha256sum "$@" )
+    echo
+    echo "If they differ from the previous values, update"
+    echo "  crates/ds4-core/tests/vectors/manifest.toml"
+    echo "and run"
+    echo "  cargo test -p ds4-core --test manifest"
 }
 
 regen_q8_0() {
@@ -43,16 +56,16 @@ regen_q8_0() {
     # about, so a Rust-generated vector is authoritative here.
     cd "$REPO_ROOT"
     cargo run --quiet -p ds4-core --example gen_vectors_q8_0
+    summary q8_0_dequant.bin q8_0_matmul.bin
+}
 
-    echo
-    echo "Done. SHAs:"
-    ( cd "$REPO_ROOT/crates/ds4-core/tests/vectors" \
-        && sha256sum q8_0_dequant.bin q8_0_matmul.bin )
-    echo
-    echo "If they differ from the previous values, update"
-    echo "  crates/ds4-core/tests/vectors/manifest.toml"
-    echo "and run"
-    echo "  cargo test -p ds4-core --test manifest"
+regen_rms_norm() {
+    # RMSNorm uses a fixed left-to-right reduction in our impl, so a
+    # Rust-generated vector is reproducible across platforms for the same
+    # inputs. No C-side dump needed for this op.
+    cd "$REPO_ROOT"
+    cargo run --quiet -p ds4-core --example gen_vectors_rms_norm
+    summary rms_norm.bin rms_norm_no_weight.bin
 }
 
 main() {
@@ -63,6 +76,9 @@ main() {
     case "$1" in
         q8_0)
             regen_q8_0
+            ;;
+        rms_norm)
+            regen_rms_norm
             ;;
         -h|--help)
             usage
