@@ -161,7 +161,9 @@
       "Bash(ls *)",
       "Bash(pwd *)",
       "Bash(echo *)",
-      "Bash(for *)"
+      "Bash(for *)",
+      "Bash(codex *)",
+      "Bash(sleep *)"
     ]
   }
 }

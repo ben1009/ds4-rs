@@ -4,6 +4,9 @@
 //! added RMSNorm; PR #3 adds RoPE. Remaining ops (softmax, SwiGLU, HC)
 //! land in later PRs per the commit roadmap.
 
+pub mod hc;
 pub mod matmul;
 pub mod norm;
 pub mod rope;
+pub mod softmax;
+pub mod swiglu;
