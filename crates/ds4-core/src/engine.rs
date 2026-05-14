@@ -72,12 +72,20 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses real filesystem, unsupported under miri isolation"
+    )]
     fn open_missing_file_errors() {
         let result = Engine::open(Path::new("/nonexistent/ds4-engine-test/file.gguf"));
         assert!(result.is_err());
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn open_empty_file_errors() {
         use std::io::Write;
         let path = std::env::temp_dir().join(format!(
@@ -98,6 +106,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn open_wrong_magic_errors() {
         use std::io::Write;
         let path = std::env::temp_dir().join(format!(
@@ -121,6 +133,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses real filesystem, unsupported under miri isolation"
+    )]
     fn open_directory_errors() {
         let result = Engine::open(&std::env::temp_dir());
         assert!(result.is_err());
