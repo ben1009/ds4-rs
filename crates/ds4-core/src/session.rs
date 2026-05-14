@@ -2,28 +2,30 @@ use std::sync::Arc;
 
 use anyhow::Result;
 
-use crate::engine::Engine;
+use crate::{engine::Engine, model::kv_cache::KvCache};
 
 /// An inference session holding mutable state.
 pub struct Session {
     engine: Arc<Engine>,
     tokens: Vec<u32>,
     pos: u32,
-    #[allow(dead_code)]
     ctx_size: u32,
     logits: Vec<f32>,
+    kv_cache: KvCache,
 }
 
 impl Session {
     pub fn new(engine: Arc<Engine>, ctx_size: u32) -> Result<Self> {
         tracing::info!("Creating session with ctx_size={ctx_size}");
         let n_vocab = engine.config.n_vocab as usize;
+        let n_layer = engine.config.n_layer as usize;
         Ok(Self {
             engine,
             tokens: Vec::new(),
             pos: 0,
             ctx_size,
             logits: vec![0.0; n_vocab],
+            kv_cache: KvCache::new(n_layer, ctx_size as usize),
         })
     }
 
@@ -66,12 +68,24 @@ impl Session {
         self.pos
     }
 
+    pub fn ctx_size(&self) -> u32 {
+        self.ctx_size
+    }
+
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
     }
 
     pub fn engine(&self) -> &Engine {
         &self.engine
+    }
+
+    pub fn kv_cache(&self) -> &KvCache {
+        &self.kv_cache
+    }
+
+    pub fn kv_cache_mut(&mut self) -> &mut KvCache {
+        &mut self.kv_cache
     }
 }
 

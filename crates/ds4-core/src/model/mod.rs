@@ -1,3 +1,12 @@
+//! Model loading, weight accessors, layer views, and forward pass.
+//!
+//! See rfcs/0002-forward-pass.md §2. The module hierarchy:
+//!
+//! * `weights` — typed [`WeightMap`] accessors (`q8_0`, `f16`, `f32`, ...).
+//! * `layer`   — per-layer borrowed weight views.
+//! * `kv_cache` — MLA latent KV cache.
+//! * `forward` — end-to-end forward pass orchestration.
+
 use std::path::Path;
 
 use anyhow::Result;
@@ -6,6 +15,11 @@ use crate::{
     config::ModelConfig,
     gguf::{GgufMmap, TensorInfo},
 };
+
+pub mod forward;
+pub mod kv_cache;
+pub mod layer;
+pub mod weights;
 
 /// Memory-mapped model weights with named tensor lookup.
 /// The mmap stays alive as long as WeightMap exists.

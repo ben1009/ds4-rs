@@ -25,18 +25,24 @@ pub enum WeightView<'a> {
         out_features: usize,
         in_features: usize,
     },
+    /// F16: `out_features × in_features` little-endian f16 values, 2 bytes each.
+    F16 {
+        bytes: &'a [u8],
+        out_features: usize,
+        in_features: usize,
+    },
 }
 
 impl WeightView<'_> {
     pub fn out_features(&self) -> usize {
         match self {
-            Self::Q8_0 { out_features, .. } => *out_features,
+            Self::Q8_0 { out_features, .. } | Self::F16 { out_features, .. } => *out_features,
         }
     }
 
     pub fn in_features(&self) -> usize {
         match self {
-            Self::Q8_0 { in_features, .. } => *in_features,
+            Self::Q8_0 { in_features, .. } | Self::F16 { in_features, .. } => *in_features,
         }
     }
 }
@@ -66,6 +72,13 @@ pub fn matmul_row(weight: WeightView<'_>, act: &[f32], out: &mut [f32]) {
             in_features,
         } => {
             matmul_row_q8_0(bytes, out_features, in_features, act, out);
+        }
+        WeightView::F16 {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_row_f16(bytes, out_features, in_features, act, out);
         }
     }
 }
@@ -103,6 +116,13 @@ pub fn matmul_batch(weight: WeightView<'_>, acts: &[f32], out: &mut [f32], m: us
             in_features,
         } => {
             matmul_batch_q8_0(bytes, out_features, in_features, acts, out, m);
+        }
+        WeightView::F16 {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_batch_f16(bytes, out_features, in_features, acts, out, m);
         }
     }
 }
@@ -246,6 +266,93 @@ fn dot_q8_0_f32_block(block: &[u8; q8_0::BYTES_PER_BLOCK], act: &[f32; q8_0::BLO
         acc += q as f32 * act[i];
     }
     d * acc
+}
+
+// ---------------------------------------------------------------------------
+// F16 weight matmul
+// ---------------------------------------------------------------------------
+
+fn matmul_row_f16(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    act: &[f32],
+    out: &mut [f32],
+) {
+    let expected_bytes = out_features
+        .checked_mul(in_features)
+        .and_then(|n| n.checked_mul(2))
+        .expect("matmul_row_f16: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_row_f16: bytes len {} != {out_features}*{in_features}*2",
+        bytes.len(),
+    );
+
+    for (n, out_n) in out.iter_mut().enumerate().take(out_features) {
+        let row_off = n * in_features * 2;
+        let row_bytes = &bytes[row_off..row_off + in_features * 2];
+        *out_n = dot_f16_f32_row(row_bytes, act);
+    }
+}
+
+fn matmul_batch_f16(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    acts: &[f32],
+    out: &mut [f32],
+    m: usize,
+) {
+    let expected_bytes = out_features
+        .checked_mul(in_features)
+        .and_then(|n| n.checked_mul(2))
+        .expect("matmul_batch_f16: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_batch_f16: bytes len {} != {out_features}*{in_features}*2",
+        bytes.len(),
+    );
+
+    out.fill(0.0);
+
+    let mut act_row_off: Vec<usize> = Vec::with_capacity(m);
+    let mut out_row_off: Vec<usize> = Vec::with_capacity(m);
+    for row in 0..m {
+        act_row_off.push(
+            row.checked_mul(in_features)
+                .expect("matmul_batch_f16: act row offset overflowed usize"),
+        );
+        out_row_off.push(
+            row.checked_mul(out_features)
+                .expect("matmul_batch_f16: out row offset overflowed usize"),
+        );
+    }
+
+    for n in 0..out_features {
+        let row_off = n * in_features * 2;
+        let row_bytes = &bytes[row_off..row_off + in_features * 2];
+        for (k, chunk) in row_bytes.chunks_exact(2).enumerate() {
+            let w = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+            for row in 0..m {
+                out[out_row_off[row] + n] += w * acts[act_row_off[row] + k];
+            }
+        }
+    }
+}
+
+/// `sum_k weight[k] * act[k]` for a single F16 row.
+fn dot_f16_f32_row(weight_row: &[u8], act: &[f32]) -> f32 {
+    let k = act.len();
+    debug_assert_eq!(weight_row.len(), k * 2);
+    let mut sum = 0.0f32;
+    for (chunk, &a) in weight_row.chunks_exact(2).zip(act) {
+        let w = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+        sum += w * a;
+    }
+    sum
 }
 
 #[cfg(test)]
@@ -422,6 +529,89 @@ mod tests {
             batch_out, ref_out,
             "batch and row paths must be bit-identical across non-unit scales",
         );
+    }
+
+    // Helper: build F16 bytes for a weight matrix where every entry is `val`.
+    fn weight_constant_f16(n: usize, k: usize, val: f32) -> Vec<u8> {
+        // Hard-coded f16 bit patterns for common test values.
+        let bits: u16 = if val == 1.0 {
+            0x3C00
+        } else if val == 2.0 {
+            0x4000
+        } else if val == 0.5 {
+            0x3800
+        } else if val == -1.0 {
+            0xBC00
+        } else {
+            panic!("weight_constant_f16: unhandled test value {val}")
+        };
+        let mut bytes = Vec::with_capacity(n * k * 2);
+        for _ in 0..(n * k) {
+            bytes.extend_from_slice(&bits.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_row_f16_basic() {
+        // 2 × 3 weight: [[1, 1, 1], [2, 2, 2]]
+        let bytes = weight_constant_f16(2, 3, 1.0);
+        // Overwrite second row to be 2.0.
+        let mut bytes = bytes;
+        for b in bytes[3 * 2..].chunks_exact_mut(2) {
+            b.copy_from_slice(&0x4000u16.to_le_bytes());
+        }
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: 2,
+            in_features: 3,
+        };
+        let act = vec![1.0f32, 2.0, 3.0];
+        let mut out = vec![0.0f32; 2];
+        matmul_row(w, &act, &mut out);
+        assert_eq!(out[0], 6.0); // 1*1 + 1*2 + 1*3
+        assert_eq!(out[1], 12.0); // 2*1 + 2*2 + 2*3
+    }
+
+    #[test]
+    fn matmul_batch_f16_matches_row_by_row() {
+        let n = 3;
+        let k = 8;
+        // Each row r has value (r + 1) as f16.
+        let mut bytes = Vec::with_capacity(n * k * 2);
+        for r in 0..n {
+            let _bits = ((r + 1) as f32).to_bits();
+            // Actually we need f16 bits. For small integers, f16 representation:
+            // 1.0 = 0x3C00, 2.0 = 0x4000, 3.0 = 0x4200
+            let bits16: u16 = match r + 1 {
+                1 => 0x3C00,
+                2 => 0x4000,
+                3 => 0x4200,
+                _ => unreachable!(),
+            };
+            for _ in 0..k {
+                bytes.extend_from_slice(&bits16.to_le_bytes());
+            }
+        }
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let m = 4;
+        let acts: Vec<f32> = (0..(m * k)).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut ref_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            let mut r = vec![0.0f32; n];
+            matmul_row(w, &acts[row * k..(row + 1) * k], &mut r);
+            ref_out[row * n..(row + 1) * n].copy_from_slice(&r);
+        }
+
+        let mut batch_out = vec![0.0f32; m * n];
+        matmul_batch(w, &acts, &mut batch_out, m);
+
+        assert_eq!(batch_out, ref_out);
     }
 
     #[test]
