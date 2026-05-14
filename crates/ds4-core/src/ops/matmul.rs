@@ -642,4 +642,181 @@ mod tests {
         let mut out = vec![0f32; 2];
         matmul_row(w, &[1.0; 32], &mut out);
     }
+
+    #[test]
+    fn weight_view_accessors() {
+        let bytes = weight_constant_i8(7, 64, 1);
+        let q = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: 7,
+            in_features: 64,
+        };
+        assert_eq!(q.out_features(), 7);
+        assert_eq!(q.in_features(), 64);
+
+        let f_bytes = weight_constant_f16(3, 5, 1.0);
+        let f = WeightView::F16 {
+            bytes: &f_bytes,
+            out_features: 3,
+            in_features: 5,
+        };
+        assert_eq!(f.out_features(), 3);
+        assert_eq!(f.in_features(), 5);
+    }
+
+    #[test]
+    fn dot_block_negative_scale() {
+        // f16 -1.0 = 0xBC00
+        let mut block = block_scale_one([1; 32]);
+        block[0..2].copy_from_slice(&0xBC00u16.to_le_bytes());
+        let act = [1.0f32; 32];
+        assert_eq!(dot_q8_0_f32_block(&block, &act), -32.0);
+    }
+
+    #[test]
+    fn dot_block_zero_quants_is_zero() {
+        let block = block_scale_one([0; 32]);
+        let act = [3.5f32; 32];
+        assert_eq!(dot_q8_0_f32_block(&block, &act), 0.0);
+    }
+
+    #[test]
+    fn dot_block_zero_act_is_zero() {
+        let block = block_scale_one([7; 32]);
+        let act = [0.0f32; 32];
+        assert_eq!(dot_q8_0_f32_block(&block, &act), 0.0);
+    }
+
+    #[test]
+    fn matmul_batch_m_one_matches_row() {
+        let n = 4;
+        let k = 64;
+        let bytes = weight_constant_i8(n, k, 2);
+        let w = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act: Vec<f32> = (0..k).map(|i| (i as f32) * 0.25 - 1.0).collect();
+
+        let mut row_out = vec![0f32; n];
+        matmul_row(w, &act, &mut row_out);
+
+        let mut batch_out = vec![0f32; n];
+        matmul_batch(w, &act, &mut batch_out, 1);
+
+        assert_eq!(row_out, batch_out);
+    }
+
+    #[test]
+    fn matmul_row_zero_act_yields_zero() {
+        let n = 3;
+        let k = 32;
+        let bytes = weight_constant_i8(n, k, 5);
+        let w = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act = vec![0.0f32; k];
+        let mut out = vec![123.0f32; n];
+        matmul_row(w, &act, &mut out);
+        assert_eq!(out, vec![0.0f32; n]);
+    }
+
+    #[test]
+    fn matmul_batch_overwrites_existing_out() {
+        let n = 2;
+        let k = 32;
+        let bytes = weight_constant_i8(n, k, 1);
+        let w = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let m = 3;
+        let acts = vec![1.0f32; m * k];
+
+        let mut out = vec![999.0f32; m * n];
+        matmul_batch(w, &acts, &mut out, m);
+
+        for &v in &out {
+            assert_eq!(v, 32.0);
+        }
+    }
+
+    #[test]
+    fn matmul_row_f16_negative_weights() {
+        let bytes = weight_constant_f16(1, 4, -1.0);
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 4,
+        };
+        let act = vec![1.0f32, 2.0, 3.0, 4.0];
+        let mut out = vec![0.0f32; 1];
+        matmul_row(w, &act, &mut out);
+        assert_eq!(out[0], -10.0);
+    }
+
+    #[test]
+    fn matmul_row_f16_fractional_weights() {
+        let bytes = weight_constant_f16(1, 4, 0.5);
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 4,
+        };
+        let act = vec![2.0f32, 4.0, 6.0, 8.0];
+        let mut out = vec![0.0f32; 1];
+        matmul_row(w, &act, &mut out);
+        assert_eq!(out[0], 10.0);
+    }
+
+    #[test]
+    fn matmul_batch_m_one_f16_matches_row() {
+        let n = 2;
+        let k = 6;
+        let bytes = weight_constant_f16(n, k, 2.0);
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act: Vec<f32> = (0..k).map(|i| (i as f32) * 0.5 - 1.0).collect();
+
+        let mut row_out = vec![0.0f32; n];
+        matmul_row(w, &act, &mut row_out);
+
+        let mut batch_out = vec![0.0f32; n];
+        matmul_batch(w, &act, &mut batch_out, 1);
+
+        assert_eq!(row_out, batch_out);
+    }
+
+    #[test]
+    #[should_panic(expected = "act len")]
+    fn matmul_row_f16_rejects_wrong_act_len() {
+        let bytes = weight_constant_f16(1, 4, 1.0);
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 4,
+        };
+        let mut out = vec![0.0f32; 1];
+        matmul_row(w, &[1.0; 8], &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn matmul_row_f16_rejects_wrong_out_len() {
+        let bytes = weight_constant_f16(1, 4, 1.0);
+        let w = WeightView::F16 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 4,
+        };
+        let mut out = vec![0.0f32; 5];
+        matmul_row(w, &[1.0; 4], &mut out);
+    }
 }

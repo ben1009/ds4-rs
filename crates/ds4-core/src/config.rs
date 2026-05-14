@@ -147,4 +147,87 @@ mod tests {
         m.remove("llama.vocab_size");
         assert!(ModelConfig::from_metadata(&m).is_err());
     }
+
+    #[test]
+    fn type_mismatch_for_u32_errors() {
+        let mut m = base_metadata();
+        m.insert(
+            "llama.vocab_size".to_string(),
+            Value::String("not a number".to_string()),
+        );
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(err.to_string().contains("Missing metadata key"));
+    }
+
+    #[test]
+    fn u32_field_accepts_u64_in_range() {
+        let mut m = base_metadata();
+        m.insert("llama.vocab_size".to_string(), Value::U64(50000));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.n_vocab, 50000);
+    }
+
+    #[test]
+    fn u32_field_rejects_u64_overflow() {
+        let mut m = base_metadata();
+        m.insert("llama.vocab_size".to_string(), Value::U64(u64::MAX));
+        assert!(ModelConfig::from_metadata(&m).is_err());
+    }
+
+    #[test]
+    fn head_dim_falls_back_to_head_dim_key() {
+        let mut m = base_metadata();
+        m.insert("llama.attention.head_dim".to_string(), Value::U32(192));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.head_dim, 192);
+    }
+
+    #[test]
+    fn key_length_takes_precedence_over_head_dim() {
+        let mut m = base_metadata();
+        m.insert("llama.attention.key_length".to_string(), Value::U32(160));
+        m.insert("llama.attention.head_dim".to_string(), Value::U32(192));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.head_dim, 160);
+    }
+
+    #[test]
+    fn rope_theta_widens_from_f64() {
+        let mut m = base_metadata();
+        m.insert("llama.rope.freq_base".to_string(), Value::F64(123_456.789));
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert!((cfg.rope_theta - 123_456.79_f32).abs() < 1.0);
+    }
+
+    #[test]
+    fn rope_theta_type_mismatch_falls_back_to_default() {
+        let mut m = base_metadata();
+        m.insert(
+            "llama.rope.freq_base".to_string(),
+            Value::String("abc".to_string()),
+        );
+        let cfg = ModelConfig::from_metadata(&m).unwrap();
+        assert_eq!(cfg.rope_theta, 10000.0);
+    }
+
+    #[test]
+    fn each_mandatory_field_individually_required() {
+        let keys = [
+            "llama.vocab_size",
+            "llama.embedding_length",
+            "llama.attention.head_count",
+            "llama.attention.head_count_kv",
+            "llama.block_count",
+            "llama.feed_forward_length",
+        ];
+        for k in keys {
+            let mut m = base_metadata();
+            m.remove(k);
+            let err = ModelConfig::from_metadata(&m).unwrap_err();
+            assert!(
+                err.to_string().contains(k),
+                "expected error to mention {k}, got: {err}"
+            );
+        }
+    }
 }

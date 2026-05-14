@@ -445,4 +445,224 @@ mod tests {
         assert_eq!(post1, post2);
         assert_eq!(comb1, comb2);
     }
+
+    #[test]
+    fn hc_weighted_sum_zero_weights_yields_zero() {
+        let streams = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weights = vec![0.0f32, 0.0];
+        let mut out = vec![9.0f32; 3];
+        hc_weighted_sum(&streams, &weights, &mut out, 3, 2);
+        assert_eq!(out, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn hc_weighted_sum_single_stream_acts_as_scale() {
+        let streams = vec![1.0f32, -2.0, 3.5];
+        let weights = vec![2.0f32];
+        let mut out = vec![0.0f32; 3];
+        hc_weighted_sum(&streams, &weights, &mut out, 3, 1);
+        assert_eq!(out, vec![2.0, -4.0, 7.0]);
+    }
+
+    #[test]
+    fn hc_weighted_sum_clears_existing_output() {
+        // out is accumulator-style; pre-existing values must be wiped.
+        let streams = vec![1.0f32, 2.0];
+        let weights = vec![1.0f32];
+        let mut out = vec![100.0f32, 200.0];
+        hc_weighted_sum(&streams, &weights, &mut out, 2, 1);
+        assert_eq!(out, vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn hc_post_zero_post_gate_drops_block_out() {
+        let n_hc = 2;
+        let n_embd = 2;
+        let block_out = vec![100.0f32, 200.0];
+        let residual_hc = vec![1.0f32, 2.0, 3.0, 4.0];
+        let post = vec![0.0f32, 0.0];
+        // Identity comb (each dst takes only its same-index src).
+        let comb = vec![1.0f32, 0.0, 0.0, 1.0];
+        let mut out_hc = vec![0.0f32; n_hc * n_embd];
+        hc_post(
+            &mut out_hc,
+            &block_out,
+            &residual_hc,
+            &post,
+            &comb,
+            n_embd,
+            n_hc,
+        );
+        assert_eq!(out_hc, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn hc_post_zero_comb_isolates_block_out_times_post() {
+        let n_hc = 2;
+        let n_embd = 2;
+        let block_out = vec![5.0f32, 7.0];
+        let residual_hc = vec![1.0f32, 2.0, 3.0, 4.0];
+        let post = vec![0.5f32, 2.0];
+        let comb = vec![0.0f32; 4];
+        let mut out_hc = vec![0.0f32; n_hc * n_embd];
+        hc_post(
+            &mut out_hc,
+            &block_out,
+            &residual_hc,
+            &post,
+            &comb,
+            n_embd,
+            n_hc,
+        );
+        assert_eq!(out_hc, vec![2.5, 3.5, 10.0, 14.0]);
+    }
+
+    #[test]
+    fn hc_from_plain_embedding_n_hc_one() {
+        let x = vec![1.0f32, 2.0, 3.0];
+        let mut out = vec![0.0f32; 3];
+        hc_from_plain_embedding(&mut out, &x, 3, 1);
+        assert_eq!(out, x);
+    }
+
+    #[test]
+    fn hc_control_split_with_zero_iters_skips_sinkhorn_loop() {
+        // iters=0 means the loop `for _ in 1..0` runs zero times, but the
+        // initial row-softmax + column-norm still execute. Columns should
+        // sum to ~1; rows generally won't.
+        let n_hc = 4;
+        let mut mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        for i in 0..(n_hc * n_hc) {
+            mix[2 * n_hc + i] = (i as f32) * 0.2 - 1.5;
+        }
+        let scale = vec![1.0f32, 1.0, 1.0];
+        let base = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        let mut pre = vec![0.0f32; n_hc];
+        let mut post = vec![0.0f32; n_hc];
+        let mut comb = vec![0.0f32; n_hc * n_hc];
+        hc_control_split(
+            &mix, &scale, &base, &mut pre, &mut post, &mut comb, n_hc, 0, 1e-6,
+        );
+        for src in 0..n_hc {
+            let col_sum: f32 = (0..n_hc).map(|dst| comb[src + dst * n_hc]).sum();
+            assert!((col_sum - 1.0).abs() < 1e-4, "col {src} sum = {col_sum}");
+        }
+    }
+
+    #[test]
+    fn hc_control_split_pre_eps_floor() {
+        // Strongly negative mix*pre_scale drives sigmoid -> 0, so pre -> eps.
+        let n_hc = 2;
+        let mut mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        mix[0] = -1000.0;
+        mix[1] = -1000.0;
+        let scale = vec![1.0f32, 1.0, 1.0];
+        let base = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        let mut pre = vec![0.0f32; n_hc];
+        let mut post = vec![0.0f32; n_hc];
+        let mut comb = vec![0.0f32; n_hc * n_hc];
+        let eps = 1e-3;
+        hc_control_split(
+            &mix, &scale, &base, &mut pre, &mut post, &mut comb, n_hc, 5, eps,
+        );
+        for &p in &pre {
+            assert!((p - eps).abs() < 1e-6, "pre = {p}, expected ~{eps}");
+        }
+    }
+
+    #[test]
+    fn hc_control_split_post_range_zero_to_two() {
+        let n_hc = 2;
+        let mut mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        // post indexes are mix[n_hc..2*n_hc].
+        mix[n_hc] = -1000.0;
+        mix[n_hc + 1] = 1000.0;
+        let scale = vec![1.0f32, 1.0, 1.0];
+        let base = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        let mut pre = vec![0.0f32; n_hc];
+        let mut post = vec![0.0f32; n_hc];
+        let mut comb = vec![0.0f32; n_hc * n_hc];
+        hc_control_split(
+            &mix, &scale, &base, &mut pre, &mut post, &mut comb, n_hc, 5, 1e-6,
+        );
+        assert!(post[0].abs() < 1e-6, "post[0] = {}", post[0]);
+        assert!((post[1] - 2.0).abs() < 1e-6, "post[1] = {}", post[1]);
+    }
+
+    #[test]
+    fn hc_control_split_base_offsets_pre_post() {
+        // With mix=0 and scale=1, pre_z = base[i], post_z = base[n_hc+i].
+        let n_hc = 2;
+        let mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        let scale = vec![1.0f32, 1.0, 1.0];
+        let mut base = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
+        base[0] = 1.0;
+        base[1] = -1.0;
+        base[n_hc] = 2.0;
+        base[n_hc + 1] = -2.0;
+        let mut pre = vec![0.0f32; n_hc];
+        let mut post = vec![0.0f32; n_hc];
+        let mut comb = vec![0.0f32; n_hc * n_hc];
+        hc_control_split(
+            &mix, &scale, &base, &mut pre, &mut post, &mut comb, n_hc, 5, 0.0,
+        );
+        let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
+        assert!((pre[0] - sigmoid(1.0)).abs() < 1e-6, "pre[0] = {}", pre[0]);
+        assert!((pre[1] - sigmoid(-1.0)).abs() < 1e-6, "pre[1] = {}", pre[1]);
+        assert!(
+            (post[0] - 2.0 * sigmoid(2.0)).abs() < 1e-6,
+            "post[0] = {}",
+            post[0]
+        );
+        assert!(
+            (post[1] - 2.0 * sigmoid(-2.0)).abs() < 1e-6,
+            "post[1] = {}",
+            post[1]
+        );
+    }
+
+    #[test]
+    fn hc_post_linear_in_block_out() {
+        // out_hc[dst, d] depends linearly on block_out[d] via post[dst].
+        // Doubling block_out should add (post[dst] * orig_block_out[d]) to each row.
+        let n_hc = 2;
+        let n_embd = 3;
+        let block_out = vec![1.0f32, 2.0, 3.0];
+        let residual_hc = vec![10.0f32, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let post = vec![0.5f32, 1.5];
+        let comb = vec![0.7f32, 0.3, 0.2, 0.8];
+
+        let mut out1 = vec![0.0f32; n_hc * n_embd];
+        let mut out2 = vec![0.0f32; n_hc * n_embd];
+        hc_post(
+            &mut out1,
+            &block_out,
+            &residual_hc,
+            &post,
+            &comb,
+            n_embd,
+            n_hc,
+        );
+        let block_out_2: Vec<f32> = block_out.iter().map(|v| v * 2.0).collect();
+        hc_post(
+            &mut out2,
+            &block_out_2,
+            &residual_hc,
+            &post,
+            &comb,
+            n_embd,
+            n_hc,
+        );
+        for (dst, &p) in post.iter().enumerate().take(n_hc) {
+            for (d, &b) in block_out.iter().enumerate().take(n_embd) {
+                let idx = dst * n_embd + d;
+                let diff = out2[idx] - out1[idx];
+                let expect = p * b;
+                assert!(
+                    (diff - expect).abs() < 1e-5,
+                    "dst={dst} d={d}: diff {diff} != {expect}",
+                );
+            }
+        }
+    }
 }

@@ -322,4 +322,243 @@ mod tests {
         let helper = build_block(0.0, [0i8; BLOCK_SIZE]);
         assert_eq!(out, helper);
     }
+
+    fn dequant(out: &[u8]) -> Vec<f32> {
+        let d = read_d(out);
+        let qs = read_qs(out);
+        qs.iter().map(|&q| d * q as f32).collect()
+    }
+
+    #[test]
+    fn round_trip_monotonic_ramp_within_quantization_step() {
+        let mut x = vec![0f32; BLOCK_SIZE];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (i as f32 - 128.0) * 0.1;
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let recon = dequant(&out);
+        // amax = 12.7 -> step size = 12.7 / 128 ~= 0.0992. Round-trip error
+        // should be bounded by half that.
+        let step = 12.7 / 128.0;
+        for (xv, rv) in x.iter().zip(recon.iter()) {
+            assert!(
+                (xv - rv).abs() <= step,
+                "input {xv}, recon {rv}, step {step}",
+            );
+        }
+    }
+
+    #[test]
+    fn round_trip_alternating_signs_preserves_pattern() {
+        let mut x = vec![0f32; BLOCK_SIZE];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let recon = dequant(&out);
+        // m = +1, iscale = -128. Positive elements clamp to -128 -> recon
+        // exactly +1. Negative elements would map to +128 but clamp to +127,
+        // so recon is -127/128. Error magnitude bounded by one step (1/128).
+        let step = 1.0 / 128.0;
+        for (xv, rv) in x.iter().zip(recon.iter()) {
+            assert_eq!(xv.signum(), rv.signum());
+            assert!((xv - rv).abs() <= step + 1e-6);
+        }
+    }
+
+    #[test]
+    fn round_trip_near_int8_saturation() {
+        // amax exactly 1.0 -> iscale = -128, qs spans full -128..127 range
+        // depending on input. Each integer step in qs maps to 1/128 in x.
+        let mut x = vec![0f32; BLOCK_SIZE];
+        for (i, v) in x.iter_mut().enumerate() {
+            // Distribute across [-1.0, 1.0)
+            *v = (i as f32 - 128.0) / 128.0;
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let qs = read_qs(&out);
+        // Element with x = -1.0 must hit -128 exactly (the chosen max).
+        assert_eq!(qs[0], -128);
+        let recon = dequant(&out);
+        for (xv, rv) in x.iter().zip(recon.iter()) {
+            assert!((xv - rv).abs() <= 1.0 / 128.0 + 1e-6);
+        }
+    }
+
+    #[test]
+    fn round_trip_very_small_magnitudes() {
+        let mut x = vec![0f32; BLOCK_SIZE];
+        for (i, v) in x.iter_mut().enumerate() {
+            *v = (i as f32 - 128.0) * 1e-20;
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let recon = dequant(&out);
+        // amax = 128 * 1e-20 = 1.28e-18. Step = amax / 128 = 1e-20.
+        let step = 1.28e-18 / 128.0;
+        for (xv, rv) in x.iter().zip(recon.iter()) {
+            assert!((xv - rv).abs() <= step + 1e-25, "input {xv}, recon {rv}",);
+        }
+    }
+
+    #[test]
+    fn d_sign_matches_negative_m() {
+        // d = -m/128. m negative -> d positive.
+        let mut x = vec![0.0f32; BLOCK_SIZE];
+        x[0] = -2.0;
+        x[1] = 1.0;
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let d = read_d(&out);
+        assert!(d > 0.0);
+        assert!((d - (2.0 / 128.0)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn d_sign_matches_positive_m() {
+        // d = -m/128. m positive -> d negative.
+        let mut x = vec![0.0f32; BLOCK_SIZE];
+        x[0] = 2.0;
+        x[1] = -1.0;
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let d = read_d(&out);
+        assert!(d < 0.0);
+        assert!((d - (-2.0 / 128.0)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn first_max_wins_when_ties_in_abs() {
+        // Two equal-abs candidates with opposite signs. The first one in scan
+        // order is picked (strict > comparison in the loop).
+        let mut x = vec![0.0f32; BLOCK_SIZE];
+        x[5] = 4.0;
+        x[200] = -4.0;
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let d = read_d(&out);
+        // m = +4, iscale = -32, d = -4/128 = -0.03125
+        assert!((d - (-4.0 / 128.0)).abs() < 1e-7);
+    }
+
+    #[test]
+    fn bsums_in_i16_range_for_full_saturation() {
+        // Every qs ends up at -128 -> each 16-group sums to -2048, which fits
+        // in i16. Verify no clamping kicks in.
+        let x = vec![1.0f32; BLOCK_SIZE];
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let bsums = read_bsums(&out);
+        for &b in &bsums {
+            assert_eq!(b, -2048);
+        }
+    }
+
+    #[test]
+    fn quantize_zero_length_input() {
+        let x: Vec<f32> = Vec::new();
+        let mut out: Vec<u8> = Vec::new();
+        quantize(&x, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "x len")]
+    fn quantize_block_rejects_short_x() {
+        let x = vec![0f32; BLOCK_SIZE - 1];
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn quantize_block_rejects_wrong_out_len() {
+        let x = vec![0f32; BLOCK_SIZE];
+        let mut out = vec![0u8; BYTES_PER_BLOCK - 1];
+        quantize_block(&x, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn quantize_rejects_mismatched_out_len() {
+        let x = vec![0f32; BLOCK_SIZE * 2];
+        let mut out = vec![0u8; BYTES_PER_BLOCK]; // should be 2 * BYTES_PER_BLOCK
+        quantize(&x, &mut out);
+    }
+
+    #[test]
+    fn block_boundary_independence() {
+        // First block is huge, second is tiny. Each must get its own scale.
+        let mut x = vec![0f32; BLOCK_SIZE * 2];
+        for v in x[..BLOCK_SIZE].iter_mut() {
+            *v = 1000.0;
+        }
+        for v in x[BLOCK_SIZE..].iter_mut() {
+            *v = 0.001;
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK * 2];
+        quantize(&x, &mut out);
+
+        let d0 = read_d(&out[..BYTES_PER_BLOCK]);
+        let d1 = read_d(&out[BYTES_PER_BLOCK..]);
+        assert!((d0 - (-1000.0 / 128.0)).abs() < 1e-3);
+        assert!((d1 - (-0.001 / 128.0)).abs() < 1e-9);
+
+        let qs0 = read_qs(&out[..BYTES_PER_BLOCK]);
+        let qs1 = read_qs(&out[BYTES_PER_BLOCK..]);
+        for &q in &qs0 {
+            assert_eq!(q, -128);
+        }
+        for &q in &qs1 {
+            assert_eq!(q, -128);
+        }
+    }
+
+    #[test]
+    fn quantize_overwrites_existing_output() {
+        // Pre-fill output with garbage; quantize_block must overwrite it
+        // entirely (especially the bsums area, which earlier code zeroed).
+        let mut x = vec![0f32; BLOCK_SIZE];
+        x[0] = 1.0;
+        let mut out = vec![0xFFu8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let qs = read_qs(&out);
+        let bsums = read_bsums(&out);
+        // qs[0] = -128, all other qs = 0 -> first bsum group sums to -128,
+        // remaining groups sum to 0.
+        assert_eq!(qs[0], -128);
+        for &q in &qs[1..] {
+            assert_eq!(q, 0);
+        }
+        assert_eq!(bsums[0], -128);
+        for &b in &bsums[1..] {
+            assert_eq!(b, 0);
+        }
+    }
+
+    #[test]
+    fn bsums_consistent_with_qs_for_random_input() {
+        // Pseudo-random sweep — confirm bsums always equal the live sum of
+        // qs across every 16-wide slab.
+        let mut x = vec![0f32; BLOCK_SIZE];
+        let mut state: u64 = 0xcafef00dd15ea5e5;
+        for v in x.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let bits = (state >> 32) as u32;
+            *v = (bits as f32 / u32::MAX as f32 - 0.5) * 8.0;
+        }
+        let mut out = vec![0u8; BYTES_PER_BLOCK];
+        quantize_block(&x, &mut out);
+        let qs = read_qs(&out);
+        let bsums = read_bsums(&out);
+        for j in 0..16 {
+            let expected: i32 = qs[j * 16..j * 16 + 16].iter().map(|&q| q as i32).sum();
+            assert_eq!(bsums[j] as i32, expected, "group {j}");
+        }
+    }
 }

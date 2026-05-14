@@ -597,3 +597,55 @@ fn output_head(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rms_scale_unit_vector() {
+        let x = [1.0f32, 1.0, 1.0, 1.0];
+        let s = rms_scale(&x, 1e-12);
+        assert!((s - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rms_scale_zero_vector_is_eps_bound() {
+        let x = [0.0f32; 8];
+        let s = rms_scale(&x, 1e-6);
+        let expected = 1.0 / 1e-6f32.sqrt();
+        assert!((s - expected).abs() / expected < 1e-3);
+    }
+
+    #[test]
+    fn rms_scale_empty_returns_eps_inverse() {
+        let s = rms_scale(&[], 1e-6);
+        let expected = 1.0 / 1e-6f32.sqrt();
+        assert!((s - expected).abs() / expected < 1e-3);
+    }
+
+    #[test]
+    fn rms_scale_matches_inverse_rms() {
+        let x = [3.0f32, 4.0, 0.0, 0.0];
+        // mean square = 25/4 = 6.25, sqrt = 2.5, scale = 1/sqrt(6.25 + eps) ~= 0.4
+        let s = rms_scale(&x, 1e-12);
+        assert!((s - 0.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn rms_scale_scale_invariance() {
+        let x = [1.0f32, 2.0, 3.0, 4.0];
+        let xs: Vec<f32> = x.iter().map(|v| v * 10.0).collect();
+        let a = rms_scale(&x, 1e-12);
+        let b = rms_scale(&xs, 1e-12);
+        // Scaling input by k should scale rms_scale by 1/k.
+        assert!((a - b * 10.0).abs() / a < 1e-3);
+    }
+
+    #[test]
+    fn rms_scale_negative_inputs_match_positive() {
+        let p = rms_scale(&[1.0, 2.0, 3.0], 1e-12);
+        let n = rms_scale(&[-1.0, -2.0, -3.0], 1e-12);
+        assert!((p - n).abs() < 1e-6);
+    }
+}

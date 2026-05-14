@@ -191,4 +191,110 @@ mod tests {
         rms_norm(&x, &w, EPS, &mut y2);
         assert_eq!(y1, y2);
     }
+
+    #[test]
+    fn empty_input_uses_eps_only_scale() {
+        // Zero-length input is documented as scale = 1/sqrt(eps); both ops
+        // become no-ops on zero-length out.
+        let x: Vec<f32> = vec![];
+        let w: Vec<f32> = vec![];
+        let mut y: Vec<f32> = vec![];
+        rms_norm(&x, &w, EPS, &mut y);
+        assert!(y.is_empty());
+
+        let mut y: Vec<f32> = vec![];
+        rms_norm_no_weight(&x, EPS, &mut y);
+        assert!(y.is_empty());
+    }
+
+    #[test]
+    fn single_element_normalises_to_unit_magnitude_times_weight() {
+        // mean(x^2) = x^2 -> scale = 1/sqrt(x^2 + eps) -> y ~= sign(x) * w.
+        let x = vec![5.0f32];
+        let w = vec![3.0f32];
+        let mut y = vec![0f32; 1];
+        rms_norm(&x, &w, EPS, &mut y);
+        let scale = 1.0 / (25.0 + EPS).sqrt();
+        assert!(approx_eq(y[0], 5.0 * scale * 3.0, 1e-6), "y[0] = {}", y[0]);
+    }
+
+    #[test]
+    fn negative_constant_input_preserves_sign_and_scale() {
+        let x = vec![-2.0f32; 5];
+        let w = vec![1.0f32; 5];
+        let mut y = vec![0f32; 5];
+        rms_norm(&x, &w, EPS, &mut y);
+        let scale = 1.0 / (4.0 + EPS).sqrt();
+        for &v in &y {
+            assert!(approx_eq(v, -2.0 * scale, 1e-6), "y = {v}");
+            assert!(v < 0.0, "sign lost: {v}");
+        }
+    }
+
+    #[test]
+    fn zero_weight_zeros_output() {
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let w = vec![0.0f32; 4];
+        let mut y = vec![99.0f32; 4];
+        rms_norm(&x, &w, EPS, &mut y);
+        assert_eq!(y, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn rms_norm_overwrites_existing_output() {
+        // Out should be written, not accumulated.
+        let x = vec![1.0f32, 2.0, 3.0, 4.0];
+        let w = vec![1.0f32; 4];
+        let mut y = vec![1000.0f32; 4];
+        rms_norm(&x, &w, EPS, &mut y);
+        let mut y_ref = vec![0f32; 4];
+        rms_norm(&x, &w, EPS, &mut y_ref);
+        assert_eq!(y, y_ref);
+    }
+
+    #[test]
+    fn no_weight_overwrites_existing_output() {
+        let x = vec![1.0f32, -2.0, 3.0];
+        let mut y = vec![-7.0f32; 3];
+        rms_norm_no_weight(&x, EPS, &mut y);
+        let mut y_ref = vec![0f32; 3];
+        rms_norm_no_weight(&x, EPS, &mut y_ref);
+        assert_eq!(y, y_ref);
+    }
+
+    #[test]
+    fn no_weight_produces_unit_rms() {
+        let x: Vec<f32> = (0..32).map(|i| (i as f32) * 0.5 - 8.0).collect();
+        let mut y = vec![0f32; 32];
+        rms_norm_no_weight(&x, EPS, &mut y);
+        let mean_sq: f32 = y.iter().map(|v| v * v).sum::<f32>() / 32.0;
+        assert!(
+            (mean_sq - 1.0).abs() < 1e-4,
+            "mean(y^2) = {mean_sq}, expected ~1",
+        );
+    }
+
+    #[test]
+    fn scale_invariant_in_input_magnitude() {
+        // RMSNorm with weight=1 is invariant to global scaling of x (modulo eps),
+        // so scaling x by k should leave y unchanged for |x| >> sqrt(eps).
+        let x: Vec<f32> = (1..=16).map(|i| i as f32).collect();
+        let x_scaled: Vec<f32> = x.iter().map(|v| v * 100.0).collect();
+        let w = vec![1.0f32; 16];
+        let mut y1 = vec![0f32; 16];
+        let mut y2 = vec![0f32; 16];
+        rms_norm(&x, &w, EPS, &mut y1);
+        rms_norm(&x_scaled, &w, EPS, &mut y2);
+        for (i, (&a, &b)) in y1.iter().zip(&y2).enumerate() {
+            assert!(approx_eq(a, b, 1e-4), "dim {i}: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn no_weight_rejects_mismatched_out_len() {
+        let x = vec![0.0f32; 4];
+        let mut y = vec![0.0f32; 3];
+        rms_norm_no_weight(&x, EPS, &mut y);
+    }
 }

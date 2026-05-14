@@ -66,3 +66,63 @@ impl Engine {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_missing_file_errors() {
+        let result = Engine::open(Path::new("/nonexistent/ds4-engine-test/file.gguf"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_empty_file_errors() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "ds4-engine-empty-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[])
+            .unwrap();
+        let result = Engine::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_wrong_magic_errors() {
+        use std::io::Write;
+        let path = std::env::temp_dir().join(format!(
+            "ds4-engine-badmagic-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ));
+        // Wrong magic bytes followed by zeros.
+        let mut buf = vec![0u8; 32];
+        buf[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let result = Engine::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn open_directory_errors() {
+        let result = Engine::open(&std::env::temp_dir());
+        assert!(result.is_err());
+    }
+}

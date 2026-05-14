@@ -118,7 +118,9 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{utf8_split, write_utf8};
+    use clap::Parser;
+
+    use super::{Args, utf8_split, write_utf8};
 
     #[test]
     fn holds_partial_multibyte() {
@@ -145,5 +147,125 @@ mod tests {
         write_utf8(&mut out, &mut pending, true).unwrap();
         assert_eq!(out, "A\u{FFFD}".as_bytes());
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn utf8_split_all_valid() {
+        assert_eq!(utf8_split(b"hello"), (5, 0));
+        assert_eq!(utf8_split("héllo".as_bytes()), ("héllo".len(), 0));
+    }
+
+    #[test]
+    fn utf8_split_invalid_in_middle() {
+        let bytes = [b'a', 0xFF, b'b'];
+        let (valid, invalid) = utf8_split(&bytes);
+        assert_eq!(valid, 1);
+        assert_eq!(invalid, 1);
+    }
+
+    #[test]
+    fn utf8_split_empty() {
+        assert_eq!(utf8_split(&[]), (0, 0));
+    }
+
+    #[test]
+    fn write_utf8_pure_ascii_drains_all() {
+        let mut pending = b"hello world".to_vec();
+        let mut out = Vec::new();
+        write_utf8(&mut out, &mut pending, false).unwrap();
+        assert_eq!(out, b"hello world");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn write_utf8_multiple_invalid_sequences() {
+        let mut pending = vec![b'a', 0xFF, b'b', 0xFE, b'c'];
+        let mut out = Vec::new();
+        write_utf8(&mut out, &mut pending, false).unwrap();
+        assert_eq!(out, "a\u{FFFD}b\u{FFFD}c".as_bytes());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn write_utf8_holds_trailing_partial_without_flush() {
+        let mut pending = vec![b'a', 0xE2, 0x82];
+        let mut out = Vec::new();
+        write_utf8(&mut out, &mut pending, false).unwrap();
+        assert_eq!(out, b"a");
+        assert_eq!(pending, vec![0xE2, 0x82]);
+    }
+
+    #[test]
+    fn write_utf8_completes_partial_on_more_bytes() {
+        let mut pending = vec![0xE2, 0x82];
+        let mut out = Vec::new();
+        write_utf8(&mut out, &mut pending, false).unwrap();
+        assert!(out.is_empty());
+        pending.push(0xAC);
+        write_utf8(&mut out, &mut pending, false).unwrap();
+        assert_eq!(out, "\u{20AC}".as_bytes());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn args_defaults() {
+        let args = Args::parse_from(["ds4"]);
+        assert_eq!(args.model.to_str().unwrap(), "./ds4flash.gguf");
+        assert!(args.prompt.is_none());
+        assert_eq!(args.max_tokens, 256);
+        assert_eq!(args.ctx, 32768);
+    }
+
+    #[test]
+    fn args_with_prompt_short_flag() {
+        let args = Args::parse_from(["ds4", "-p", "hello"]);
+        assert_eq!(args.prompt.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn args_with_prompt_long_flag() {
+        let args = Args::parse_from(["ds4", "--prompt", "world"]);
+        assert_eq!(args.prompt.as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn args_with_max_tokens() {
+        let args = Args::parse_from(["ds4", "-n", "10"]);
+        assert_eq!(args.max_tokens, 10);
+        let args = Args::parse_from(["ds4", "--max-tokens", "42"]);
+        assert_eq!(args.max_tokens, 42);
+    }
+
+    #[test]
+    fn args_with_ctx() {
+        let args = Args::parse_from(["ds4", "--ctx", "1024"]);
+        assert_eq!(args.ctx, 1024);
+    }
+
+    #[test]
+    fn args_with_custom_model_path() {
+        let args = Args::parse_from(["ds4", "--model", "/tmp/custom.gguf"]);
+        assert_eq!(args.model.to_str().unwrap(), "/tmp/custom.gguf");
+    }
+
+    #[test]
+    fn args_combined_flags() {
+        let args = Args::parse_from([
+            "ds4", "--model", "/m.gguf", "-p", "hi", "-n", "5", "--ctx", "64",
+        ]);
+        assert_eq!(args.model.to_str().unwrap(), "/m.gguf");
+        assert_eq!(args.prompt.as_deref(), Some("hi"));
+        assert_eq!(args.max_tokens, 5);
+        assert_eq!(args.ctx, 64);
+    }
+
+    #[test]
+    fn args_rejects_unknown_flag() {
+        assert!(Args::try_parse_from(["ds4", "--no-such-flag"]).is_err());
+    }
+
+    #[test]
+    fn args_rejects_invalid_max_tokens() {
+        assert!(Args::try_parse_from(["ds4", "-n", "not-a-number"]).is_err());
     }
 }

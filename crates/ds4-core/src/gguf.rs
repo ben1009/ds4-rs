@@ -827,4 +827,240 @@ mod tests {
 
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---- additional parse() tests ----------------------------------------------
+
+    #[test]
+    fn parse_rejects_truncated_header() {
+        // Only magic, no version/counts.
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC);
+        assert!(GgufContent::parse(&b.build()).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_buffer() {
+        assert!(GgufContent::parse(&[]).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_truncated_metadata_value() {
+        // Header claims 1 KV pair, but the file ends mid-value (key + type only).
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_str("k").raw_u32(4); // type U32, no payload
+        assert!(GgufContent::parse(&b.build()).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_unknown_value_type() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_str("k").raw_u32(99); // bogus value type
+        b.raw_u32(0); // some payload
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Unknown GGUF value type"));
+    }
+
+    #[test]
+    fn parse_rejects_oversized_array() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_str("k").raw_u32(9); // Array
+        b.raw_u32(4); // inner type U32
+        b.raw_u64((MAX_GGUF_ARRAY_LEN + 1) as u64);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Array too long"));
+    }
+
+    #[test]
+    fn parse_rejects_deeply_nested_arrays() {
+        let mut b = GgufBuilder::new();
+        b.raw_u32(GGUF_MAGIC).raw_u32(3).raw_u64(0).raw_u64(1);
+        b.raw_str("k").raw_u32(9); // Array (outer)
+        // 17 levels of nested arrays each of length 1, exceeding MAX_ARRAY_DEPTH=16.
+        for _ in 0..17 {
+            b.raw_u32(9); // inner type Array
+            b.raw_u64(1); // length
+        }
+        b.raw_u32(4); // innermost type U32
+        b.raw_u64(1);
+        b.raw_u32(0);
+        let err = GgufContent::parse(&b.build()).unwrap_err();
+        assert!(err.to_string().contains("Array nesting too deep"));
+    }
+
+    #[test]
+    fn parse_duplicate_keys_keeps_last() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 2).kv_u32("dup", 1).kv_u32("dup", 2);
+        let c = GgufContent::parse(&b.build()).unwrap();
+        assert_eq!(c.metadata.get("dup").unwrap().to_u32(), Some(2));
+    }
+
+    #[test]
+    fn parse_empty_string_value() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 1).kv_string("k", "");
+        let c = GgufContent::parse(&b.build()).unwrap();
+        assert_eq!(c.metadata.get("k").unwrap().to_string_val(), Some(""));
+    }
+
+    #[test]
+    fn parse_empty_array() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 1);
+        b.raw_str("a").raw_u32(9); // Array
+        b.raw_u32(4); // inner U32
+        b.raw_u64(0); // length 0
+        let c = GgufContent::parse(&b.build()).unwrap();
+        let arr = c.metadata.get("a").unwrap().to_array().unwrap();
+        assert!(arr.is_empty());
+    }
+
+    #[test]
+    fn parse_array_of_strings() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 1);
+        b.raw_str("toks").raw_u32(9);
+        b.raw_u32(8); // inner String
+        b.raw_u64(3);
+        b.raw_str("a").raw_str("bb").raw_str("ccc");
+        let c = GgufContent::parse(&b.build()).unwrap();
+        let arr = c.metadata.get("toks").unwrap().to_array().unwrap();
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0].to_string_val(), Some("a"));
+        assert_eq!(arr[2].to_string_val(), Some("ccc"));
+    }
+
+    #[test]
+    fn parse_all_scalar_value_types() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 10);
+        // U8
+        b.raw_str("u8").raw_u32(0).buf.push(7);
+        // I8
+        b.raw_str("i8").raw_u32(1).buf.push((-3i8) as u8);
+        // U16
+        b.raw_str("u16").raw_u32(2);
+        b.buf.extend_from_slice(&12345u16.to_le_bytes());
+        // I16
+        b.raw_str("i16").raw_u32(3);
+        b.buf.extend_from_slice(&(-1234i16).to_le_bytes());
+        // I32
+        b.raw_str("i32").raw_u32(5);
+        b.buf.extend_from_slice(&(-42i32).to_le_bytes());
+        // F32
+        b.raw_str("f32").raw_u32(6);
+        b.buf.extend_from_slice(&1.5f32.to_le_bytes());
+        // I64
+        b.raw_str("i64").raw_u32(11);
+        b.buf.extend_from_slice(&(-99i64).to_le_bytes());
+        // F64
+        b.raw_str("f64").raw_u32(12);
+        b.buf.extend_from_slice(&2.5f64.to_le_bytes());
+        // U32 (already covered, but for sanity)
+        b.kv_u32("u32", 100);
+        // U64
+        b.kv_u64("u64", 1234567890);
+
+        let c = GgufContent::parse(&b.build()).unwrap();
+        assert!(matches!(c.metadata["u8"], Value::U8(7)));
+        assert!(matches!(c.metadata["i8"], Value::I8(-3)));
+        assert!(matches!(c.metadata["u16"], Value::U16(12345)));
+        assert!(matches!(c.metadata["i16"], Value::I16(-1234)));
+        assert!(matches!(c.metadata["i32"], Value::I32(-42)));
+        assert!(matches!(c.metadata["f32"], Value::F32(v) if (v - 1.5).abs() < 1e-6));
+        assert!(matches!(c.metadata["i64"], Value::I64(-99)));
+        assert!(matches!(c.metadata["f64"], Value::F64(v) if (v - 2.5).abs() < 1e-9));
+        assert_eq!(c.metadata["u32"].to_u32(), Some(100));
+        assert_eq!(c.metadata["u64"].to_u64(), Some(1234567890));
+    }
+
+    #[test]
+    fn parse_default_alignment_when_metadata_absent() {
+        let mut b = GgufBuilder::new();
+        b.header(0, 0);
+        let bytes = b.build();
+        let c = GgufContent::parse(&bytes).unwrap();
+        assert_eq!(c.data_offset % DEFAULT_ALIGNMENT, 0);
+        assert!(c.data_offset >= bytes.len() as u64);
+    }
+
+    #[test]
+    fn parse_zero_position_yields_zero_data_offset() {
+        // The cursor-position-zero branch is unreachable in normal parsing
+        // (header always advances), but exercise the math via an exact-aligned
+        // header whose end is at a multiple of alignment.
+        let mut b = GgufBuilder::new();
+        b.header(0, 1).kv_u64("general.alignment", 8);
+        let bytes = b.build();
+        let c = GgufContent::parse(&bytes).unwrap();
+        assert_eq!(c.data_offset % 8, 0);
+    }
+
+    #[test]
+    fn parse_tensor_with_multiple_dims() {
+        let mut b = GgufBuilder::new();
+        b.header(1, 0).tensor_info("m", 0, &[2, 3], 0);
+        b.align_to(DEFAULT_ALIGNMENT);
+        for v in 0..6 {
+            b.raw_bytes(&(v as f32).to_le_bytes());
+        }
+        let c = GgufContent::parse(&b.build()).unwrap();
+        let info = &c.tensors["m"];
+        assert_eq!(info.dims, vec![2, 3]);
+        assert_eq!(info.dtype, GgmlType::F32);
+    }
+
+    #[test]
+    fn parse_tensor_zero_dims_is_accepted() {
+        // A 0-dim tensor (scalar) — n_dims=0 and offset=0.
+        let mut b = GgufBuilder::new();
+        b.header(1, 0).tensor_info("scalar", 0, &[], 0);
+        b.align_to(DEFAULT_ALIGNMENT);
+        let c = GgufContent::parse(&b.build()).unwrap();
+        let info = &c.tensors["scalar"];
+        assert!(info.dims.is_empty());
+    }
+
+    #[test]
+    fn ggufmmap_tensor_data_rejects_past_eof() {
+        use std::{
+            io::Write,
+            sync::atomic::{AtomicU64, Ordering},
+        };
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+
+        // Tensor claims 16 bytes of F32 data but we write only 8.
+        let mut b = GgufBuilder::new();
+        b.header(1, 0).tensor_info("t", 0, &[4], 0);
+        b.align_to(DEFAULT_ALIGNMENT);
+        b.raw_bytes(&1.0f32.to_le_bytes());
+        b.raw_bytes(&2.0f32.to_le_bytes());
+        let bytes = b.build();
+
+        let path =
+            std::env::temp_dir().join(format!("ds4-gguf-eof-{}-{}.bin", std::process::id(), seq,));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(&bytes).unwrap();
+        }
+        let gguf = GgufMmap::open(&path).unwrap();
+        let err = gguf.tensor_data("t").unwrap_err();
+        assert!(err.to_string().contains("extends past end of file"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ggml_tensor_nbytes_for_k_quants() {
+        // Q4_K is 144 bytes per 256-element block.
+        assert_eq!(ggml_tensor_nbytes(256, GgmlType::Q4_K), Some(144));
+        assert_eq!(ggml_tensor_nbytes(512, GgmlType::Q4_K), Some(288));
+        // Partial block rounds up.
+        assert_eq!(ggml_tensor_nbytes(257, GgmlType::Q4_K), Some(288));
+        // F16 is 2 bytes per element.
+        assert_eq!(ggml_tensor_nbytes(10, GgmlType::F16), Some(20));
+    }
 }

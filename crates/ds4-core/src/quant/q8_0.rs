@@ -187,4 +187,102 @@ mod tests {
         let mut out = vec![0f32; 32];
         dequant(&bytes, &mut out);
     }
+
+    #[test]
+    fn f16_to_f32_max_finite() {
+        // 0x7BFF = 65504, the largest finite f16.
+        assert_eq!(f16_to_f32(0x7BFF), 65504.0);
+        // -65504
+        assert_eq!(f16_to_f32(0xFBFF), -65504.0);
+    }
+
+    #[test]
+    fn f16_to_f32_negative_subnormal() {
+        let v = f16_to_f32(0x8001);
+        assert!((v + 2.0f32.powi(-24)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dequant_block_zero_scale_produces_zeros() {
+        let quants: [i8; 32] = std::array::from_fn(|i| i as i8 - 16);
+        let block = build_block(0x0000, quants);
+        let mut out = [0f32; BLOCK_SIZE];
+        dequant_block(&block, &mut out);
+        for v in out {
+            assert_eq!(v, 0.0);
+        }
+    }
+
+    #[test]
+    fn dequant_block_handles_min_i8_quant() {
+        // d = 1.0, quant = -128 => output = -128.0
+        let mut quants = [0i8; 32];
+        quants[5] = -128;
+        quants[10] = 127;
+        let block = build_block(0x3C00, quants);
+        let mut out = [0f32; BLOCK_SIZE];
+        dequant_block(&block, &mut out);
+        assert_eq!(out[5], -128.0);
+        assert_eq!(out[10], 127.0);
+    }
+
+    #[test]
+    fn dequant_block_alternating_signs() {
+        // d = 0.25, quants alternate +/-1 -> output alternates +/-0.25
+        let quants: [i8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 1 } else { -1 });
+        let block = build_block(0x3400, quants); // 0.25
+        let mut out = [0f32; BLOCK_SIZE];
+        dequant_block(&block, &mut out);
+        for (i, v) in out.iter().enumerate() {
+            let expected = if i % 2 == 0 { 0.25 } else { -0.25 };
+            assert_eq!(*v, expected);
+        }
+    }
+
+    #[test]
+    fn dequant_empty_input_is_noop() {
+        let bytes: Vec<u8> = Vec::new();
+        let mut out: Vec<f32> = Vec::new();
+        dequant(&bytes, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn dequant_three_blocks_varied_scales_and_quants() {
+        let b0 = build_block(0x0000, [50i8; 32]); // d=0 -> all zero
+        let b1 = build_block(0x3C00, std::array::from_fn(|i| i as i8 - 16)); // d=1
+        let b2 = build_block(0xBC00, std::array::from_fn(|i| -(i as i8) + 8)); // d=-1
+        let mut bytes = Vec::with_capacity(BYTES_PER_BLOCK * 3);
+        bytes.extend_from_slice(&b0);
+        bytes.extend_from_slice(&b1);
+        bytes.extend_from_slice(&b2);
+        let mut out = vec![0f32; BLOCK_SIZE * 3];
+        dequant(&bytes, &mut out);
+
+        for v in &out[..BLOCK_SIZE] {
+            assert_eq!(*v, 0.0);
+        }
+        for (i, v) in out[BLOCK_SIZE..2 * BLOCK_SIZE].iter().enumerate() {
+            assert_eq!(*v, (i as i8 - 16) as f32);
+        }
+        for (i, v) in out[2 * BLOCK_SIZE..].iter().enumerate() {
+            assert_eq!(*v, -((-(i as i8) + 8) as f32));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn dequant_block_rejects_wrong_out_len() {
+        let block = build_block(0x3C00, [0i8; 32]);
+        let mut out = [0f32; 16];
+        dequant_block(&block, &mut out);
+    }
+
+    #[test]
+    #[should_panic(expected = "out len")]
+    fn dequant_rejects_mismatched_out_len() {
+        let bytes = vec![0u8; BYTES_PER_BLOCK * 2];
+        let mut out = vec![0f32; BLOCK_SIZE]; // should be 64
+        dequant(&bytes, &mut out);
+    }
 }
