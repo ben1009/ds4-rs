@@ -167,16 +167,34 @@ impl KvCache {
     pub fn latent_layer_prefix(&self, layer: usize, len: usize) -> &[f32] {
         assert!(layer < self.n_layer);
         assert!(len <= self.ctx_size);
-        let off = layer * self.ctx_size * KV_LATENT_DIM;
-        &self.latent[off..off + len * KV_LATENT_DIM]
+        let off = layer
+            .checked_mul(self.ctx_size)
+            .and_then(|v| v.checked_mul(KV_LATENT_DIM))
+            .expect("KvCache: latent prefix offset overflow");
+        let span = len
+            .checked_mul(KV_LATENT_DIM)
+            .expect("KvCache: latent prefix length overflow");
+        let end = off
+            .checked_add(span)
+            .expect("KvCache: latent prefix end overflow");
+        &self.latent[off..end]
     }
 
     /// Return a slice of all k_pe vectors for `layer` up to `len` tokens.
     pub fn k_pe_layer_prefix(&self, layer: usize, len: usize) -> &[f32] {
         assert!(layer < self.n_layer);
         assert!(len <= self.ctx_size);
-        let off = layer * self.ctx_size * K_PE_DIM;
-        &self.k_pe[off..off + len * K_PE_DIM]
+        let off = layer
+            .checked_mul(self.ctx_size)
+            .and_then(|v| v.checked_mul(K_PE_DIM))
+            .expect("KvCache: k_pe prefix offset overflow");
+        let span = len
+            .checked_mul(K_PE_DIM)
+            .expect("KvCache: k_pe prefix length overflow");
+        let end = off
+            .checked_add(span)
+            .expect("KvCache: k_pe prefix end overflow");
+        &self.k_pe[off..end]
     }
 
     /// Advance the position watermark.

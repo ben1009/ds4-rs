@@ -14,6 +14,8 @@
 //! Reference: `hc_split_sinkhorn_one`, `hc_weighted_sum_one`, `hc_post_one`,
 //! `hc_from_plain_embedding` in antirez/ds4 ds4.c.
 
+use crate::ops::swiglu::sigmoid_stable;
+
 /// Compute HC control split from the projected mix vector.
 ///
 /// Inputs:
@@ -71,14 +73,14 @@ pub fn hc_control_split(
     // Pre weights: sigmoid + eps.
     for (i, pre_i) in pre.iter_mut().enumerate().take(n_hc) {
         let z = mix[i] * pre_scale + base[i];
-        *pre_i = sigmoid(z) + eps;
+        *pre_i = sigmoid_stable(z) + eps;
     }
 
     // Post gates: 2 * sigmoid.
     for (i, post_i) in post.iter_mut().enumerate().take(n_hc) {
         let off = n_hc + i;
         let z = mix[off] * post_scale + base[off];
-        *post_i = 2.0 * sigmoid(z);
+        *post_i = 2.0 * sigmoid_stable(z);
     }
 
     // Combine matrix: initialise from mix tail.
@@ -248,15 +250,6 @@ pub fn hc_from_plain_embedding(out_hc: &mut [f32], x: &[f32], n_embd: usize, n_h
 
     for h in 0..n_hc {
         out_hc[h * n_embd..(h + 1) * n_embd].copy_from_slice(x);
-    }
-}
-
-fn sigmoid(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let z = x.exp();
-        z / (1.0 + z)
     }
 }
 
