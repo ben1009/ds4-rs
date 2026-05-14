@@ -185,16 +185,23 @@ fn layer_attention_decode(
     let mut kv = vec![0.0f32; n_head_dim];
     kv_projection_decode(&engine.weights, layer, &attn_norm, &mut kv, n_head_dim)?;
 
-    // RoPE (uses precomputed frequency cache from Engine).
-    apply_rope(&mut q, pos, &engine.rope_freqs);
+    // RoPE per head (uses precomputed frequency cache from Engine).
+    for h in 0..n_head {
+        let qh = &mut q[h * n_head_dim..(h + 1) * n_head_dim];
+        apply_rope(qh, pos, &engine.rope_freqs);
+    }
     apply_rope(&mut kv, pos, &engine.rope_freqs);
 
-    // Store KV in cache.
+    // Store KV in cache and advance the watermark so the just-written
+    // token participates in this step's softmax.
     kv_cache.write_latent(il, pos, &kv);
+    if pos + 1 > kv_cache.len() {
+        kv_cache.set_pos(pos + 1);
+    }
 
     // Attention over cached KV rows.
     let mut heads = vec![0.0f32; q_dim];
-    let kv_len = kv_cache.len().min(pos + 1);
+    let kv_len = (pos + 1).min(kv_cache.ctx_size());
     let sliding_window = 128usize;
     let start_pos = kv_len.saturating_sub(sliding_window);
 
@@ -202,8 +209,11 @@ fn layer_attention_decode(
         &mut heads, layer, &q, kv_cache, il, start_pos, kv_len, n_head, n_head_dim,
     )?;
 
-    // Inverse RoPE on attention output before grouped projection.
-    apply_rope_inverse(&mut heads, pos, &engine.rope_freqs);
+    // Inverse RoPE per head on attention output before grouped projection.
+    for h in 0..n_head {
+        let oh = &mut heads[h * n_head_dim..(h + 1) * n_head_dim];
+        apply_rope_inverse(oh, pos, &engine.rope_freqs);
+    }
 
     // Grouped output projection.
     grouped_out_decode(&engine.weights, layer, &heads, out)?;
@@ -231,27 +241,7 @@ fn hc_pre(
     let mut mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
     matmul_row(layer.hc_attn_fn, &flat, &mut mix);
 
-    // 3. Sinkhorn split.
-    hc_control_split(
-        &mix,
-        layer.hc_attn_scale,
-        layer.hc_attn_base,
-        out, // pre weights
-        post,
-        comb,
-        n_hc,
-        20,
-        1e-6,
-    );
-
-    // Wait — `out` here is the pre-weights, but we need the weighted sum result
-    // in `out`. The C code does:
-    //   hc_split_sinkhorn_one(split, mix, scale, base, ...)
-    //   hc_weighted_sum_one(out, residual_hc, split, n_embd, n_hc)
-    //
-    // So `out` should receive the weighted sum, not the pre-weights.
-    // Let me fix this: use a separate pre buffer.
-
+    // 3. Sinkhorn split: produce pre-weights (and post/comb for caller).
     let mut pre = vec![0.0f32; n_hc];
     hc_control_split(
         &mix,
@@ -265,6 +255,7 @@ fn hc_pre(
         1e-6,
     );
 
+    // 4. Weighted sum of streams into the per-sublayer input.
     hc_weighted_sum(residual_hc, &pre, out, n_embd, n_hc);
 
     Ok(())

@@ -105,7 +105,7 @@ pub fn hc_control_split(
             row_sum += e;
         }
 
-        let inv = 1.0 / row_sum;
+        let inv = 1.0 / (row_sum + eps);
         for src in 0..n_hc {
             let idx = src + dst * n_hc;
             c[idx] = c[idx] * inv + eps;
