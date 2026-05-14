@@ -225,15 +225,20 @@ pub fn hc_post(
     assert_eq!(post.len(), n_hc, "hc_post: post len mismatch");
     assert_eq!(comb.len(), n_hc * n_hc, "hc_post: comb len mismatch");
 
-    for dst in 0..n_hc {
-        let post_gate = post[dst];
-        for d in 0..n_embd {
-            let mut acc = block_out[d] * post_gate;
-            for src in 0..n_hc {
-                let c = comb[src + dst * n_hc];
-                acc += c * residual_hc[src * n_embd + d];
+    // Loop order src → dst → d so the inner loop sweeps contiguous slices of
+    // residual_hc[src, ..] and out_hc[dst, ..] (both n_embd-wide), letting the
+    // compiler vectorise the FMA over the embedding dimension.
+    for (dst, &post_gate) in post.iter().enumerate().take(n_hc) {
+        let out_row = &mut out_hc[dst * n_embd..(dst + 1) * n_embd];
+        for (o, &b) in out_row.iter_mut().zip(block_out.iter()) {
+            *o = b * post_gate;
+        }
+        for src in 0..n_hc {
+            let c = comb[src + dst * n_hc];
+            let res_row = &residual_hc[src * n_embd..(src + 1) * n_embd];
+            for (o, &r) in out_row.iter_mut().zip(res_row.iter()) {
+                *o += c * r;
             }
-            out_hc[dst * n_embd + d] = acc;
         }
     }
 }

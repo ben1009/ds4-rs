@@ -38,8 +38,8 @@ pub fn swiglu(gate: &[f32], up: &[f32], out: &mut [f32]) {
         gate.len(),
         out.len(),
     );
-    for i in 0..gate.len() {
-        out[i] = silu(gate[i]) * up[i];
+    for ((&g, &u), o) in gate.iter().zip(up.iter()).zip(out.iter_mut()) {
+        *o = silu(g) * u;
     }
 }
 

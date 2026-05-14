@@ -290,12 +290,14 @@ fn matmul_row_f16(
         bytes.len(),
     );
 
-    for (n, out_n) in out.iter_mut().enumerate().take(out_features) {
-        let row_off = n
-            .checked_mul(in_features)
-            .and_then(|v| v.checked_mul(2))
-            .expect("matmul_row_f16: row offset overflowed usize");
-        let row_bytes = &bytes[row_off..row_off + in_features * 2];
+    let row_stride = in_features
+        .checked_mul(2)
+        .expect("matmul_row_f16: row stride overflowed usize");
+    for (row_bytes, out_n) in bytes
+        .chunks_exact(row_stride)
+        .zip(out.iter_mut())
+        .take(out_features)
+    {
         *out_n = dot_f16_f32_row(row_bytes, act);
     }
 }

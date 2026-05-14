@@ -329,10 +329,11 @@ fn q_projection_decode(
     head_dim: usize,
 ) -> Result<()> {
     // Q = attn_q_b(RMSNorm(attn_q_a(norm)))
-    let mut qr = vec![0.0f32; 1024];
+    let q_a_rank = layer.attn_q_a.out_features();
+    let mut qr = vec![0.0f32; q_a_rank];
     matmul_row(layer.attn_q_a, norm, &mut qr);
 
-    let mut qr_norm = vec![0.0f32; 1024];
+    let mut qr_norm = vec![0.0f32; q_a_rank];
     rms_norm(&qr, layer.attn_q_a_norm, 1e-6, &mut qr_norm);
 
     matmul_row(layer.attn_q_b, &qr_norm, q);
