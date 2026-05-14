@@ -1025,6 +1025,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
     fn ggufmmap_tensor_data_rejects_past_eof() {
         use std::{
             io::Write,
