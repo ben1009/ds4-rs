@@ -15,6 +15,7 @@ use anyhow::{Result, bail};
 use crate::{
     config::ModelConfig,
     engine::Engine,
+    gguf::GgmlType,
     model::{WeightMap, kv_cache::KvCache, layer::LayerWeights},
     ops::{
         hc::{hc_control_split, hc_from_plain_embedding, hc_post, hc_weighted_sum},
@@ -106,6 +107,9 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
     let info = model
         .tensor_info("token_embd.weight")
         .ok_or_else(|| anyhow::anyhow!("token_embd.weight not found"))?;
+    if info.dtype != GgmlType::F16 {
+        bail!("token_embd.weight: expected F16, got {:?}", info.dtype);
+    }
     let n_embd = info.dims[0] as usize;
     let n_vocab = info.dims[1] as usize;
     assert_eq!(out.len(), n_embd, "embed_token: out len mismatch");
@@ -409,18 +413,15 @@ fn attention_rows(
         }
 
         let mut denom = (sinks[h] - max_score).exp();
-        let (oh_latent, oh_pe) = oh.split_at_mut(KV_LATENT_DIM);
-        for (i, (kv, k_pe)) in latent_window
-            .chunks_exact(KV_LATENT_DIM)
-            .zip(k_pe_window.chunks_exact(K_PE_DIM))
-            .enumerate()
-        {
+        let oh_latent = &mut oh[..KV_LATENT_DIM];
+        // k_pe is a *key*, not a value: it participates in scoring (above) but
+        // not in the output weighted sum. The k_pe slice of `oh` stays zero —
+        // the per-head MLA up-projection (which actually fills oh from V)
+        // lands with PR #5.
+        for (i, kv) in latent_window.chunks_exact(KV_LATENT_DIM).enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
             for (o, &k) in oh_latent.iter_mut().zip(kv.iter()) {
-                *o += k * weight;
-            }
-            for (o, &k) in oh_pe.iter_mut().zip(k_pe.iter()) {
                 *o += k * weight;
             }
         }
