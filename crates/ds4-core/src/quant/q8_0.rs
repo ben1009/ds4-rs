@@ -229,12 +229,12 @@ mod tests {
     #[test]
     fn dequant_block_alternating_signs() {
         // d = 0.25, quants alternate +/-1 -> output alternates +/-0.25
-        let quants: [i8; 32] = std::array::from_fn(|i| if i % 2 == 0 { 1 } else { -1 });
+        let quants: [i8; 32] = std::array::from_fn(|i| if i.is_multiple_of(2) { 1 } else { -1 });
         let block = build_block(0x3400, quants); // 0.25
         let mut out = [0f32; BLOCK_SIZE];
         dequant_block(&block, &mut out);
         for (i, v) in out.iter().enumerate() {
-            let expected = if i % 2 == 0 { 0.25 } else { -0.25 };
+            let expected = if i.is_multiple_of(2) { 0.25 } else { -0.25 };
             assert_eq!(*v, expected);
         }
     }

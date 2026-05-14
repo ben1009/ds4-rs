@@ -983,7 +983,7 @@ mod tests {
         b.header(0, 0);
         let bytes = b.build();
         let c = GgufContent::parse(&bytes).unwrap();
-        assert_eq!(c.data_offset % DEFAULT_ALIGNMENT, 0);
+        assert!(c.data_offset.is_multiple_of(DEFAULT_ALIGNMENT));
         assert!(c.data_offset >= bytes.len() as u64);
     }
 
@@ -996,7 +996,7 @@ mod tests {
         b.header(0, 1).kv_u64("general.alignment", 8);
         let bytes = b.build();
         let c = GgufContent::parse(&bytes).unwrap();
-        assert_eq!(c.data_offset % 8, 0);
+        assert!(c.data_offset.is_multiple_of(8));
     }
 
     #[test]

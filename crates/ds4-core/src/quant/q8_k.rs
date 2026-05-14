@@ -353,7 +353,7 @@ mod tests {
     fn round_trip_alternating_signs_preserves_pattern() {
         let mut x = vec![0f32; BLOCK_SIZE];
         for (i, v) in x.iter_mut().enumerate() {
-            *v = if i % 2 == 0 { 1.0 } else { -1.0 };
+            *v = if i.is_multiple_of(2) { 1.0 } else { -1.0 };
         }
         let mut out = vec![0u8; BYTES_PER_BLOCK];
         quantize_block(&x, &mut out);

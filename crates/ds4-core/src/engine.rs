@@ -71,6 +71,16 @@ impl Engine {
 mod tests {
     use super::*;
 
+    fn unique_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ds4-engine-{tag}-{}-{seq}.gguf",
+            std::process::id()
+        ))
+    }
+
     #[test]
     #[cfg_attr(
         miri,
@@ -88,14 +98,7 @@ mod tests {
     )]
     fn open_empty_file_errors() {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!(
-            "ds4-engine-empty-{}-{}.gguf",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
+        let path = unique_path("empty");
         std::fs::File::create(&path)
             .unwrap()
             .write_all(&[])
@@ -112,15 +115,7 @@ mod tests {
     )]
     fn open_wrong_magic_errors() {
         use std::io::Write;
-        let path = std::env::temp_dir().join(format!(
-            "ds4-engine-badmagic-{}-{}.gguf",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0),
-        ));
-        // Wrong magic bytes followed by zeros.
+        let path = unique_path("badmagic");
         let mut buf = vec![0u8; 32];
         buf[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         std::fs::File::create(&path)
