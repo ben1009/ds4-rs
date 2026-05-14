@@ -336,6 +336,96 @@ mod tests {
     }
 
     #[test]
+    fn pos_zero_inverse_is_identity() {
+        let freqs = RopeFreqs::new(&plain_params(8, 10_000.0));
+        let mut head: Vec<f32> = (0..8).map(|i| i as f32 + 1.0).collect();
+        let before = head.clone();
+        apply_rope_inverse(&mut head, 0, &freqs);
+        assert_eq!(head, before);
+    }
+
+    #[test]
+    fn rotation_at_quarter_turn_swaps_pair() {
+        // theta = pi/2 => cos=0, sin=1 => (x0, x1) -> (-x1, x0).
+        let freqs = RopeFreqs {
+            freqs: vec![std::f32::consts::FRAC_PI_2],
+            attn_factor: 1.0,
+        };
+        let mut head = vec![3.0f32, 5.0];
+        apply_rope(&mut head, 1, &freqs);
+        assert!(approx_eq(head[0], -5.0, 1e-6), "head[0] = {}", head[0]);
+        assert!(approx_eq(head[1], 3.0, 1e-6), "head[1] = {}", head[1]);
+    }
+
+    #[test]
+    fn forward_then_inverse_is_identity_with_attn_factor() {
+        let params = RopeParams {
+            n_rot: 8,
+            base: 10_000.0,
+            yarn: Some(YarnParams {
+                scale_factor: 1.0,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                orig_ctx: 65_536.0,
+                attn_factor: Some(0.7),
+            }),
+        };
+        let freqs = RopeFreqs::new(&params);
+        let orig: Vec<f32> = (0..8).map(|i| ((i as f32) * 0.3 - 1.0).cos()).collect();
+        let mut head = orig.clone();
+        apply_rope(&mut head, 11, &freqs);
+        apply_rope_inverse(&mut head, 11, &freqs);
+        for (i, (&got, &want)) in head.iter().zip(&orig).enumerate() {
+            assert!(
+                approx_eq(got, want, 1e-5),
+                "dim {i}: got {got}, want {want}",
+            );
+        }
+    }
+
+    #[test]
+    fn different_positions_produce_different_outputs() {
+        let freqs = RopeFreqs::new(&plain_params(8, 10_000.0));
+        let orig: Vec<f32> = (0..8).map(|i| (i as f32) - 3.5).collect();
+        let mut a = orig.clone();
+        let mut b = orig.clone();
+        apply_rope(&mut a, 1, &freqs);
+        apply_rope(&mut b, 2, &freqs);
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn freqs_decrease_with_dim_for_base_above_one() {
+        let freqs = RopeFreqs::new(&plain_params(16, 10_000.0));
+        for w in freqs.freqs.windows(2) {
+            assert!(w[0] > w[1], "freqs not strictly decreasing: {w:?}");
+        }
+    }
+
+    #[test]
+    fn head_longer_than_n_rot_only_rotates_tail() {
+        // 16-dim head, only last 4 are rotated.
+        let freqs = RopeFreqs::new(&plain_params(4, 10_000.0));
+        let mut head: Vec<f32> = (0..16).map(|i| i as f32).collect();
+        apply_rope(&mut head, 5, &freqs);
+        for (i, &v) in head[..12].iter().enumerate() {
+            assert_eq!(v, i as f32, "prefix dim {i} changed");
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "n_rot must be positive and even")]
+    fn rope_freqs_rejects_zero_n_rot() {
+        let _ = RopeFreqs::new(&plain_params(0, 10_000.0));
+    }
+
+    #[test]
+    #[should_panic(expected = "n_rot must be positive and even")]
+    fn rope_freqs_rejects_odd_n_rot() {
+        let _ = RopeFreqs::new(&plain_params(7, 10_000.0));
+    }
+
+    #[test]
     #[cfg_attr(
         miri,
         ignore = "miri's f32 cos/sin intrinsics are intentionally non-deterministic"

@@ -66,3 +66,74 @@ impl Engine {
         }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique_path(tag: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "ds4-engine-{tag}-{}-{seq}.gguf",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses real filesystem, unsupported under miri isolation"
+    )]
+    fn open_missing_file_errors() {
+        let result = Engine::open(Path::new("/nonexistent/ds4-engine-test/file.gguf"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn open_empty_file_errors() {
+        use std::io::Write;
+        let path = unique_path("empty");
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&[])
+            .unwrap();
+        let result = Engine::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn open_wrong_magic_errors() {
+        use std::io::Write;
+        let path = unique_path("badmagic");
+        let mut buf = vec![0u8; 32];
+        buf[..4].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        std::fs::File::create(&path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+        let result = Engine::open(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses real filesystem, unsupported under miri isolation"
+    )]
+    fn open_directory_errors() {
+        let result = Engine::open(&std::env::temp_dir());
+        assert!(result.is_err());
+    }
+}

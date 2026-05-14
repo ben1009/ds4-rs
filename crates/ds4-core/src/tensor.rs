@@ -260,4 +260,140 @@ mod tests {
         assert_eq!(t.strides(), &[1]);
         assert_eq!(t.offset(&[2]), 2);
     }
+
+    #[test]
+    fn single_element_tensor() {
+        let data = vec![42.0];
+        let t = Tensor::new(&data, vec![1]);
+        assert_eq!(t.rank(), 1);
+        assert_eq!(t.shape(), &[1]);
+        assert_eq!(t.strides(), &[1]);
+        assert_eq!(t.offset(&[0]), 0);
+        assert_eq!(t.data()[0], 42.0);
+    }
+
+    #[test]
+    fn scalar_tensor_rank_zero() {
+        let data = vec![7.0];
+        let t = Tensor::new(&data, vec![]);
+        assert_eq!(t.rank(), 0);
+        assert!(t.shape().is_empty());
+        assert!(t.strides().is_empty());
+        assert_eq!(t.offset(&[]), 0);
+    }
+
+    #[test]
+    fn rank_4_strides_are_row_major() {
+        let data: Vec<f32> = (0..2 * 3 * 4 * 5).map(|x| x as f32).collect();
+        let t = Tensor::new(&data, vec![2, 3, 4, 5]);
+        assert_eq!(t.strides(), &[60, 20, 5, 1]);
+        assert_eq!(t.offset(&[1, 2, 3, 4]), 60 + 40 + 15 + 4);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of bounds")]
+    fn offset_rejects_out_of_bounds_inner_dim() {
+        let data = vec![0.0f32; 6];
+        let t = Tensor::new(&data, vec![2, 3]);
+        let _ = t.offset(&[0, 3]);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires rank-2")]
+    fn row_panics_on_non_rank_2() {
+        let data = vec![1.0f32, 2.0, 3.0];
+        let t = Tensor::new(&data, vec![3]);
+        let _ = t.row(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Tensor::row")]
+    fn row_panics_on_out_of_bounds() {
+        let data = vec![0.0f32; 6];
+        let t = Tensor::new(&data, vec![2, 3]);
+        let _ = t.row(2);
+    }
+
+    #[test]
+    #[should_panic(expected = "requires rank-2")]
+    fn view_2d_panics_on_non_rank_2() {
+        let data = vec![1.0f32, 2.0, 3.0];
+        let t = Tensor::new(&data, vec![3]);
+        let _ = t.view_2d(0..1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Tensor::view_2d")]
+    fn view_2d_panics_on_out_of_bounds() {
+        let data = vec![0.0f32; 6];
+        let t = Tensor::new(&data, vec![2, 3]);
+        let _ = t.view_2d(0..3);
+    }
+
+    #[test]
+    fn view_2d_full_range_matches_original() {
+        let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let t = Tensor::new(&data, vec![3, 4]);
+        let v = t.view_2d(0..3);
+        assert_eq!(v.shape(), &[3, 4]);
+        assert_eq!(v.data(), t.data());
+    }
+
+    #[test]
+    fn view_2d_empty_range() {
+        let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let t = Tensor::new(&data, vec![3, 4]);
+        let v = t.view_2d(1..1);
+        assert_eq!(v.shape(), &[0, 4]);
+        assert!(v.data().is_empty());
+    }
+
+    #[test]
+    fn view_2d_single_row() {
+        let data: Vec<f32> = (0..12).map(|x| x as f32).collect();
+        let t = Tensor::new(&data, vec![3, 4]);
+        let v = t.view_2d(2..3);
+        assert_eq!(v.shape(), &[1, 4]);
+        assert_eq!(v.row(0), &[8.0, 9.0, 10.0, 11.0]);
+    }
+
+    #[test]
+    fn owned_from_vec_preserves_data() {
+        let t = OwnedTensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        assert_eq!(t.shape(), &[2, 2]);
+        assert_eq!(t.data(), &[1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    #[should_panic(expected = "shape product")]
+    fn owned_from_vec_panics_on_mismatched_len() {
+        let _ = OwnedTensor::from_vec(vec![1.0, 2.0, 3.0], vec![2, 2]);
+    }
+
+    #[test]
+    fn owned_zeros_has_correct_size() {
+        let t = OwnedTensor::zeros(vec![4, 5]);
+        assert_eq!(t.data().len(), 20);
+        assert!(t.data().iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn owned_as_view_round_trips_to_tensor() {
+        let mut t = OwnedTensor::zeros(vec![3, 2]);
+        for (i, v) in t.data_mut().iter_mut().enumerate() {
+            *v = i as f32;
+        }
+        let v = t.as_view();
+        assert_eq!(v.shape(), &[3, 2]);
+        assert_eq!(v.offset(&[2, 1]), 5);
+        assert_eq!(v.row(1), &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn empty_dim_tensor_has_zero_elements() {
+        let data: Vec<f32> = Vec::new();
+        let t = Tensor::new(&data, vec![0, 4]);
+        assert_eq!(t.shape(), &[0, 4]);
+        assert!(t.data().is_empty());
+    }
 }

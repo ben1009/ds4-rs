@@ -228,4 +228,99 @@ mod tests {
         // Can't compare Engine directly — just check it's reachable.
         assert_eq!(s.engine().config.n_vocab, engine.config.n_vocab);
     }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_initial_state_is_empty() {
+        let engine = open_engine();
+        let s = Session::new(engine.clone(), 256).unwrap();
+        assert_eq!(s.pos(), 0);
+        assert_eq!(s.ctx_size(), 256);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().len(), 0);
+        assert_eq!(s.kv_cache().n_layer(), engine.config.n_layer as usize);
+        assert_eq!(s.kv_cache().ctx_size(), 256);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_multiple_eval_tokens_track_position() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 32).unwrap();
+        let _ = s.prefill(&[1, 2]).unwrap();
+        for t in [3u32, 4, 5, 6] {
+            let _ = s.eval_token(t).unwrap();
+        }
+        assert_eq!(s.pos(), 6);
+        assert_eq!(s.tokens(), &[1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_eval_without_prefill_advances_from_zero() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 16).unwrap();
+        let _ = s.eval_token(7).unwrap();
+        assert_eq!(s.pos(), 1);
+        assert_eq!(s.tokens(), &[7]);
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_kv_cache_mut_round_trips_writes() {
+        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        let lat = vec![3.0f32; KV_LATENT_DIM];
+        let pe = vec![4.0f32; K_PE_DIM];
+        s.kv_cache_mut().write_latent(0, 0, &lat).unwrap();
+        s.kv_cache_mut().write_k_pe(0, 0, &pe).unwrap();
+        s.kv_cache_mut().set_pos(1);
+        assert_eq!(s.kv_cache().len(), 1);
+        assert_eq!(s.kv_cache().read_latent(0, 0), lat.as_slice());
+        assert_eq!(s.kv_cache().read_k_pe(0, 0), pe.as_slice());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_empty_prefill_keeps_state() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 16).unwrap();
+        let logits = s.prefill(&[]).unwrap();
+        assert_eq!(logits.len(), engine.config.n_vocab as usize);
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+    }
+
+    #[test]
+    fn argmax_with_infinity() {
+        assert_eq!(Session::argmax(&[1.0, f32::INFINITY, 2.0]), Some(1));
+        assert_eq!(
+            Session::argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY, 0.0]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn argmax_all_neg_infinity_is_none() {
+        assert_eq!(
+            Session::argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]),
+            None
+        );
+    }
 }

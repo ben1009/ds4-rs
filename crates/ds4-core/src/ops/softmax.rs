@@ -60,7 +60,7 @@ fn softplus_stable(x: f32) -> f32 {
 mod tests {
     use super::*;
 
-    fn _approx_eq(a: f32, b: f32, tol: f32) -> bool {
+    fn approx_eq(a: f32, b: f32, tol: f32) -> bool {
         (a - b).abs() <= tol * b.abs().max(1.0) + tol
     }
 
@@ -159,5 +159,111 @@ mod tests {
         softmax(&x, &mut a);
         softmax(&x, &mut b);
         assert_eq!(a, b, "softmax must be deterministic");
+    }
+
+    #[test]
+    fn softmax_single_element_is_one() {
+        let x = vec![42.0f32];
+        let mut out = vec![0.0f32];
+        softmax(&x, &mut out);
+        assert!(approx_eq(out[0], 1.0, 1e-6));
+    }
+
+    #[test]
+    fn softmax_all_outputs_nonnegative() {
+        let x: Vec<f32> = (0..16).map(|i| (i as f32) * 0.5 - 4.0).collect();
+        let mut out = vec![0.0f32; 16];
+        softmax(&x, &mut out);
+        for &v in &out {
+            assert!(v >= 0.0, "softmax output must be non-negative, got {v}");
+        }
+    }
+
+    #[test]
+    fn softmax_translation_invariant() {
+        let x = vec![0.1f32, 1.2, -0.5, 2.0];
+        let mut out_a = vec![0.0f32; 4];
+        softmax(&x, &mut out_a);
+
+        let shifted: Vec<f32> = x.iter().map(|v| v + 17.5).collect();
+        let mut out_b = vec![0.0f32; 4];
+        softmax(&shifted, &mut out_b);
+
+        for (a, b) in out_a.iter().zip(out_b.iter()) {
+            assert!(
+                approx_eq(*a, *b, 1e-5),
+                "translation invariance violated: {a} vs {b}",
+            );
+        }
+    }
+
+    #[test]
+    fn softmax_stable_for_very_negative_inputs() {
+        let x = vec![-1000.0f32, -1001.0, -999.0];
+        let mut out = vec![0.0f32; 3];
+        softmax(&x, &mut out);
+        assert!(out.iter().all(|&v| v.is_finite()));
+        let sum: f32 = out.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "sum = {sum}");
+        assert!(out[2] > out[0] && out[0] > out[1]);
+    }
+
+    #[test]
+    fn softmax_dominant_input_is_near_one() {
+        let x = vec![0.0f32, 0.0, 50.0, 0.0];
+        let mut out = vec![0.0f32; 4];
+        softmax(&x, &mut out);
+        assert!(out[2] > 0.9999);
+        assert!(out[0] < 1e-20);
+        assert!(out[1] < 1e-20);
+        assert!(out[3] < 1e-20);
+    }
+
+    #[test]
+    #[should_panic(expected = "x len")]
+    fn softmax_rejects_mismatched_lens() {
+        let x = vec![1.0f32; 4];
+        let mut out = vec![0.0f32; 3];
+        softmax(&x, &mut out);
+    }
+
+    #[test]
+    fn softplus_stable_boundary_branches() {
+        let just_above = 20.000_01f32;
+        assert_eq!(softplus_stable(just_above), just_above);
+
+        let just_below = -20.000_01f32;
+        assert!((softplus_stable(just_below) - just_below.exp()).abs() < 1e-10);
+
+        let inside = 20.0f32;
+        let direct = inside.exp().ln_1p();
+        assert!((softplus_stable(inside) - direct).abs() < 1e-4);
+    }
+
+    #[test]
+    fn softplus_stable_at_zero_is_ln2() {
+        let ln2 = std::f32::consts::LN_2;
+        assert!(approx_eq(softplus_stable(0.0), ln2, 1e-6));
+    }
+
+    #[test]
+    fn softplus_always_nonnegative() {
+        for i in -50..=50 {
+            let x = (i as f32) * 0.5;
+            let v = softplus_stable(x);
+            assert!(v >= 0.0, "softplus({x}) = {v} should be >= 0");
+        }
+    }
+
+    #[test]
+    fn sqrt_softplus_at_zero() {
+        let expected = std::f32::consts::LN_2.sqrt();
+        assert!(approx_eq(sqrt_softplus(0.0), expected, 1e-6));
+    }
+
+    #[test]
+    fn sqrt_softplus_large_positive_matches_sqrt_x() {
+        let x = 100.0f32;
+        assert!(approx_eq(sqrt_softplus(x), x.sqrt(), 1e-5));
     }
 }

@@ -449,4 +449,168 @@ mod tests {
         let m = std::collections::HashMap::new();
         assert!(Tokenizer::from_metadata(&m).is_err());
     }
+
+    #[test]
+    fn round_trip_whitespace() {
+        let t = tok(&[], &[]);
+        let text = "  \t \n  ";
+        let ids = t.encode(text, false);
+        assert_eq!(t.decode_tokens(&ids), text);
+    }
+
+    #[test]
+    fn round_trip_single_char() {
+        let t = tok(&[], &[]);
+        let ids = t.encode("x", false);
+        assert_eq!(ids.len(), 1);
+        assert_eq!(t.decode_tokens(&ids), "x");
+    }
+
+    #[test]
+    fn round_trip_repeated_chars() {
+        let t = tok(&[], &[]);
+        let text = "aaaaaaaa";
+        let ids = t.encode(text, false);
+        assert_eq!(ids.len(), 8);
+        assert_eq!(t.decode_tokens(&ids), text);
+    }
+
+    #[test]
+    fn round_trip_multibyte_utf8() {
+        let t = tok(&[], &[]);
+        let text = "héllo 世界 🌍";
+        let ids = t.encode(text, false);
+        assert_eq!(ids.len(), text.len()); // one id per byte without merges
+        assert_eq!(t.decode_tokens(&ids), text);
+    }
+
+    #[test]
+    fn repeated_pair_merges_all_occurrences() {
+        // (A,B) -> AB; "ABAB" should produce two AB tokens.
+        let t = tok(&[("<0x41>", "<0x42>")], &[]);
+        let ab = t.tokens.iter().position(|s| s == "<0x41><0x42>").unwrap() as u32;
+        let out = t.encode("ABAB", false);
+        assert_eq!(out, vec![ab, ab]);
+    }
+
+    #[test]
+    fn lower_rank_merge_wins_over_higher() {
+        // Rank 0: (B,C)->BC. Rank 1: (A,B)->AB.
+        // For "ABC", BC must merge first, then no further merges apply.
+        let t = tok(&[("<0x42>", "<0x43>"), ("<0x41>", "<0x42>")], &[]);
+        let bc = t.tokens.iter().position(|s| s == "<0x42><0x43>").unwrap() as u32;
+        let a = t.byte_to_id[b'A' as usize];
+        let out = t.encode("ABC", false);
+        assert_eq!(out, vec![a, bc]);
+    }
+
+    #[test]
+    fn long_chain_of_merges() {
+        // (A,B)->AB, (AB,C)->ABC, (ABC,D)->ABCD, (ABCD,E)->ABCDE
+        let t = tok(
+            &[
+                ("<0x41>", "<0x42>"),
+                ("<0x41><0x42>", "<0x43>"),
+                ("<0x41><0x42><0x43>", "<0x44>"),
+                ("<0x41><0x42><0x43><0x44>", "<0x45>"),
+            ],
+            &[],
+        );
+        let abcde = t
+            .tokens
+            .iter()
+            .position(|s| s == "<0x41><0x42><0x43><0x44><0x45>")
+            .unwrap() as u32;
+        assert_eq!(t.encode("ABCDE", false), vec![abcde]);
+    }
+
+    #[test]
+    fn append_token_bytes_decodes_byte_fallback() {
+        let t = tok(&[], &[]);
+        let mut out = Vec::new();
+        t.append_token_bytes(t.byte_to_id[0xE4], &mut out);
+        t.append_token_bytes(t.byte_to_id[0xB8], &mut out);
+        t.append_token_bytes(t.byte_to_id[0x96], &mut out);
+        assert_eq!(out, "世".as_bytes());
+    }
+
+    #[test]
+    fn decode_tokens_handles_invalid_utf8_lossily() {
+        let t = tok(&[], &[]);
+        // Lone 0xFF is not valid UTF-8; from_utf8_lossy should produce the
+        // replacement character rather than panic.
+        let ids = vec![t.byte_to_id[0xFF]];
+        let s = t.decode_tokens(&ids);
+        assert!(s.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decode_unknown_id_returns_empty_string() {
+        let t = tok(&[], &[]);
+        assert_eq!(t.decode(t.vocab_size() as u32 + 100), "");
+    }
+
+    #[test]
+    fn decode_tokens_skips_unknown_ids_silently() {
+        let t = tok(&[], &[]);
+        let oob = t.vocab_size() as u32;
+        // append_token_bytes for an out-of-range id falls through to decode(),
+        // which yields "" — the byte stream is just empty for that id.
+        let ids = vec![
+            t.byte_to_id[b'X' as usize],
+            oob,
+            t.byte_to_id[b'Y' as usize],
+        ];
+        assert_eq!(t.decode_tokens(&ids), "XY");
+    }
+
+    #[test]
+    fn from_metadata_default_bos_eos_when_absent() {
+        let tokens: Vec<Value> = (0u8..=255)
+            .map(|b| Value::String(format!("<0x{b:02X}>")))
+            .collect();
+        let mut m = std::collections::HashMap::new();
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+        let t = Tokenizer::from_metadata(&m).unwrap();
+        assert_eq!(t.bos_token(), 0);
+        assert_eq!(t.eos_token(), 1);
+    }
+
+    #[test]
+    fn from_metadata_ignores_malformed_merge_entries() {
+        let mut tokens: Vec<Value> = (0u8..=255)
+            .map(|b| Value::String(format!("<0x{b:02X}>")))
+            .collect();
+        tokens.push(Value::String("<0x48><0x69>".to_string()));
+        // First merge is malformed (no space); second is valid.
+        let merges = vec![
+            Value::String("nospace".to_string()),
+            Value::String("<0x48> <0x69>".to_string()),
+        ];
+        let mut m = std::collections::HashMap::new();
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+        m.insert("tokenizer.ggml.merges".to_string(), Value::Array(merges));
+        let t = Tokenizer::from_metadata(&m).unwrap();
+        assert_eq!(t.encode("Hi", false), vec![256]);
+    }
+
+    #[test]
+    fn from_metadata_works_without_merges() {
+        let tokens: Vec<Value> = (0u8..=255)
+            .map(|b| Value::String(format!("<0x{b:02X}>")))
+            .collect();
+        let mut m = std::collections::HashMap::new();
+        m.insert("tokenizer.ggml.tokens".to_string(), Value::Array(tokens));
+        let t = Tokenizer::from_metadata(&m).unwrap();
+        let ids = t.encode("hi", false);
+        assert_eq!(t.decode_tokens(&ids), "hi");
+    }
+
+    #[test]
+    fn encode_with_bos_and_merges_emits_bos_then_merged_ids() {
+        let t = tok(&[("<0x41>", "<0x42>")], &[]);
+        let ab = t.tokens.iter().position(|s| s == "<0x41><0x42>").unwrap() as u32;
+        let ids = t.encode("ABAB", true);
+        assert_eq!(ids, vec![t.bos_token(), ab, ab]);
+    }
 }

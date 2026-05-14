@@ -278,4 +278,134 @@ mod tests {
         cache.set_pos(3);
         assert_eq!(cache.len(), 3);
     }
+
+    #[test]
+    fn write_at_capacity_boundary_ok() {
+        let mut cache = KvCache::new(1, 4).unwrap();
+        let lat = vec![1.0f32; KV_LATENT_DIM];
+        let pe = vec![2.0f32; K_PE_DIM];
+        cache.write_latent(0, 3, &lat).unwrap();
+        cache.write_k_pe(0, 3, &pe).unwrap();
+        assert_eq!(cache.read_latent(0, 3), lat.as_slice());
+        assert_eq!(cache.read_k_pe(0, 3), pe.as_slice());
+    }
+
+    #[test]
+    fn write_layer_overflow_errors() {
+        let mut cache = KvCache::new(2, 4).unwrap();
+        let data = vec![0.0f32; KV_LATENT_DIM];
+        let err = cache.write_latent(2, 0, &data).unwrap_err();
+        assert!(err.to_string().contains("layer 2"));
+    }
+
+    #[test]
+    fn rejects_wrong_k_pe_size() {
+        let mut cache = KvCache::new(1, 2).unwrap();
+        let err = cache.write_k_pe(0, 0, &[0.0; 1]).unwrap_err();
+        assert!(err.to_string().contains("expected"));
+    }
+
+    #[test]
+    fn k_pe_pos_overflow_errors() {
+        let mut cache = KvCache::new(1, 2).unwrap();
+        let data = vec![0.0f32; K_PE_DIM];
+        let err = cache.write_k_pe(0, 2, &data).unwrap_err();
+        assert!(err.to_string().contains("context overflow"));
+    }
+
+    #[test]
+    fn k_pe_layer_overflow_errors() {
+        let mut cache = KvCache::new(1, 2).unwrap();
+        let data = vec![0.0f32; K_PE_DIM];
+        let err = cache.write_k_pe(1, 0, &data).unwrap_err();
+        assert!(err.to_string().contains("layer 1"));
+    }
+
+    #[test]
+    fn multi_layer_isolation_latent() {
+        let mut cache = KvCache::new(3, 4).unwrap();
+        let a = vec![1.0f32; KV_LATENT_DIM];
+        let b = vec![2.0f32; KV_LATENT_DIM];
+        cache.write_latent(0, 1, &a).unwrap();
+        cache.write_latent(2, 1, &b).unwrap();
+        assert!(cache.read_latent(0, 1).iter().all(|&v| v == 1.0));
+        assert!(cache.read_latent(1, 1).iter().all(|&v| v == 0.0));
+        assert!(cache.read_latent(2, 1).iter().all(|&v| v == 2.0));
+    }
+
+    #[test]
+    fn multi_layer_isolation_k_pe() {
+        let mut cache = KvCache::new(3, 4).unwrap();
+        let a = vec![5.0f32; K_PE_DIM];
+        cache.write_k_pe(1, 2, &a).unwrap();
+        assert!(cache.read_k_pe(0, 2).iter().all(|&v| v == 0.0));
+        assert!(cache.read_k_pe(1, 2).iter().all(|&v| v == 5.0));
+        assert!(cache.read_k_pe(2, 2).iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn k_pe_layer_prefix_per_layer() {
+        let mut cache = KvCache::new(2, 3).unwrap();
+        for layer in 0..2 {
+            for pos in 0..3 {
+                let v: Vec<f32> = (0..K_PE_DIM)
+                    .map(|i| (layer * 100 + pos * 10 + i) as f32)
+                    .collect();
+                cache.write_k_pe(layer, pos, &v).unwrap();
+            }
+        }
+        let prefix0 = cache.k_pe_layer_prefix(0, 3);
+        let prefix1 = cache.k_pe_layer_prefix(1, 3);
+        assert_eq!(prefix0.len(), 3 * K_PE_DIM);
+        assert_eq!(prefix1.len(), 3 * K_PE_DIM);
+        assert_eq!(prefix0[0], 0.0);
+        assert_eq!(prefix1[0], 100.0);
+        assert_eq!(prefix1[K_PE_DIM], 110.0);
+    }
+
+    #[test]
+    fn empty_prefix_when_len_zero() {
+        let cache = KvCache::new(2, 4).unwrap();
+        assert_eq!(cache.latent_layer_prefix(0, 0).len(), 0);
+        assert_eq!(cache.k_pe_layer_prefix(0, 0).len(), 0);
+    }
+
+    #[test]
+    fn set_pos_to_ctx_size_ok() {
+        let mut cache = KvCache::new(1, 4).unwrap();
+        cache.set_pos(4);
+        assert_eq!(cache.len(), 4);
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    #[should_panic]
+    fn set_pos_above_ctx_size_panics() {
+        let mut cache = KvCache::new(1, 4).unwrap();
+        cache.set_pos(5);
+    }
+
+    #[test]
+    #[should_panic]
+    fn read_latent_layer_oob_panics() {
+        let cache = KvCache::new(1, 2).unwrap();
+        let _ = cache.read_latent(1, 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn read_k_pe_pos_oob_panics() {
+        let cache = KvCache::new(1, 2).unwrap();
+        let _ = cache.read_k_pe(0, 2);
+    }
+
+    #[test]
+    fn round_trip_overwrite() {
+        let mut cache = KvCache::new(1, 4).unwrap();
+        let a = vec![1.0f32; KV_LATENT_DIM];
+        let b = vec![7.0f32; KV_LATENT_DIM];
+        cache.write_latent(0, 0, &a).unwrap();
+        cache.write_latent(0, 0, &b).unwrap();
+        assert_eq!(cache.read_latent(0, 0), b.as_slice());
+    }
 }

@@ -148,4 +148,86 @@ mod tests {
         swiglu(&gate, &up, &mut b);
         assert_eq!(a, b, "swiglu must be deterministic");
     }
+
+    #[test]
+    fn sigmoid_at_zero_is_half() {
+        assert_eq!(sigmoid_stable(0.0), 0.5);
+    }
+
+    #[test]
+    fn sigmoid_symmetry_around_zero() {
+        for &x in &[0.5f32, 1.0, 2.5, 7.0] {
+            let s = sigmoid_stable(x);
+            let s_neg = sigmoid_stable(-x);
+            assert!(
+                approx_eq(s + s_neg, 1.0, 1e-6),
+                "sigmoid({x}) + sigmoid({}) = {}, expected 1.0",
+                -x,
+                s + s_neg,
+            );
+        }
+    }
+
+    #[test]
+    fn silu_large_negative_decays_to_zero() {
+        assert!(silu(-50.0).abs() < 1e-15);
+    }
+
+    #[test]
+    fn silu_matches_naive_formula() {
+        for &x in &[-3.0f32, -0.5, 0.25, 1.5, 4.0] {
+            let naive = x / (1.0 + (-x).exp());
+            assert!(
+                approx_eq(silu(x), naive, 1e-6),
+                "silu({x}): got {}, expected {}",
+                silu(x),
+                naive,
+            );
+        }
+    }
+
+    #[test]
+    fn swiglu_empty_is_noop() {
+        let gate: Vec<f32> = vec![];
+        let up: Vec<f32> = vec![];
+        let mut out: Vec<f32> = vec![];
+        swiglu(&gate, &up, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn swiglu_single_element() {
+        let gate = [1.5f32];
+        let up = [4.0f32];
+        let mut out = [0.0f32];
+        swiglu(&gate, &up, &mut out);
+        assert!((out[0] - silu(1.5) * 4.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_negative_gate() {
+        let gate = [-2.0f32, -0.5];
+        let up = [1.0f32, 2.0];
+        let mut out = [0.0f32; 2];
+        swiglu(&gate, &up, &mut out);
+        assert!(out[0] < 0.0);
+        assert!(out[1] < 0.0);
+        assert!((out[0] - silu(-2.0) * 1.0).abs() < 1e-6);
+        assert!((out[1] - silu(-0.5) * 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn swiglu_matches_naive_reference() {
+        let gate: Vec<f32> = (0..32).map(|i| (i as f32) * 0.25 - 4.0).collect();
+        let up: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.1 + 0.3).cos()).collect();
+        let mut out = vec![0.0f32; 32];
+        swiglu(&gate, &up, &mut out);
+        for (i, &o) in out.iter().enumerate() {
+            let expected = silu(gate[i]) * up[i];
+            assert!(
+                approx_eq(o, expected, 1e-6),
+                "out[{i}]: got {o}, expected {expected}",
+            );
+        }
+    }
 }

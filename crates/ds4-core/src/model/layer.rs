@@ -129,3 +129,81 @@ impl<'a> LayerWeights<'a> {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::*;
+
+    fn write_minimal_gguf(path: &std::path::Path) {
+        let mut buf: Vec<u8> = Vec::new();
+        let u32le = |buf: &mut Vec<u8>, v: u32| buf.extend_from_slice(&v.to_le_bytes());
+        let u64le = |buf: &mut Vec<u8>, v: u64| buf.extend_from_slice(&v.to_le_bytes());
+        let strle = |buf: &mut Vec<u8>, s: &str| {
+            u64le(buf, s.len() as u64);
+            buf.extend_from_slice(s.as_bytes());
+        };
+        let kv_u32 = |buf: &mut Vec<u8>, k: &str, v: u32| {
+            strle(buf, k);
+            u32le(buf, 4);
+            u32le(buf, v);
+        };
+        let kv_arr_string = |buf: &mut Vec<u8>, k: &str, values: &[String]| {
+            strle(buf, k);
+            u32le(buf, 9);
+            u32le(buf, 8);
+            u64le(buf, values.len() as u64);
+            for v in values {
+                strle(buf, v);
+            }
+        };
+        u32le(&mut buf, crate::gguf::GGUF_MAGIC);
+        u32le(&mut buf, 3);
+        u64le(&mut buf, 0);
+        let tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        u64le(&mut buf, 7);
+        kv_u32(&mut buf, "llama.vocab_size", 256);
+        kv_u32(&mut buf, "llama.embedding_length", 16);
+        kv_u32(&mut buf, "llama.attention.head_count", 4);
+        kv_u32(&mut buf, "llama.attention.head_count_kv", 4);
+        kv_u32(&mut buf, "llama.block_count", 2);
+        kv_u32(&mut buf, "llama.feed_forward_length", 32);
+        kv_arr_string(&mut buf, "tokenizer.ggml.tokens", &tokens);
+        std::fs::File::create(path)
+            .unwrap()
+            .write_all(&buf)
+            .unwrap();
+    }
+
+    fn open_map() -> WeightMap {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "ds4-layer-test-{}-{}.gguf",
+            std::process::id(),
+            seq,
+        ));
+        write_minimal_gguf(&path);
+        let map = WeightMap::open(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        map
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "uses mmap + filesystem")]
+    fn from_map_missing_tensors_errors() {
+        let m = open_map();
+        let err = LayerWeights::from_map(&m, 0).unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "uses mmap + filesystem")]
+    fn from_map_higher_layer_also_errors() {
+        let m = open_map();
+        assert!(LayerWeights::from_map(&m, 7).is_err());
+    }
+}
