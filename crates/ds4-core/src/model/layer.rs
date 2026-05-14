@@ -56,10 +56,23 @@ pub struct LayerWeights<'a> {
 impl<'a> LayerWeights<'a> {
     /// Load all tensors for layer `il` from the weight map.
     pub fn from_map(map: &'a WeightMap, il: u32) -> Result<Self> {
+        use crate::model::kv_cache::KV_LATENT_DIM;
+
         let prefix = format!("blk.{il}.");
         let n_embd = map.config.n_embd as usize;
+        let n_head = map.config.n_head as usize;
+        let n_hc = map.config.n_hc as usize;
         let _n_ff = map.config.n_ff as usize;
         let _n_expert = map.config.n_expert as usize;
+
+        // mix tail layout: [pre (n_hc) | post (n_hc) | comb (n_hc * n_hc)]
+        let hc_base_dim = n_hc
+            .checked_mul(
+                n_hc.checked_add(2).ok_or_else(|| {
+                    anyhow::anyhow!("LayerWeights: hc base dim (n_hc + 2) overflow")
+                })?,
+            )
+            .ok_or_else(|| anyhow::anyhow!("LayerWeights: hc base dim overflow"))?;
 
         let f32_1d = |name: &str, n: usize| map.f32_1d(&format!("{prefix}{name}"), n);
         let q8_0 = |name: &str| map.q8_0(&format!("{prefix}{name}"));
@@ -76,23 +89,27 @@ impl<'a> LayerWeights<'a> {
             None
         };
 
+        // Bind attn_q_a first so we can size attn_q_a_norm from its out_features.
+        let attn_q_a = q8_0("attn_q_a.weight")?;
+        let q_a_rank = attn_q_a.out_features();
+
         Ok(Self {
             attn_norm: f32_1d("attn_norm.weight", n_embd)?,
-            attn_q_a: q8_0("attn_q_a.weight")?,
-            attn_q_a_norm: f32_1d("attn_q_a_norm.weight", 1024)?,
+            attn_q_a,
+            attn_q_a_norm: f32_1d("attn_q_a_norm.weight", q_a_rank)?,
             attn_q_b: q8_0("attn_q_b.weight")?,
             attn_kv: q8_0("attn_kv.weight")?,
-            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", 448)?,
-            attn_sinks: f32_1d("attn_sinks.weight", 64)?,
+            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", KV_LATENT_DIM)?,
+            attn_sinks: f32_1d("attn_sinks.weight", n_head)?,
             attn_output_a: q8_0("attn_output_a.weight")?,
             attn_output_b: q8_0("attn_output_b.weight")?,
 
             hc_attn_fn: f16("hc_attn_fn.weight")?,
             hc_attn_scale: f32_1d("hc_attn_scale.weight", 3)?,
-            hc_attn_base: f32_1d("hc_attn_base.weight", 2 * 4 + 4 * 4)?,
+            hc_attn_base: f32_1d("hc_attn_base.weight", hc_base_dim)?,
             hc_ffn_fn: f16("hc_ffn_fn.weight")?,
             hc_ffn_scale: f32_1d("hc_ffn_scale.weight", 3)?,
-            hc_ffn_base: f32_1d("hc_ffn_base.weight", 2 * 4 + 4 * 4)?,
+            hc_ffn_base: f32_1d("hc_ffn_base.weight", hc_base_dim)?,
 
             ffn_norm: f32_1d("ffn_norm.weight", n_embd)?,
             ffn_gate_inp: f16("ffn_gate_inp.weight")?,
