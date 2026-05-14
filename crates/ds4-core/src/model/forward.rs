@@ -20,7 +20,7 @@ use crate::{
         hc::{hc_control_split, hc_from_plain_embedding, hc_post, hc_weighted_sum},
         matmul::matmul_row,
         norm::{rms_norm, rms_norm_no_weight},
-        rope::{RopeFreqs, apply_rope, apply_rope_inverse},
+        rope::{apply_rope, apply_rope_inverse},
         swiglu::swiglu,
     },
     quant::q8_0,
@@ -52,10 +52,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     for il in 0..config.n_layer {
         let layer = LayerWeights::from_map(model, il)?;
         let mut attn_out = vec![0.0f32; n_embd];
-        layer_attention_decode(
+        let (attn_post, attn_comb) = layer_attention_decode(
             &mut attn_out,
-            model,
-            config,
+            engine,
             &layer,
             &residual_hc,
             session.kv_cache_mut(),
@@ -65,35 +64,31 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
 
         // HC post for attention.
         let mut after_attn_hc = vec![0.0f32; hc_dim];
-        hc_post_attn(
+        hc_post(
             &mut after_attn_hc,
             &attn_out,
             &residual_hc,
-            &layer,
+            &attn_post,
+            &attn_comb,
             n_embd,
             n_hc,
-        )?;
+        );
 
         // FFN sublayer.
         let mut ffn_out = vec![0.0f32; n_embd];
-        layer_ffn_decode(
-            &mut ffn_out,
-            model,
-            config,
-            &layer,
-            &after_attn_hc,
-            il as usize,
-        )?;
+        let (ffn_post, ffn_comb) =
+            layer_ffn_decode(&mut ffn_out, config, &layer, &after_attn_hc, il as usize)?;
 
         // HC post for FFN.
-        hc_post_ffn(
+        hc_post(
             &mut residual_hc,
             &ffn_out,
             &after_attn_hc,
-            &layer,
+            &ffn_post,
+            &ffn_comb,
             n_embd,
             n_hc,
-        )?;
+        );
     }
 
     // --- Output head -------------------------------------------------------
@@ -119,8 +114,16 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
     }
 
     let bytes = model.tensor_bytes("token_embd.weight")?;
-    let row_off = (token as usize) * n_embd * 2;
-    let row = &bytes[row_off..row_off + n_embd * 2];
+    let row_off = (token as usize)
+        .checked_mul(n_embd)
+        .and_then(|v| v.checked_mul(2))
+        .ok_or_else(|| anyhow::anyhow!("embed_token: row offset overflow"))?;
+    let row_end = row_off
+        .checked_add(n_embd * 2)
+        .ok_or_else(|| anyhow::anyhow!("embed_token: row end overflow"))?;
+    let row = &bytes
+        .get(row_off..row_end)
+        .ok_or_else(|| anyhow::anyhow!("embed_token: row out of bounds"))?;
     for (i, chunk) in row.chunks_exact(2).enumerate() {
         out[i] = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
@@ -131,17 +134,16 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
 // Attention (decode)
 // =========================================================================
 
-#[allow(clippy::too_many_arguments)]
 fn layer_attention_decode(
     out: &mut [f32],
-    model: &WeightMap,
-    config: &ModelConfig,
+    engine: &Engine,
     layer: &LayerWeights<'_>,
     residual_hc: &[f32],
     kv_cache: &mut KvCache,
     il: usize,
     pos: usize,
-) -> Result<()> {
+) -> Result<(Vec<f32>, Vec<f32>)> {
+    let config = &engine.config;
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
     let n_head = config.n_head as usize;
@@ -154,7 +156,7 @@ fn layer_attention_decode(
     let mut post = vec![0.0f32; n_hc];
     let mut comb = vec![0.0f32; n_hc * n_hc];
     hc_pre(
-        model,
+        &engine.weights,
         layer,
         residual_hc,
         &mut attn_cur,
@@ -170,26 +172,22 @@ fn layer_attention_decode(
 
     // Q projection (low-rank).
     let mut q = vec![0.0f32; q_dim];
-    q_projection_decode(model, layer, &attn_norm, &mut q)?;
+    q_projection_decode(
+        &engine.weights,
+        layer,
+        &attn_norm,
+        &mut q,
+        n_head,
+        n_head_dim,
+    )?;
 
     // KV projection.
     let mut kv = vec![0.0f32; n_head_dim];
-    kv_projection_decode(model, layer, &attn_norm, &mut kv)?;
+    kv_projection_decode(&engine.weights, layer, &attn_norm, &mut kv, n_head_dim)?;
 
-    // RoPE.
-    let rope_freqs = RopeFreqs::new(&crate::ops::rope::RopeParams {
-        n_rot: 64,
-        base: 10000.0,
-        yarn: Some(crate::ops::rope::YarnParams {
-            scale_factor: 16.0,
-            beta_fast: 32.0,
-            beta_slow: 1.0,
-            orig_ctx: 65536.0,
-            attn_factor: None,
-        }),
-    });
-    apply_rope(&mut q, pos, &rope_freqs);
-    apply_rope(&mut kv, pos, &rope_freqs);
+    // RoPE (uses precomputed frequency cache from Engine).
+    apply_rope(&mut q, pos, &engine.rope_freqs);
+    apply_rope(&mut kv, pos, &engine.rope_freqs);
 
     // Store KV in cache.
     kv_cache.write_latent(il, pos, &kv);
@@ -205,15 +203,12 @@ fn layer_attention_decode(
     )?;
 
     // Inverse RoPE on attention output before grouped projection.
-    apply_rope_inverse(&mut heads, pos, &rope_freqs);
+    apply_rope_inverse(&mut heads, pos, &engine.rope_freqs);
 
     // Grouped output projection.
-    grouped_out_decode(model, layer, &heads, out)?;
+    grouped_out_decode(&engine.weights, layer, &heads, out)?;
 
-    // HC post: mix back into residual streams.
-    // (Done by caller)
-
-    Ok(())
+    Ok((post, comb))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -275,85 +270,6 @@ fn hc_pre(
     Ok(())
 }
 
-fn hc_post_attn(
-    out_hc: &mut [f32],
-    block_out: &[f32],
-    residual_hc: &[f32],
-    layer: &LayerWeights<'_>,
-    n_embd: usize,
-    n_hc: usize,
-) -> Result<()> {
-    // We need the post and comb from the hc_pre step. In the C code, these are
-    // passed through. Here we recompute them — inefficient but correct for Phase 1.
-    let mut attn_cur = vec![0.0f32; n_embd];
-    let mut post = vec![0.0f32; n_hc];
-    let mut comb = vec![0.0f32; n_hc * n_hc];
-    hc_pre_from_state(
-        layer,
-        residual_hc,
-        &mut attn_cur,
-        &mut post,
-        &mut comb,
-        n_embd,
-        n_hc,
-    )?;
-    hc_post(out_hc, block_out, residual_hc, &post, &comb, n_embd, n_hc);
-    Ok(())
-}
-
-fn hc_post_ffn(
-    out_hc: &mut [f32],
-    block_out: &[f32],
-    residual_hc: &[f32],
-    layer: &LayerWeights<'_>,
-    n_embd: usize,
-    n_hc: usize,
-) -> Result<()> {
-    let mut ffn_cur = vec![0.0f32; n_embd];
-    let mut post = vec![0.0f32; n_hc];
-    let mut comb = vec![0.0f32; n_hc * n_hc];
-    hc_pre_ffn(
-        layer,
-        residual_hc,
-        &mut ffn_cur,
-        &mut post,
-        &mut comb,
-        n_embd,
-        n_hc,
-    )?;
-    hc_post(out_hc, block_out, residual_hc, &post, &comb, n_embd, n_hc);
-    Ok(())
-}
-
-fn hc_pre_from_state(
-    layer: &LayerWeights<'_>,
-    residual_hc: &[f32],
-    out: &mut [f32],
-    post: &mut [f32],
-    comb: &mut [f32],
-    n_embd: usize,
-    n_hc: usize,
-) -> Result<()> {
-    let mut flat = vec![0.0f32; n_hc * n_embd];
-    rms_norm_no_weight(residual_hc, 1e-6, &mut flat);
-    let mut mix = vec![0.0f32; 2 * n_hc + n_hc * n_hc];
-    matmul_row(layer.hc_attn_fn, &flat, &mut mix);
-    let mut pre = vec![0.0f32; n_hc];
-    hc_control_split(
-        &mix,
-        layer.hc_attn_scale,
-        layer.hc_attn_base,
-        &mut pre,
-        post,
-        comb,
-        n_hc,
-        20,
-        1e-6,
-    );
-    hc_weighted_sum(residual_hc, &pre, out, n_embd, n_hc);
-    Ok(())
-}
-
 fn hc_pre_ffn(
     layer: &LayerWeights<'_>,
     residual_hc: &[f32],
@@ -388,6 +304,8 @@ fn q_projection_decode(
     layer: &LayerWeights<'_>,
     norm: &[f32],
     q: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
 ) -> Result<()> {
     // Q = attn_q_b(RMSNorm(attn_q_a(norm)))
     let mut qr = vec![0.0f32; 1024];
@@ -399,8 +317,6 @@ fn q_projection_decode(
     matmul_row(layer.attn_q_b, &qr_norm, q);
 
     // Per-head RMSNorm (no weight).
-    let n_head = 64usize;
-    let head_dim = 512usize;
     for h in 0..n_head {
         let head = &mut q[h * head_dim..(h + 1) * head_dim];
         let scale = rms_scale(head, 1e-6);
@@ -417,8 +333,9 @@ fn kv_projection_decode(
     layer: &LayerWeights<'_>,
     norm: &[f32],
     kv: &mut [f32],
+    n_head_dim: usize,
 ) -> Result<()> {
-    let mut raw = vec![0.0f32; 512];
+    let mut raw = vec![0.0f32; n_head_dim];
     matmul_row(layer.attn_kv, norm, &mut raw);
     rms_norm(&raw, layer.attn_kv_a_norm, 1e-6, kv);
     Ok(())
@@ -449,6 +366,7 @@ fn attention_rows(
     n_head: usize,
     head_dim: usize,
 ) -> Result<()> {
+    const MAX_SWA: usize = 128;
     let sinks = layer.attn_sinks;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
 
@@ -458,10 +376,14 @@ fn attention_rows(
         oh.fill(0.0);
 
         let mut max_score = sinks[h];
-        let mut scores = vec![0.0f32; end_pos - start_pos];
+        let window_len = end_pos - start_pos;
+        let mut scores = [0.0f32; MAX_SWA];
+        let mut kvs: [&[f32]; MAX_SWA] = [&[]; MAX_SWA];
 
+        // First pass: compute scores, cache KV references, find max.
         for (i, pos) in (start_pos..end_pos).enumerate() {
             let kv = kv_cache.read_latent(il, pos);
+            kvs[i] = kv;
             let mut score = 0.0f32;
             for d in 0..head_dim {
                 score += qh[d] * kv[d];
@@ -473,11 +395,12 @@ fn attention_rows(
             }
         }
 
+        // Second pass: softmax denominator and weighted sum.
         let mut denom = (sinks[h] - max_score).exp();
-        for (i, pos) in (start_pos..end_pos).enumerate() {
+        for i in 0..window_len {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            let kv = kv_cache.read_latent(il, pos);
+            let kv = kvs[i];
             for d in 0..head_dim {
                 oh[d] += kv[d] * weight;
             }
@@ -522,12 +445,11 @@ fn grouped_out_decode(
 
 fn layer_ffn_decode(
     out: &mut [f32],
-    model: &WeightMap,
     config: &ModelConfig,
     layer: &LayerWeights<'_>,
     residual_hc: &[f32],
     il: usize,
-) -> Result<()> {
+) -> Result<(Vec<f32>, Vec<f32>)> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
 
@@ -551,7 +473,7 @@ fn layer_ffn_decode(
 
     // Shared expert.
     let mut shared_out = vec![0.0f32; n_embd];
-    shared_expert_decode(model, layer, &ffn_norm, &mut shared_out)?;
+    shared_expert_decode(layer, &ffn_norm, &mut shared_out)?;
 
     // Router + routed experts (stubbed — needs IQ2_XXS / Q2_K).
     let mut moe_out = vec![0.0f32; n_embd];
@@ -567,15 +489,10 @@ fn layer_ffn_decode(
         out[i] = shared_out[i] + moe_out[i];
     }
 
-    Ok(())
+    Ok((post, comb))
 }
 
-fn shared_expert_decode(
-    _model: &WeightMap,
-    layer: &LayerWeights<'_>,
-    x: &[f32],
-    out: &mut [f32],
-) -> Result<()> {
+fn shared_expert_decode(layer: &LayerWeights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
     let hidden = 2048usize; // DS4_N_FF_EXP
 
     let mut gate = vec![0.0f32; hidden];

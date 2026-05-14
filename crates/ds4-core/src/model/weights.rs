@@ -74,6 +74,9 @@ impl WeightMap {
                 bytes.len()
             );
         }
+        if !(bytes.as_ptr() as usize).is_multiple_of(4) {
+            bail!("{name}: F32 data is not 4-byte aligned");
+        }
         // SAFETY: we just validated length and alignment (u8 slice is 1-byte aligned,
         // and f32 requires 4-byte alignment which the GGUF file guarantees for F32
         // tensors via its alignment field, and mmap returns page-aligned memory).
