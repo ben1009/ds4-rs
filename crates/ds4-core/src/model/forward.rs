@@ -28,6 +28,10 @@ use crate::{
     session::Session,
 };
 
+/// Width of the local attention window in decode. Matches `DS4_SWA_K`
+/// in antirez/ds4 ds4.c — the recent-tokens prefix scored at every layer.
+const SLIDING_WINDOW: usize = 128;
+
 /// Run a single decode step: compute logits for the token at `session.pos()`.
 ///
 /// This is the entry point called by `Session::eval_token`.
@@ -43,7 +47,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     // --- Copy embedding into HC streams ------------------------------------
     let n_hc = config.n_hc as usize;
     let n_embd = config.n_embd as usize;
-    let hc_dim = n_hc * n_embd;
+    let hc_dim = n_hc
+        .checked_mul(n_embd)
+        .ok_or_else(|| anyhow::anyhow!("HC dimension overflow"))?;
     let mut residual_hc = vec![0.0f32; hc_dim];
     hc_from_plain_embedding(&mut residual_hc, &plain, n_embd, n_hc);
 
@@ -227,8 +233,7 @@ fn layer_attention_decode(
     // Attention over cached KV rows.
     let mut heads = vec![0.0f32; q_dim];
     let kv_len = (pos + 1).min(kv_cache.ctx_size());
-    let sliding_window = 128usize;
-    let start_pos = kv_len.saturating_sub(sliding_window);
+    let start_pos = kv_len.saturating_sub(SLIDING_WINDOW);
 
     attention_rows(
         &mut heads, layer, &q, kv_cache, il, start_pos, kv_len, n_head, n_head_dim,
@@ -384,8 +389,20 @@ fn attention_rows(
 
     let latent_prefix = kv_cache.latent_layer_prefix(il, end_pos);
     let k_pe_prefix = kv_cache.k_pe_layer_prefix(il, end_pos);
-    let latent_window = &latent_prefix[start_pos * KV_LATENT_DIM..end_pos * KV_LATENT_DIM];
-    let k_pe_window = &k_pe_prefix[start_pos * K_PE_DIM..end_pos * K_PE_DIM];
+    let lat_lo = start_pos
+        .checked_mul(KV_LATENT_DIM)
+        .ok_or_else(|| anyhow::anyhow!("attention window: latent start overflow"))?;
+    let lat_hi = end_pos
+        .checked_mul(KV_LATENT_DIM)
+        .ok_or_else(|| anyhow::anyhow!("attention window: latent end overflow"))?;
+    let pe_lo = start_pos
+        .checked_mul(K_PE_DIM)
+        .ok_or_else(|| anyhow::anyhow!("attention window: k_pe start overflow"))?;
+    let pe_hi = end_pos
+        .checked_mul(K_PE_DIM)
+        .ok_or_else(|| anyhow::anyhow!("attention window: k_pe end overflow"))?;
+    let latent_window = &latent_prefix[lat_lo..lat_hi];
+    let k_pe_window = &k_pe_prefix[pe_lo..pe_hi];
 
     let mut scores = vec![0.0f32; window_len];
 
@@ -426,7 +443,7 @@ fn attention_rows(
             }
         }
 
-        let inv = 1.0 / denom;
+        let inv = 1.0 / (denom + 1e-9);
         for v in oh.iter_mut() {
             *v *= inv;
         }
@@ -554,8 +571,12 @@ fn output_head(
     // The output uses a learned combine matrix, but for Phase 1 we can sum
     // the streams. TODO: load output_weights from GGUF and do proper HC reduce.
     for h in 0..n_hc {
-        for d in 0..n_embd {
-            plain[d] += residual_hc[h * n_embd + d];
+        let start = h
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow::anyhow!("output_head: hc offset overflow"))?;
+        let stream = &residual_hc[start..start + n_embd];
+        for (p, &s) in plain.iter_mut().zip(stream.iter()) {
+            *p += s;
         }
     }
 

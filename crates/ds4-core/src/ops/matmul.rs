@@ -291,7 +291,10 @@ fn matmul_row_f16(
     );
 
     for (n, out_n) in out.iter_mut().enumerate().take(out_features) {
-        let row_off = n * in_features * 2;
+        let row_off = n
+            .checked_mul(in_features)
+            .and_then(|v| v.checked_mul(2))
+            .expect("matmul_row_f16: row offset overflowed usize");
         let row_bytes = &bytes[row_off..row_off + in_features * 2];
         *out_n = dot_f16_f32_row(row_bytes, act);
     }
@@ -332,12 +335,15 @@ fn matmul_batch_f16(
     }
 
     for n in 0..out_features {
-        let row_off = n * in_features * 2;
+        let row_off = n
+            .checked_mul(in_features)
+            .and_then(|v| v.checked_mul(2))
+            .expect("matmul_batch_f16: row offset overflowed usize");
         let row_bytes = &bytes[row_off..row_off + in_features * 2];
         for (k, chunk) in row_bytes.chunks_exact(2).enumerate() {
             let w = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
-            for row in 0..m {
-                out[out_row_off[row] + n] += w * acts[act_row_off[row] + k];
+            for (&o_off, &a_off) in out_row_off.iter().zip(act_row_off.iter()) {
+                out[o_off + n] += w * acts[a_off + k];
             }
         }
     }

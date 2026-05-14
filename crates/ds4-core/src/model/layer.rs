@@ -68,7 +68,10 @@ impl<'a> LayerWeights<'a> {
         // Hash routing table is optional (only present for layers 0–2).
         let tid2eid_name = format!("{prefix}ffn_gate_tid2eid.weight");
         let ffn_gate_tid2eid = if map.tensor_info(&tid2eid_name).is_some() {
-            Some(map.i32_1d(&tid2eid_name, 6 * map.config.n_vocab as usize)?)
+            let expect_elems = 6usize
+                .checked_mul(map.config.n_vocab as usize)
+                .ok_or_else(|| anyhow::anyhow!("{tid2eid_name}: tid2eid size overflow"))?;
+            Some(map.i32_1d(&tid2eid_name, expect_elems)?)
         } else {
             None
         };
