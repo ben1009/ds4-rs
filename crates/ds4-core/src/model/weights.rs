@@ -67,7 +67,9 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::F32)?;
         let bytes = self.tensor_bytes(name)?;
-        let expect_bytes = expect_elems * 4;
+        let expect_bytes = expect_elems
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("{name}: F32 element count overflow"))?;
         if bytes.len() != expect_bytes {
             bail!(
                 "{name}: expected {expect_elems} F32 elems ({expect_bytes} B), got {} B",

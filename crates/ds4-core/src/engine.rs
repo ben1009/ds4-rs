@@ -29,7 +29,10 @@ impl Engine {
 
         // Match antirez/ds4: `config_expect_f32("rope.freq_base", …, DS4_ROPE_FREQ_BASE)`.
         // The metadata value isn't an override; it's a sanity check on the GGUF.
-        if (config.rope_theta - ROPE_FREQ_BASE).abs() > f32::EPSILON {
+        // Bitwise compare — the upstream check is exact equality on the same
+        // 10000.0 constant, so any mismatch deserves a hard failure rather
+        // than a tolerance bucket.
+        if config.rope_theta != ROPE_FREQ_BASE {
             bail!(
                 "rope.freq_base mismatch: GGUF metadata says {}, expected {ROPE_FREQ_BASE}",
                 config.rope_theta
