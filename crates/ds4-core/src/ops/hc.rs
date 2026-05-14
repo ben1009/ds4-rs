@@ -390,6 +390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "miri's f32 emulation produces sub-ULP non-determinism")]
     fn is_deterministic_across_runs() {
         let n_hc = 4;
         let mix: Vec<f32> = (0..(2 * n_hc + n_hc * n_hc))

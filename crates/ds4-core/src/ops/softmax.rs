@@ -151,6 +151,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "miri's f32 emulation produces sub-ULP non-determinism")]
     fn is_deterministic_across_runs() {
         let x: Vec<f32> = (0..32).map(|i| ((i as f32) * 0.17 - 2.7).sin()).collect();
         let mut a = vec![0.0f32; 32];
