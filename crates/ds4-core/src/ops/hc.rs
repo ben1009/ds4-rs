@@ -83,9 +83,9 @@ pub fn hc_control_split(
         *post_i = 2.0 * sigmoid_stable(z);
     }
 
-    // Combine matrix: initialise from mix tail.
+    // Combine matrix: write directly into the caller-provided `comb` slot.
     // c[idx] where idx = src + dst * n_hc  (dst = row, src = col)
-    let mut c = vec![0.0f32; n_hc * n_hc];
+    let c = &mut comb[..n_hc * n_hc];
     for dst in 0..n_hc {
         let mut row_max = f32::NEG_INFINITY;
         for src in 0..n_hc {
@@ -152,8 +152,6 @@ pub fn hc_control_split(
             }
         }
     }
-
-    comb.copy_from_slice(&c);
 }
 
 /// Weighted sum of HC streams into a single vector.

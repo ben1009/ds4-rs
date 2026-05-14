@@ -34,11 +34,20 @@ const SLIDING_WINDOW: usize = 128;
 
 /// Run a single decode step: compute logits for the token at `session.pos()`.
 ///
-/// This is the entry point called by `Session::eval_token`.
+/// **Contract:** `session.pos()` must be the index of the token to evaluate
+/// (i.e. `< session.tokens().len()`), and the prior `pos` tokens must already
+/// have been written into the KV cache. The wiring in [`Session::eval_token`]
+/// is responsible for upholding this — `forward_decode` only validates.
 pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec<f32>> {
     let model = &engine.weights;
     let config = &engine.config;
     let pos = session.pos() as usize;
+    if pos >= session.tokens().len() {
+        bail!(
+            "forward_decode: pos {pos} out of range — session has {} tokens",
+            session.tokens().len()
+        );
+    }
 
     // --- Token embedding ---------------------------------------------------
     let mut plain = vec![0.0f32; config.n_embd as usize];
@@ -136,8 +145,8 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
     let row = &bytes
         .get(row_off..row_end)
         .ok_or_else(|| anyhow::anyhow!("embed_token: row out of bounds"))?;
-    for (i, chunk) in row.chunks_exact(2).enumerate() {
-        out[i] = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
+    for (o, chunk) in out.iter_mut().zip(row.chunks_exact(2)) {
+        *o = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
     }
     Ok(())
 }
@@ -571,12 +580,8 @@ fn output_head(
     let mut plain = vec![0.0f32; n_embd];
     // The output uses a learned combine matrix, but for Phase 1 we can sum
     // the streams. TODO: load output_weights from GGUF and do proper HC reduce.
-    for h in 0..n_hc {
-        let start = h
-            .checked_mul(n_embd)
-            .ok_or_else(|| anyhow::anyhow!("output_head: hc offset overflow"))?;
-        let stream = &residual_hc[start..start + n_embd];
-        for (p, &s) in plain.iter_mut().zip(stream.iter()) {
+    for stream in residual_hc.chunks_exact(n_embd).take(n_hc) {
+        for (p, &s) in plain.iter_mut().zip(stream) {
             *p += s;
         }
     }

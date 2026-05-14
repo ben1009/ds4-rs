@@ -320,32 +320,27 @@ fn matmul_batch_f16(
         "matmul_batch_f16: bytes len {} != {out_features}*{in_features}*2",
         bytes.len(),
     );
+    debug_assert_eq!(acts.len(), m * in_features);
+    debug_assert_eq!(out.len(), m * out_features);
 
     out.fill(0.0);
 
-    let mut act_row_off: Vec<usize> = Vec::with_capacity(m);
-    let mut out_row_off: Vec<usize> = Vec::with_capacity(m);
-    for row in 0..m {
-        act_row_off.push(
-            row.checked_mul(in_features)
-                .expect("matmul_batch_f16: act row offset overflowed usize"),
-        );
-        out_row_off.push(
-            row.checked_mul(out_features)
-                .expect("matmul_batch_f16: out row offset overflowed usize"),
-        );
-    }
+    let row_stride = in_features
+        .checked_mul(2)
+        .expect("matmul_batch_f16: row stride overflowed usize");
 
-    for n in 0..out_features {
-        let row_off = n
-            .checked_mul(in_features)
-            .and_then(|v| v.checked_mul(2))
-            .expect("matmul_batch_f16: row offset overflowed usize");
-        let row_bytes = &bytes[row_off..row_off + in_features * 2];
+    for (n, row_bytes) in bytes
+        .chunks_exact(row_stride)
+        .enumerate()
+        .take(out_features)
+    {
         for (k, chunk) in row_bytes.chunks_exact(2).enumerate() {
             let w = q8_0::f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]]));
-            for (&o_off, &a_off) in out_row_off.iter().zip(act_row_off.iter()) {
-                out[o_off + n] += w * acts[a_off + k];
+            for (out_row, act_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(acts.chunks_exact(in_features))
+            {
+                out_row[n] += w * act_row[k];
             }
         }
     }
