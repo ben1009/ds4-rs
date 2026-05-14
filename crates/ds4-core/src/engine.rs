@@ -1,8 +1,12 @@
 use std::{path::Path, sync::Arc};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
 use crate::{config::ModelConfig, model::WeightMap, ops::rope::RopeFreqs, tokenizer::Tokenizer};
+
+/// Hardcoded RoPE frequency base, matches `DS4_ROPE_FREQ_BASE` in antirez/ds4.
+/// Cross-checked against the GGUF `*.rope.freq_base` metadata at load time.
+const ROPE_FREQ_BASE: f32 = 10000.0;
 
 /// The inference engine. Holds loaded model weights and tokenizer.
 /// Immutable after creation — safe to share across threads via Arc.
@@ -23,9 +27,18 @@ impl Engine {
         let config = weights.config.clone();
         let tokenizer = Tokenizer::from_metadata(weights.metadata())?;
 
+        // Match antirez/ds4: `config_expect_f32("rope.freq_base", …, DS4_ROPE_FREQ_BASE)`.
+        // The metadata value isn't an override; it's a sanity check on the GGUF.
+        if (config.rope_theta - ROPE_FREQ_BASE).abs() > f32::EPSILON {
+            bail!(
+                "rope.freq_base mismatch: GGUF metadata says {}, expected {ROPE_FREQ_BASE}",
+                config.rope_theta
+            );
+        }
+
         let rope_freqs = RopeFreqs::new(&crate::ops::rope::RopeParams {
             n_rot: 64,
-            base: 10000.0,
+            base: ROPE_FREQ_BASE,
             yarn: Some(crate::ops::rope::YarnParams {
                 scale_factor: 16.0,
                 beta_fast: 32.0,

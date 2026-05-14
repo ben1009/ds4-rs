@@ -25,7 +25,7 @@ impl Session {
             pos: 0,
             ctx_size,
             logits: vec![0.0; n_vocab],
-            kv_cache: KvCache::new(n_layer, ctx_size as usize),
+            kv_cache: KvCache::new(n_layer, ctx_size as usize)?,
         })
     }
 

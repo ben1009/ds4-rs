@@ -58,7 +58,6 @@ impl<'a> LayerWeights<'a> {
     pub fn from_map(map: &'a WeightMap, il: u32) -> Result<Self> {
         let prefix = format!("blk.{il}.");
         let n_embd = map.config.n_embd as usize;
-        let n_head_dim = map.config.head_dim as usize;
         let _n_ff = map.config.n_ff as usize;
         let _n_expert = map.config.n_expert as usize;
 
@@ -80,7 +79,7 @@ impl<'a> LayerWeights<'a> {
             attn_q_a_norm: f32_1d("attn_q_a_norm.weight", 1024)?,
             attn_q_b: q8_0("attn_q_b.weight")?,
             attn_kv: q8_0("attn_kv.weight")?,
-            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", n_head_dim)?,
+            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", 448)?,
             attn_sinks: f32_1d("attn_sinks.weight", 64)?,
             attn_output_a: q8_0("attn_output_a.weight")?,
             attn_output_b: q8_0("attn_output_b.weight")?,

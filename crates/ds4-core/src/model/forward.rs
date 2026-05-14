@@ -181,20 +181,39 @@ fn layer_attention_decode(
         n_head_dim,
     )?;
 
-    // KV projection.
-    let mut kv = vec![0.0f32; n_head_dim];
-    kv_projection_decode(&engine.weights, layer, &attn_norm, &mut kv, n_head_dim)?;
+    // KV projection (matches antirez/ds4 ds4.c). The attn_kv matmul produces
+    // a single DS4_N_HEAD_DIM = 512 wide row, split into:
+    //   * KV_LATENT_DIM = 448 — non-positional ("nope") slice, RMSNorm'd and cached
+    //   * K_PE_DIM      =  64 — decoupled RoPE key, RoPE'd and cached separately
+    // The MLA up-projection of the latent into per-head K/V lands in PR #5;
+    // Phase 1 caches both pieces with the canonical dims so the cache asserts
+    // don't fire and downstream attention can read the correct shape.
+    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+    let kv_full_dim = KV_LATENT_DIM + K_PE_DIM;
+    let mut kv_raw = vec![0.0f32; kv_full_dim];
+    matmul_row(layer.attn_kv, &attn_norm, &mut kv_raw);
 
-    // RoPE per head (uses precomputed frequency cache from Engine).
+    let mut kv_latent = vec![0.0f32; KV_LATENT_DIM];
+    rms_norm(
+        &kv_raw[..KV_LATENT_DIM],
+        layer.attn_kv_a_norm,
+        1e-6,
+        &mut kv_latent,
+    );
+
+    let mut k_pe = kv_raw[KV_LATENT_DIM..].to_vec();
+    apply_rope(&mut k_pe, pos, &engine.rope_freqs);
+
+    // RoPE per head on Q (uses precomputed frequency cache from Engine).
     for h in 0..n_head {
         let qh = &mut q[h * n_head_dim..(h + 1) * n_head_dim];
         apply_rope(qh, pos, &engine.rope_freqs);
     }
-    apply_rope(&mut kv, pos, &engine.rope_freqs);
 
-    // Store KV in cache and advance the watermark so the just-written
-    // token participates in this step's softmax.
-    kv_cache.write_latent(il, pos, &kv);
+    // Store latent + k_pe in the cache and advance the watermark so the
+    // just-written token participates in this step's softmax.
+    kv_cache.write_latent(il, pos, &kv_latent)?;
+    kv_cache.write_k_pe(il, pos, &k_pe)?;
     if pos + 1 > kv_cache.len() {
         kv_cache.set_pos(pos + 1);
     }
@@ -216,7 +235,7 @@ fn layer_attention_decode(
     }
 
     // Grouped output projection.
-    grouped_out_decode(&engine.weights, layer, &heads, out)?;
+    grouped_out_decode(&engine.weights, layer, &heads, out, n_head, n_head_dim)?;
 
     Ok((post, comb))
 }
@@ -319,19 +338,6 @@ fn q_projection_decode(
     Ok(())
 }
 
-fn kv_projection_decode(
-    _model: &WeightMap,
-    layer: &LayerWeights<'_>,
-    norm: &[f32],
-    kv: &mut [f32],
-    n_head_dim: usize,
-) -> Result<()> {
-    let mut raw = vec![0.0f32; n_head_dim];
-    matmul_row(layer.attn_kv, norm, &mut raw);
-    rms_norm(&raw, layer.attn_kv_a_norm, 1e-6, kv);
-    Ok(())
-}
-
 fn rms_scale(x: &[f32], eps: f32) -> f32 {
     let n = x.len();
     if n == 0 {
@@ -357,9 +363,15 @@ fn attention_rows(
     n_head: usize,
     head_dim: usize,
 ) -> Result<()> {
-    const MAX_SWA: usize = 128;
     let sinks = layer.attn_sinks;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
+    let window_len = end_pos - start_pos;
+
+    let mut scores = vec![0.0f32; window_len];
+    let mut kvs: Vec<&[f32]> = Vec::with_capacity(window_len);
+    for pos in start_pos..end_pos {
+        kvs.push(kv_cache.read_latent(il, pos));
+    }
 
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
@@ -367,14 +379,8 @@ fn attention_rows(
         oh.fill(0.0);
 
         let mut max_score = sinks[h];
-        let window_len = end_pos - start_pos;
-        let mut scores = [0.0f32; MAX_SWA];
-        let mut kvs: [&[f32]; MAX_SWA] = [&[]; MAX_SWA];
 
-        // First pass: compute scores, cache KV references, find max.
-        for (i, pos) in (start_pos..end_pos).enumerate() {
-            let kv = kv_cache.read_latent(il, pos);
-            kvs[i] = kv;
+        for (i, kv) in kvs.iter().enumerate() {
             let mut score = 0.0f32;
             for d in 0..head_dim {
                 score += qh[d] * kv[d];
@@ -386,12 +392,10 @@ fn attention_rows(
             }
         }
 
-        // Second pass: softmax denominator and weighted sum.
         let mut denom = (sinks[h] - max_score).exp();
-        for i in 0..window_len {
+        for (i, kv) in kvs.iter().enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            let kv = kvs[i];
             for d in 0..head_dim {
                 oh[d] += kv[d] * weight;
             }
@@ -411,18 +415,27 @@ fn grouped_out_decode(
     layer: &LayerWeights<'_>,
     heads: &[f32],
     out: &mut [f32],
+    n_head: usize,
+    head_dim: usize,
 ) -> Result<()> {
     let n_groups = 8usize;
-    let group_heads = 64 / n_groups; // 8
-    let group_dim = 512 * group_heads; // 4096
+    let group_heads = n_head / n_groups;
+    let group_dim = head_dim
+        .checked_mul(group_heads)
+        .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: group_dim overflow"))?;
     let rank = 1024usize;
 
-    let mut low = vec![0.0f32; n_groups * rank];
+    let mut low = vec![
+        0.0f32;
+        n_groups
+            .checked_mul(rank)
+            .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: low len overflow"))?
+    ];
 
-    // Each group maps its heads to a 1024-rank low vector.
-    for g in 0..n_groups {
-        let group_input = &heads[g * group_dim..(g + 1) * group_dim];
-        let group_output = &mut low[g * rank..(g + 1) * rank];
+    for (group_input, group_output) in heads
+        .chunks_exact(group_dim)
+        .zip(low.chunks_exact_mut(rank))
+    {
         matmul_row(layer.attn_output_a, group_input, group_output);
     }
 
