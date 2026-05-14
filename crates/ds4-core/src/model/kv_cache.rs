@@ -35,6 +35,15 @@ pub struct KvCache {
     pos: usize,
 }
 
+/// Compute `(layer * ctx_size + pos) * dim` with overflow checks.
+fn checked_offset(layer: usize, ctx_size: usize, pos: usize, dim: usize) -> Result<usize> {
+    layer
+        .checked_mul(ctx_size)
+        .and_then(|v| v.checked_add(pos))
+        .and_then(|v| v.checked_mul(dim))
+        .ok_or_else(|| anyhow::anyhow!("KvCache: offset overflow"))
+}
+
 impl KvCache {
     /// Pre-allocate the cache to full `[n_layer, ctx_size, dim]`.
     pub fn new(n_layer: usize, ctx_size: usize) -> Result<Self> {
@@ -96,7 +105,7 @@ impl KvCache {
                 self.ctx_size
             );
         }
-        let off = (layer * self.ctx_size + pos) * KV_LATENT_DIM;
+        let off = checked_offset(layer, self.ctx_size, pos, KV_LATENT_DIM)?;
         self.latent[off..off + KV_LATENT_DIM].copy_from_slice(data);
         Ok(())
     }
@@ -115,7 +124,7 @@ impl KvCache {
                 self.ctx_size
             );
         }
-        let off = (layer * self.ctx_size + pos) * K_PE_DIM;
+        let off = checked_offset(layer, self.ctx_size, pos, K_PE_DIM)?;
         self.k_pe[off..off + K_PE_DIM].copy_from_slice(data);
         Ok(())
     }
@@ -132,7 +141,8 @@ impl KvCache {
             "read_latent: pos {pos} >= {}",
             self.ctx_size
         );
-        let off = (layer * self.ctx_size + pos) * KV_LATENT_DIM;
+        let off = checked_offset(layer, self.ctx_size, pos, KV_LATENT_DIM)
+            .expect("KvCache: latent offset overflow (bounds already checked)");
         &self.latent[off..off + KV_LATENT_DIM]
     }
 
@@ -148,7 +158,8 @@ impl KvCache {
             "read_k_pe: pos {pos} >= {}",
             self.ctx_size
         );
-        let off = (layer * self.ctx_size + pos) * K_PE_DIM;
+        let off = checked_offset(layer, self.ctx_size, pos, K_PE_DIM)
+            .expect("KvCache: k_pe offset overflow (bounds already checked)");
         &self.k_pe[off..off + K_PE_DIM]
     }
 

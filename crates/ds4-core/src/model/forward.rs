@@ -114,12 +114,14 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
     }
 
     let bytes = model.tensor_bytes("token_embd.weight")?;
+    let row_size = n_embd
+        .checked_mul(2)
+        .ok_or_else(|| anyhow::anyhow!("embed_token: row size overflow"))?;
     let row_off = (token as usize)
-        .checked_mul(n_embd)
-        .and_then(|v| v.checked_mul(2))
+        .checked_mul(row_size)
         .ok_or_else(|| anyhow::anyhow!("embed_token: row offset overflow"))?;
     let row_end = row_off
-        .checked_add(n_embd * 2)
+        .checked_add(row_size)
         .ok_or_else(|| anyhow::anyhow!("embed_token: row end overflow"))?;
     let row = &bytes
         .get(row_off..row_end)
@@ -363,15 +365,18 @@ fn attention_rows(
     n_head: usize,
     head_dim: usize,
 ) -> Result<()> {
+    use crate::model::kv_cache::KV_LATENT_DIM;
+
     let sinks = layer.attn_sinks;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
     let window_len = end_pos - start_pos;
 
+    // Borrow the contiguous layer prefix once and slice the active window —
+    // chunks_exact then yields one per-token row without intermediate allocs.
+    let layer_prefix = kv_cache.latent_layer_prefix(il, end_pos);
+    let window = &layer_prefix[start_pos * KV_LATENT_DIM..end_pos * KV_LATENT_DIM];
+
     let mut scores = vec![0.0f32; window_len];
-    let mut kvs: Vec<&[f32]> = Vec::with_capacity(window_len);
-    for pos in start_pos..end_pos {
-        kvs.push(kv_cache.read_latent(il, pos));
-    }
 
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
@@ -380,12 +385,9 @@ fn attention_rows(
 
         let mut max_score = sinks[h];
 
-        for (i, kv) in kvs.iter().enumerate() {
-            let mut score = 0.0f32;
-            for d in 0..head_dim {
-                score += qh[d] * kv[d];
-            }
-            score *= kq_scale;
+        for (i, kv) in window.chunks_exact(KV_LATENT_DIM).enumerate() {
+            // qh is `head_dim` wide; kv is the full latent. zip caps at head_dim.
+            let score = qh.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum::<f32>() * kq_scale;
             scores[i] = score;
             if score > max_score {
                 max_score = score;
@@ -393,16 +395,16 @@ fn attention_rows(
         }
 
         let mut denom = (sinks[h] - max_score).exp();
-        for (i, kv) in kvs.iter().enumerate() {
+        for (i, kv) in window.chunks_exact(KV_LATENT_DIM).enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            for d in 0..head_dim {
-                oh[d] += kv[d] * weight;
+            for (o, &k) in oh.iter_mut().zip(kv.iter()) {
+                *o += k * weight;
             }
         }
 
         let inv = 1.0 / denom;
-        for v in oh.iter_mut().take(head_dim) {
+        for v in oh.iter_mut() {
             *v *= inv;
         }
     }

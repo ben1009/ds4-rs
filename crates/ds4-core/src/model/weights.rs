@@ -88,12 +88,17 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::I32)?;
         let bytes = self.tensor_bytes(name)?;
-        let expect_bytes = expect_elems * 4;
+        let expect_bytes = expect_elems
+            .checked_mul(4)
+            .ok_or_else(|| anyhow::anyhow!("{name}: I32 element count overflow"))?;
         if bytes.len() != expect_bytes {
             bail!(
                 "{name}: expected {expect_elems} I32 elems ({expect_bytes} B), got {} B",
                 bytes.len()
             );
+        }
+        if !(bytes.as_ptr() as usize).is_multiple_of(4) {
+            bail!("{name}: I32 data is not 4-byte aligned");
         }
         Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const i32, expect_elems) })
     }
@@ -105,8 +110,11 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::F32)?;
         let bytes = self.tensor_bytes(name)?;
-        if bytes.len() % 4 != 0 {
+        if !bytes.len().is_multiple_of(4) {
             bail!("{name}: F32 bytes {} not multiple of 4", bytes.len());
+        }
+        if !(bytes.as_ptr() as usize).is_multiple_of(4) {
+            bail!("{name}: F32 data is not 4-byte aligned");
         }
         let elems = bytes.len() / 4;
         Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, elems) })
