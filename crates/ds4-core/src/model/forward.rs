@@ -365,29 +365,43 @@ fn attention_rows(
     n_head: usize,
     head_dim: usize,
 ) -> Result<()> {
-    use crate::model::kv_cache::KV_LATENT_DIM;
+    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
 
     let sinks = layer.attn_sinks;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
     let window_len = end_pos - start_pos;
 
-    // Borrow the contiguous layer prefix once and slice the active window —
-    // chunks_exact then yields one per-token row without intermediate allocs.
-    let layer_prefix = kv_cache.latent_layer_prefix(il, end_pos);
-    let window = &layer_prefix[start_pos * KV_LATENT_DIM..end_pos * KV_LATENT_DIM];
+    // Phase 1 stub: until the per-head MLA up-projection lands (PR #5),
+    // we score against the concatenated MLA cache row [kv_latent || k_pe]
+    // (448 + 64 = 512 = head_dim). This keeps the full qh dot product
+    // covered and folds the decoupled RoPE key into attention so positional
+    // info isn't dropped.
+    debug_assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
+
+    let latent_prefix = kv_cache.latent_layer_prefix(il, end_pos);
+    let k_pe_prefix = kv_cache.k_pe_layer_prefix(il, end_pos);
+    let latent_window = &latent_prefix[start_pos * KV_LATENT_DIM..end_pos * KV_LATENT_DIM];
+    let k_pe_window = &k_pe_prefix[start_pos * K_PE_DIM..end_pos * K_PE_DIM];
 
     let mut scores = vec![0.0f32; window_len];
 
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
+        let qh_latent = &qh[..KV_LATENT_DIM];
+        let qh_pe = &qh[KV_LATENT_DIM..];
         let oh = &mut out_heads[h * head_dim..(h + 1) * head_dim];
         oh.fill(0.0);
 
         let mut max_score = sinks[h];
 
-        for (i, kv) in window.chunks_exact(KV_LATENT_DIM).enumerate() {
-            // qh is `head_dim` wide; kv is the full latent. zip caps at head_dim.
-            let score = qh.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum::<f32>() * kq_scale;
+        for (i, (kv, k_pe)) in latent_window
+            .chunks_exact(KV_LATENT_DIM)
+            .zip(k_pe_window.chunks_exact(K_PE_DIM))
+            .enumerate()
+        {
+            let s_latent: f32 = qh_latent.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum();
+            let s_pe: f32 = qh_pe.iter().zip(k_pe.iter()).map(|(&q, &k)| q * k).sum();
+            let score = (s_latent + s_pe) * kq_scale;
             scores[i] = score;
             if score > max_score {
                 max_score = score;
@@ -395,10 +409,18 @@ fn attention_rows(
         }
 
         let mut denom = (sinks[h] - max_score).exp();
-        for (i, kv) in window.chunks_exact(KV_LATENT_DIM).enumerate() {
+        let (oh_latent, oh_pe) = oh.split_at_mut(KV_LATENT_DIM);
+        for (i, (kv, k_pe)) in latent_window
+            .chunks_exact(KV_LATENT_DIM)
+            .zip(k_pe_window.chunks_exact(K_PE_DIM))
+            .enumerate()
+        {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            for (o, &k) in oh.iter_mut().zip(kv.iter()) {
+            for (o, &k) in oh_latent.iter_mut().zip(kv.iter()) {
+                *o += k * weight;
+            }
+            for (o, &k) in oh_pe.iter_mut().zip(k_pe.iter()) {
                 *o += k * weight;
             }
         }
