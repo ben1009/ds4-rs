@@ -195,12 +195,14 @@ pub fn hc_weighted_sum(
 /// `residual_hc` — previous HC state, shape `[n_hc, n_embd]`.
 /// `post`        — post-gates, shape `[n_hc]`.
 /// `comb`        — combine matrix, shape `[n_hc*n_hc]`.
-///   Storage layout matches `hc_control_split`: `comb[src + dst*n_hc]`.
+///   Storage layout matches `hc_control_split`: `comb[src + dst*n_hc]`
+///   stores the entry that maps source stream `src` into destination
+///   stream `dst`.
 ///
 /// For each destination stream `dst` and embedding dim `d`:
 /// ```text
 /// out_hc[dst, d] = block_out[d] * post[dst]
-///                + sum_src comb[dst + src * n_hc] * residual_hc[src, d]
+///                + sum_src comb[src + dst * n_hc] * residual_hc[src, d]
 /// ```
 ///
 /// This indexing matches `hc_post_one` in ds4.c exactly.
@@ -228,7 +230,7 @@ pub fn hc_post(
         for d in 0..n_embd {
             let mut acc = block_out[d] * post_gate;
             for src in 0..n_hc {
-                let c = comb[dst + src * n_hc];
+                let c = comb[src + dst * n_hc];
                 acc += c * residual_hc[src * n_embd + d];
             }
             out_hc[dst * n_embd + d] = acc;
@@ -331,8 +333,8 @@ mod tests {
         ];
         let post = vec![1.0f32, 1.0];
         // comb stored as comb[src + dst*n_hc]
-        // For dst=0: use comb[0 + 0*2]=0.5, comb[0 + 1*2]=0.5
-        // For dst=1: use comb[1 + 0*2]=0.5, comb[1 + 1*2]=0.5
+        // For dst=0: use comb[0 + 0*2]=0.5, comb[1 + 0*2]=0.5
+        // For dst=1: use comb[0 + 1*2]=0.5, comb[1 + 1*2]=0.5
         let comb = vec![0.5f32, 0.5, 0.5, 0.5];
         let mut out_hc = vec![0.0f32; n_hc * n_embd];
 
@@ -346,11 +348,42 @@ mod tests {
             n_hc,
         );
 
-        // dst=0, d=0: block[0]*post[0] + comb[0+0*2]*res[0] + comb[0+1*2]*res[3]
+        // dst=0, d=0: block[0]*post[0] + comb[0+0*2]*res[0] + comb[1+0*2]*res[3]
         //            = 1*1 + 0.5*10 + 0.5*40 = 1 + 5 + 20 = 26
         assert!((out_hc[0] - 26.0).abs() < 1e-6, "out[0] = {}", out_hc[0]);
         // dst=1, d=0: 1*1 + 0.5*10 + 0.5*40 = 26 (same because comb is uniform)
         assert!((out_hc[3] - 26.0).abs() < 1e-6, "out[3] = {}", out_hc[3]);
+    }
+
+    #[test]
+    fn hc_post_uses_split_layout_for_asymmetric_comb() {
+        // Non-symmetric comb to verify the post-step honours the
+        // `comb[src + dst*n_hc]` layout produced by `hc_control_split`.
+        let n_hc = 2;
+        let n_embd = 1;
+        let block_out = vec![0.0f32];
+        let residual_hc = vec![1.0f32, 10.0]; // src 0 = 1, src 1 = 10
+        let post = vec![0.0f32, 0.0];
+        // Row-major by dst:
+        //   dst=0: [comb(src=0,dst=0)=0.7, comb(src=1,dst=0)=0.3]
+        //   dst=1: [comb(src=0,dst=1)=0.2, comb(src=1,dst=1)=0.8]
+        let comb = vec![0.7f32, 0.3, 0.2, 0.8];
+        let mut out_hc = vec![0.0f32; n_hc * n_embd];
+
+        hc_post(
+            &mut out_hc,
+            &block_out,
+            &residual_hc,
+            &post,
+            &comb,
+            n_embd,
+            n_hc,
+        );
+
+        // dst=0: 0.7*1 + 0.3*10 = 3.7
+        assert!((out_hc[0] - 3.7).abs() < 1e-6, "out[0] = {}", out_hc[0]);
+        // dst=1: 0.2*1 + 0.8*10 = 8.2
+        assert!((out_hc[1] - 8.2).abs() < 1e-6, "out[1] = {}", out_hc[1]);
     }
 
     #[test]
