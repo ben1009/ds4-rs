@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 
-use crate::{engine::Engine, model::kv_cache::KvCache};
+use crate::{engine::Engine, model, model::kv_cache::KvCache};
 
 /// An inference session holding mutable state.
 pub struct Session {
@@ -32,19 +32,53 @@ impl Session {
     /// Run prefill for the entire prompt. Returns logits for the last token.
     pub fn prefill(&mut self, tokens: &[u32]) -> Result<&[f32]> {
         tracing::info!("Prefill: {} tokens", tokens.len());
-        // TODO: implement forward pass
-        self.tokens.extend_from_slice(tokens);
-        self.pos = self.tokens.len() as u32;
-        self.logits.fill(0.0);
+        if tokens.is_empty() {
+            return Ok(&self.logits);
+        }
+        let final_len = self
+            .tokens
+            .len()
+            .checked_add(tokens.len())
+            .ok_or_else(|| anyhow::anyhow!("prefill would overflow token buffer length"))?;
+        if final_len > self.ctx_size as usize {
+            bail!(
+                "prefill context overflow: final length {final_len} exceeds ctx_size {}",
+                self.ctx_size
+            );
+        }
+
+        for &token in tokens {
+            self.eval_token(token)?;
+        }
         Ok(&self.logits)
     }
 
     /// Evaluate one decode token. Returns logits for the next token.
     pub fn eval_token(&mut self, token: u32) -> Result<&[f32]> {
-        // TODO: implement single-token forward pass
+        if self.tokens.len() >= self.ctx_size as usize {
+            bail!(
+                "eval_token context overflow: pos {} >= ctx_size {}",
+                self.tokens.len(),
+                self.ctx_size
+            );
+        }
+
         self.tokens.push(token);
-        self.pos += 1;
-        self.logits.fill(0.0);
+        self.pos = (self.tokens.len() - 1) as u32;
+
+        let engine = self.engine.clone();
+        match model::forward::forward_decode(self, &engine) {
+            Ok(logits) => {
+                self.logits = logits;
+                self.pos = self.tokens.len() as u32;
+            }
+            Err(err) => {
+                self.tokens.pop();
+                self.pos = self.tokens.len() as u32;
+                return Err(err);
+            }
+        }
+
         Ok(&self.logits)
     }
 
@@ -190,16 +224,17 @@ mod tests {
         miri,
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
-    fn session_prefill_tracks_tokens_and_pos() {
+    fn session_prefill_requires_forward_weights_and_rolls_back() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 128).unwrap();
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
 
-        let logits = s.prefill(&[1, 2, 3]).unwrap();
-        assert_eq!(logits.len(), engine.config.n_vocab as usize);
-        assert_eq!(s.pos(), 3);
-        assert_eq!(s.tokens(), &[1, 2, 3]);
+        let err = s.prefill(&[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.logits.len(), engine.config.n_vocab as usize);
     }
 
     #[test]
@@ -207,14 +242,14 @@ mod tests {
         miri,
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
-    fn session_eval_token_appends_and_increments_pos() {
+    fn session_eval_token_requires_forward_weights_and_rolls_back() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 128).unwrap();
-        let _ = s.prefill(&[10, 20]).unwrap();
-        let logits = s.eval_token(30).unwrap();
-        assert_eq!(logits.len(), engine.config.n_vocab as usize);
-        assert_eq!(s.pos(), 3);
-        assert_eq!(s.tokens(), &[10, 20, 30]);
+        let err = s.eval_token(30).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.logits.len(), engine.config.n_vocab as usize);
     }
 
     #[test]
@@ -250,15 +285,13 @@ mod tests {
         miri,
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
-    fn session_multiple_eval_tokens_track_position() {
+    fn session_prefill_rejects_context_overflow_before_mutating() {
         let engine = open_engine();
-        let mut s = Session::new(engine.clone(), 32).unwrap();
-        let _ = s.prefill(&[1, 2]).unwrap();
-        for t in [3u32, 4, 5, 6] {
-            let _ = s.eval_token(t).unwrap();
-        }
-        assert_eq!(s.pos(), 6);
-        assert_eq!(s.tokens(), &[1, 2, 3, 4, 5, 6]);
+        let mut s = Session::new(engine.clone(), 2).unwrap();
+        let err = s.prefill(&[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("context overflow"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
     }
 
     #[test]
@@ -266,12 +299,27 @@ mod tests {
         miri,
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
-    fn session_eval_without_prefill_advances_from_zero() {
+    fn session_eval_without_prefill_rolls_back_on_forward_error() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 16).unwrap();
-        let _ = s.eval_token(7).unwrap();
-        assert_eq!(s.pos(), 1);
-        assert_eq!(s.tokens(), &[7]);
+        let err = s.eval_token(7).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_eval_rejects_context_overflow_before_mutating() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 0).unwrap();
+        let err = s.eval_token(7).unwrap_err();
+        assert!(err.to_string().contains("context overflow"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
     }
 
     #[test]
