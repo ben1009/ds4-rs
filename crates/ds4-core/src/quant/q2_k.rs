@@ -3,11 +3,10 @@
 //! Block layout (84 bytes, 256 elements):
 //! * `d`       : f16 scale           (2 bytes, offset 0)
 //! * `dmin`    : f16 min scale       (2 bytes, offset 2)
-//! * `scales`  : 16 × u8             (16 bytes, offset 4)
-//!   Each byte packs one 4-bit scale index (low nibble) and one 4-bit min
-//!   index (high nibble) for a 16-element sub-block.
-//! * `qs`      : 64 × u8             (64 bytes, offset 20)
-//!   Packed 2-bit quants: 256 values, 4 per byte.
+//! * `scales`  : 16 × u8             (16 bytes, offset 4) Each byte packs one 4-bit scale index
+//!   (low nibble) and one 4-bit min index (high nibble) for a 16-element sub-block.
+//! * `qs`      : 64 × u8             (64 bytes, offset 20) Packed 2-bit quants: 256 values, 4 per
+//!   byte.
 //!
 //! Dequantised value for element `e` in sub-block `b`:
 //!   `x = d * (scales[b] & 0xF) * q - dmin * (scales[b] >> 4)`
@@ -124,7 +123,11 @@ pub fn dot_q2k_q8k_block(q2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) -> f
     let q2_scales = &q2_block[offset::SCALES..offset::SCALES + 16];
     let q2_qs = &q2_block[offset::QS..offset::QS + 64];
 
-    let q8_d = f32::from_le_bytes(q8_block[q8_k::offset::D..q8_k::offset::D + 4].try_into().unwrap());
+    let q8_d = f32::from_le_bytes(
+        q8_block[q8_k::offset::D..q8_k::offset::D + 4]
+            .try_into()
+            .unwrap(),
+    );
     let q8_qs = &q8_block[q8_k::offset::QS..q8_k::offset::QS + 256];
     let q8_bsums = &q8_block[q8_k::offset::BSUMS..q8_k::offset::BSUMS + 32];
 
@@ -147,12 +150,22 @@ pub fn dot_q2k_q8k_block(q2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) -> f
         let mut shift = 0u32;
         for _ in 0..4 {
             let d0 = (q2_scales[is] & 0x0F) as i32;
-            isum += d0 * dot_q2_16(&q2_qs[q2_off..q2_off + 16], &q8_qs[q8_off..q8_off + 16], shift);
+            isum += d0
+                * dot_q2_16(
+                    &q2_qs[q2_off..q2_off + 16],
+                    &q8_qs[q8_off..q8_off + 16],
+                    shift,
+                );
             is += 1;
             q8_off += 16;
 
             let d1 = (q2_scales[is] & 0x0F) as i32;
-            isum += d1 * dot_q2_16(&q2_qs[q2_off + 16..q2_off + 32], &q8_qs[q8_off..q8_off + 16], shift);
+            isum += d1
+                * dot_q2_16(
+                    &q2_qs[q2_off + 16..q2_off + 32],
+                    &q8_qs[q8_off..q8_off + 16],
+                    shift,
+                );
             is += 1;
             q8_off += 16;
 
@@ -180,7 +193,12 @@ fn dot_q2_16(q2: &[u8], q8: &[u8], shift: u32) -> i32 {
 mod tests {
     use super::*;
 
-    fn build_block(d_bits: u16, dmin_bits: u16, scales: [u8; 16], qs: [u8; 64]) -> [u8; BYTES_PER_BLOCK] {
+    fn build_block(
+        d_bits: u16,
+        dmin_bits: u16,
+        scales: [u8; 16],
+        qs: [u8; 64],
+    ) -> [u8; BYTES_PER_BLOCK] {
         let mut block = [0u8; BYTES_PER_BLOCK];
         block[0..2].copy_from_slice(&d_bits.to_le_bytes());
         block[2..4].copy_from_slice(&dmin_bits.to_le_bytes());

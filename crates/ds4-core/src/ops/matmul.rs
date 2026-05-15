@@ -11,12 +11,13 @@
 //! IQ2_XXS / Q2_K / IQ4_K / Q4_K paths will extend [`WeightView`] and the
 //! dispatch arm without changing the public matmul signatures.
 
-use crate::quant::{q8_0, q8_k, q2_k, iq2_xxs};
+use crate::quant::{iq2_xxs, q2_k, q8_0, q8_k};
 
 /// A weight matrix with shape `[out_features, in_features]` (row-major).
 ///
 /// Storage depends on the dtype; consumers never see raw bytes directly.
 #[derive(Clone, Copy, Debug)]
+#[allow(non_camel_case_types)]
 pub enum WeightView<'a> {
     /// Q8_0: `out_features × in_features / 32` blocks of 34 bytes each.
     /// Rows are laid out contiguously; each row is `in_features / 32` blocks.
@@ -443,8 +444,8 @@ fn matmul_row_q2_k(
         let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
         let mut sum = 0.0f32;
         for (block_idx, block) in wrow.chunks_exact(q2_k::BYTES_PER_BLOCK).enumerate() {
-            let q8_block = &q8_bytes[block_idx * q8_k::BYTES_PER_BLOCK
-                ..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
+            let q8_block = &q8_bytes
+                [block_idx * q8_k::BYTES_PER_BLOCK..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
             sum += q2_k::dot_q2k_q8k_block(block.try_into().unwrap(), q8_block);
         }
         out[n] = sum;
@@ -546,8 +547,8 @@ fn matmul_row_iq2_xxs(
         let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
         let mut sum = 0.0f32;
         for (block_idx, block) in wrow.chunks_exact(iq2_xxs::BYTES_PER_BLOCK).enumerate() {
-            let q8_block = &q8_bytes[block_idx * q8_k::BYTES_PER_BLOCK
-                ..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
+            let q8_block = &q8_bytes
+                [block_idx * q8_k::BYTES_PER_BLOCK..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
             sum += iq2_xxs::dot_iq2xxs_q8k_block(block.try_into().unwrap(), q8_block);
         }
         out[n] = sum;

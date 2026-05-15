@@ -120,9 +120,7 @@ impl WeightMap {
                 out_features,
                 in_features,
             }),
-            other => bail!(
-                "{name}: unsupported GGML dtype for weight view: {other:?}"
-            ),
+            other => bail!("{name}: unsupported GGML dtype for weight view: {other:?}"),
         }
     }
 
