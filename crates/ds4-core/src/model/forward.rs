@@ -642,16 +642,19 @@ fn routed_moe_decode(
             }
             selected[slot] = eid as usize;
         }
-    } else {
+    } else if let Some(bias) = layer.ffn_exp_probs_b {
         // Biased top-k. Bias only shifts the *selection*; the per-expert
-        // weight still uses the unbiased prob.
+        // weight still uses the unbiased prob, so we score against a
+        // bias-shifted copy of `probs`.
         let mut selection = probs.clone();
-        if let Some(bias) = layer.ffn_exp_probs_b {
-            for (s, &b) in selection.iter_mut().zip(bias.iter()) {
-                *s += b;
-            }
+        for (s, &b) in selection.iter_mut().zip(bias.iter()) {
+            *s += b;
         }
         topk_indices_desc(&selection, n_expert_used, &mut selected);
+    } else {
+        // Unbiased top-k (no `exp_probs_b.bias` tensor): score directly
+        // against `probs` without an extra clone.
+        topk_indices_desc(&probs, n_expert_used, &mut selected);
     }
 
     // Per-expert weights from the unbiased probs.
