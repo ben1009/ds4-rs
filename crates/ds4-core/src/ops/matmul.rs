@@ -7,9 +7,9 @@
 //! * [`matmul_batch`] — `M` activation rows against the same weight, so each weight block is
 //!   dequant'd once per prompt in prefill rather than once per token.
 //!
-//! PR #1 implements only the `Q8_0` weight dtype. Later PRs add F16, IQ2_XXS,
-//! Q2_K, IQ4_K, Q4_K by extending [`WeightView`] and the dispatch arm — no
-//! signature changes.
+//! Implemented weight dtypes currently cover Q8_0 and F16. The routed-expert
+//! IQ2_XXS / Q2_K / IQ4_K / Q4_K paths will extend [`WeightView`] and the
+//! dispatch arm without changing the public matmul signatures.
 
 use crate::quant::q8_0;
 

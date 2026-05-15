@@ -3,8 +3,8 @@
 //! See rfcs/0002-forward-pass.md §3.2 + §3.8. DS4 Flash's IQ2_XXS / Q2_K /
 //! IQ4_K / Q4_K weight matmuls operate on Q8_K-quantised activation rows
 //! (the "block_q8_K" struct in ggml / antirez/ds4). This module writes one
-//! 256-element activation row into the Q8_K block layout; later PRs that
-//! implement the mixed-dtype dot kernels will call this first.
+//! 256-element activation row into the Q8_K block layout; the pending
+//! mixed-dtype dot kernels will call this first.
 //!
 //! Block layout (292 bytes, 256 elements):
 //! * `d`      : f32 scale           (4 bytes, offset 0)

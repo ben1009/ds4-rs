@@ -8,12 +8,23 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 
 **Goal:** Load model weights, run forward pass, generate tokens greedily via `ds4 -p "hello"`.
 
+**Status:** In progress. GGUF/config/tokenizer plumbing, core op helpers,
+partial decode forward orchestration, MLA latent KV cache, and session/CLI
+wiring have landed. Phase 1 logits are not numerically complete yet: routed
+expert quant kernels, routed MoE, real MLA K/V up-projection, learned output
+HC reduction, and end-to-end smoke coverage remain tracked in `todo.md`.
+
 ### Step 1 — Workspace scaffold
+
+Status: **done**.
 
 - `Cargo.toml` workspace root with dependencies
 - Create `crates/ds4-core/`, `crates/ds4-cli/` with Cargo.toml stubs
 
 ### Step 2 — `ds4-core`: GGUF parser + config + model
+
+Status: **partially done**. The loader and typed weight accessors exist; routed
+expert quant typed accessors are still blocked on the remaining quant kernels.
 
 | File | Responsibility |
 |------|---------------|
@@ -23,11 +34,17 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 
 ### Step 3 — `ds4-core`: tokenizer
 
+Status: **done for the current Phase 1 path**.
+
 | File | Responsibility |
 |------|---------------|
 | `tokenizer.rs` | BPE tokenizer from GGUF vocab (`tokenizer.ggml.tokens`, `.scores`, `.merges`). `encode(text) -> Vec<u32>`, `decode(token_id) -> &str` |
 
 ### Step 4 — `ds4-core`: engine + session
+
+Status: **partial**. `Session::prefill` and `Session::eval_token` now call the
+decode forward path and preserve session/KV state on errors. The forward graph
+still contains the numerical stubs listed in `todo.md`.
 
 | File | Responsibility |
 |------|---------------|
@@ -42,6 +59,10 @@ HC split → norm → QKV proj → RoPE → KV store → attention → HC expand
 Output head: HC reduction → norm → LM head → logits.
 
 ### Step 5 — `ds4-cli`: one-shot generation
+
+Status: **wired, pending credible logits**. The CLI reaches session prefill and
+generation, but real model smoke validation waits for the remaining Phase 1
+forward-pass work.
 
 | File | Responsibility |
 |------|---------------|

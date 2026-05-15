@@ -1,8 +1,8 @@
 //! Forward-pass ops.
 //!
-//! See rfcs/0002-forward-pass.md §2 / §3.8. PR #1 shipped matmul; PR #2
-//! added RMSNorm; PR #3 adds RoPE. Remaining ops (softmax, SwiGLU, HC)
-//! land in later PRs per the commit roadmap.
+//! See rfcs/0002-forward-pass.md §2 / §3.8. This module contains the current
+//! Phase 1 CPU reference op helpers: matmul, RMSNorm, RoPE, softmax, SwiGLU,
+//! and HC split/mix support.
 
 pub mod hc;
 pub mod matmul;
