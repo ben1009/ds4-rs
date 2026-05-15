@@ -46,6 +46,13 @@ pub enum WeightView<'a> {
         out_features: usize,
         in_features: usize,
     },
+    /// Placeholder for dtypes not yet supported by the matmul kernels.
+    /// Model loading succeeds, but calling matmul on this variant panics.
+    Unsupported {
+        dtype_name: &'static str,
+        out_features: usize,
+        in_features: usize,
+    },
 }
 
 impl WeightView<'_> {
@@ -54,7 +61,8 @@ impl WeightView<'_> {
             Self::Q8_0 { out_features, .. }
             | Self::F16 { out_features, .. }
             | Self::Q2_K { out_features, .. }
-            | Self::IQ2_XXS { out_features, .. } => *out_features,
+            | Self::IQ2_XXS { out_features, .. }
+            | Self::Unsupported { out_features, .. } => *out_features,
         }
     }
 
@@ -63,7 +71,8 @@ impl WeightView<'_> {
             Self::Q8_0 { in_features, .. }
             | Self::F16 { in_features, .. }
             | Self::Q2_K { in_features, .. }
-            | Self::IQ2_XXS { in_features, .. } => *in_features,
+            | Self::IQ2_XXS { in_features, .. }
+            | Self::Unsupported { in_features, .. } => *in_features,
         }
     }
 }
@@ -114,6 +123,9 @@ pub fn matmul_row(weight: WeightView<'_>, act: &[f32], out: &mut [f32]) {
             in_features,
         } => {
             matmul_row_iq2_xxs(bytes, out_features, in_features, act, out);
+        }
+        WeightView::Unsupported { dtype_name, .. } => {
+            panic!("matmul_row: unsupported weight dtype {dtype_name}");
         }
     }
 }
@@ -172,6 +184,9 @@ pub fn matmul_batch(weight: WeightView<'_>, acts: &[f32], out: &mut [f32], m: us
             in_features,
         } => {
             matmul_batch_iq2_xxs(bytes, out_features, in_features, acts, out, m);
+        }
+        WeightView::Unsupported { dtype_name, .. } => {
+            panic!("matmul_batch: unsupported weight dtype {dtype_name}");
         }
     }
 }

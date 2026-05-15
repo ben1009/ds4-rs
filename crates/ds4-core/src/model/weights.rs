@@ -120,6 +120,25 @@ impl WeightMap {
                 out_features,
                 in_features,
             }),
+            // Routed-expert tensors also appear as IQ4_NL / IQ4_XS / Q4_K in
+            // some model variants. They are not yet wired to matmul kernels,
+            // but we must keep model loading working so LayerWeights::from_map
+            // does not fail before inference starts (routed MoE is still stubbed).
+            GgmlType::IQ4_NL => Ok(WeightView::Unsupported {
+                dtype_name: "IQ4_NL",
+                out_features,
+                in_features,
+            }),
+            GgmlType::IQ4_XS => Ok(WeightView::Unsupported {
+                dtype_name: "IQ4_XS",
+                out_features,
+                in_features,
+            }),
+            GgmlType::Q4_K => Ok(WeightView::Unsupported {
+                dtype_name: "Q4_K",
+                out_features,
+                in_features,
+            }),
             other => bail!("{name}: unsupported GGML dtype for weight view: {other:?}"),
         }
     }
