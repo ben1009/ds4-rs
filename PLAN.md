@@ -9,10 +9,10 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 **Goal:** Load model weights, run forward pass, generate tokens greedily via `ds4 -p "hello"`.
 
 **Status:** In progress. GGUF/config/tokenizer plumbing, core op helpers,
-partial decode forward orchestration, MLA latent KV cache, and session/CLI
-wiring have landed. Phase 1 logits are not numerically complete yet: routed
-expert quant kernels, routed MoE, real MLA K/V up-projection, learned output
-HC reduction, and end-to-end smoke coverage remain tracked in `todo.md`.
+partial decode forward orchestration, MLA latent KV cache, routed MoE
+assembly, and session/CLI wiring have landed. Phase 1 logits are not
+numerically complete yet: real MLA K/V up-projection, learned output HC
+reduction, and end-to-end smoke coverage remain tracked in `todo.md`.
 
 ### Step 1 — Workspace scaffold
 
