@@ -113,14 +113,22 @@ impl WeightView<'_> {
     /// concatenation of `n_expert` per-expert blocks of this size.
     ///
     /// Multiplications are `checked_mul`'d so a pathological dimension tuple
-    /// fails fast instead of silently wrapping `usize`.
+    /// fails fast instead of silently wrapping `usize`. We also assert that
+    /// `out_features * in_features` is a multiple of the block size so a
+    /// dim/block mismatch surfaces as a clear panic instead of a silently-
+    /// truncated byte count.
     fn per_expert_bytes(&self) -> usize {
         let blocks = |out_features: usize, in_features: usize, block: usize, bytes: usize| {
-            out_features
+            let total_elems = out_features
                 .checked_mul(in_features)
-                .and_then(|n| n.checked_div(block))
-                .and_then(|n| n.checked_mul(bytes))
-                .expect("per_expert_bytes: dimension overflow")
+                .expect("per_expert_bytes: dimension overflow");
+            assert!(
+                total_elems.is_multiple_of(block),
+                "per_expert_bytes: total elements {total_elems} not a multiple of block size {block}",
+            );
+            (total_elems / block)
+                .checked_mul(bytes)
+                .expect("per_expert_bytes: byte size overflow")
         };
         match *self {
             Self::Q8_0 {

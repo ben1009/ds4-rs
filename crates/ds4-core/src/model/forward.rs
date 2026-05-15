@@ -718,6 +718,11 @@ fn run_routed_expert(
 /// order of value, into `out`. Ties resolve toward the lower index. `k` is
 /// expected to be small (6 for DS4) so a linear scan per slot is cheaper than
 /// a heap.
+///
+/// NaN safety: the comparison is `values[i] > best_v` with `best_v` seeded at
+/// `f32::NEG_INFINITY`. `NaN > x` is always false in IEEE-754, so any NaN
+/// inputs are skipped on every slot rather than poisoning the result. The
+/// final `best_i != usize::MAX` check then catches an all-NaN window.
 fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
     let n = values.len();
     debug_assert!(k <= n);
@@ -873,6 +878,19 @@ mod tests {
         let mut out = [0usize; 1];
         topk_indices_desc(&v, 1, &mut out);
         assert_eq!(out, [1]);
+    }
+
+    #[test]
+    fn topk_skips_nan_values() {
+        // NaN > x is always false, so the linear scan should pick the
+        // largest *non-NaN* entry for every slot. With three NaNs and one
+        // real value, the first slot picks the real value and subsequent
+        // slots fall back to NaN entries (any of them is fine — only the
+        // non-NaN winner is asserted here).
+        let v = [f32::NAN, 0.5, f32::NAN, f32::NAN];
+        let mut out = [0usize; 1];
+        topk_indices_desc(&v, 1, &mut out);
+        assert_eq!(out, [1], "topk should pick the non-NaN value");
     }
 
     #[test]
