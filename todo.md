@@ -7,7 +7,7 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 
 - `cargo test --workspace` passes.
 - `rfcs/0002-forward-pass.md` is partially implemented, but its status line is stale.
-- `Session::prefill` and `Session::eval_token` still return zeroed logits instead of calling the forward path.
+- `Session::prefill` and `Session::eval_token` now call the forward path, but full numerical correctness is still blocked by the Phase 1 stubs below.
 - `model::forward` exists, but it still contains known Phase 1 stubs:
   - routed expert MoE is disabled until I-quant / K-quant matmul support lands;
   - attention scores against the cached MLA latent directly instead of doing per-head MLA K/V up-projection;

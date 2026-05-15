@@ -47,8 +47,17 @@ impl Session {
             );
         }
 
-        for &token in tokens {
-            self.eval_token(token)?;
+        let start_len = self.tokens.len();
+        let start_pos = self.pos;
+        let start_kv_pos = self.kv_cache.len();
+        self.tokens.reserve(tokens.len());
+        for &token in tokens.iter().take(tokens.len()) {
+            if let Err(err) = self.eval_token(token) {
+                self.tokens.truncate(start_len);
+                self.pos = start_pos;
+                self.kv_cache.set_pos(start_kv_pos);
+                return Err(err);
+            }
         }
         Ok(&self.logits)
     }
@@ -67,6 +76,7 @@ impl Session {
         self.pos = (self.tokens.len() - 1) as u32;
 
         let engine = self.engine.clone();
+        let start_kv_pos = self.kv_cache.len();
         match model::forward::forward_decode(self, &engine) {
             Ok(logits) => {
                 self.logits = logits;
@@ -75,6 +85,7 @@ impl Session {
             Err(err) => {
                 self.tokens.pop();
                 self.pos = self.tokens.len() as u32;
+                self.kv_cache.set_pos(start_kv_pos);
                 return Err(err);
             }
         }
