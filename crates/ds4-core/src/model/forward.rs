@@ -660,9 +660,9 @@ fn routed_moe_decode(
     // Per-expert weights from the unbiased probs.
     let mut weights = vec![0.0f32; n_expert_used];
     let mut sum = 0.0f32;
-    for (i, &eid) in selected.iter().enumerate() {
-        weights[i] = probs[eid];
-        sum += weights[i];
+    for (&eid, w) in selected.iter().zip(weights.iter_mut()) {
+        *w = probs[eid];
+        sum += *w;
     }
     if sum < EXPERT_WEIGHT_SUM_EPS {
         sum = EXPERT_WEIGHT_SUM_EPS;
@@ -717,32 +717,34 @@ fn run_routed_expert(
 /// Pick the indices of the top-`k` largest entries in `values`, in descending
 /// order of value, into `out`. Ties resolve toward the lower index. `k` is
 /// expected to be small (6 for DS4) so a linear scan per slot is cheaper than
-/// a heap.
+/// a heap, and we track "already-taken" by scanning `out[..slot]` rather than
+/// allocating a side `taken: Vec<bool>` buffer.
 ///
 /// NaN safety: the comparison is `values[i] > best_v` with `best_v` seeded at
 /// `f32::NEG_INFINITY`. `NaN > x` is always false in IEEE-754, so any NaN
 /// inputs are skipped on every slot rather than poisoning the result. The
-/// final `best_i != usize::MAX` check then catches an all-NaN window.
+/// final `best_i != usize::MAX` check then catches an all-NaN window with a
+/// clear panic message in both debug and release builds.
 fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
-    let n = values.len();
-    debug_assert!(k <= n);
+    debug_assert!(k <= values.len());
     debug_assert_eq!(out.len(), k);
-    let mut taken = vec![false; n];
-    for slot in out.iter_mut().take(k) {
+    for slot in 0..k {
         let mut best_i = usize::MAX;
         let mut best_v = f32::NEG_INFINITY;
-        for i in 0..n {
-            if taken[i] {
+        for (i, &v) in values.iter().enumerate() {
+            if out[..slot].contains(&i) {
                 continue;
             }
-            if values[i] > best_v {
-                best_v = values[i];
+            if v > best_v {
+                best_v = v;
                 best_i = i;
             }
         }
-        debug_assert!(best_i != usize::MAX, "topk_indices_desc: no candidate");
-        taken[best_i] = true;
-        *slot = best_i;
+        assert!(
+            best_i != usize::MAX,
+            "topk_indices_desc: no candidate at slot {slot} (all remaining values are NaN or -inf)",
+        );
+        out[slot] = best_i;
     }
 }
 
