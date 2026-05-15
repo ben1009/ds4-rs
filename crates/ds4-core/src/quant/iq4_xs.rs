@@ -69,9 +69,8 @@ pub fn dequant_block(block: &[u8; BYTES_PER_BLOCK], out: &mut [f32]) {
 
 /// Dequantise a contiguous sequence of IQ4_XS blocks.
 pub fn dequant(bytes: &[u8], out: &mut [f32]) {
-    assert_eq!(
-        bytes.len() % BYTES_PER_BLOCK,
-        0,
+    assert!(
+        bytes.len().is_multiple_of(BYTES_PER_BLOCK),
         "iq4_xs::dequant: bytes len {} not multiple of {BYTES_PER_BLOCK}",
         bytes.len(),
     );
