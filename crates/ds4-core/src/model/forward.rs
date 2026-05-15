@@ -701,10 +701,10 @@ fn run_routed_expert(
     matmul_row(up_w, x, &mut up);
 
     let mut mid = vec![0.0f32; hidden];
-    for i in 0..hidden {
-        let g = gate[i].min(SWIGLU_CLAMP_EXP);
-        let u = up[i].clamp(-SWIGLU_CLAMP_EXP, SWIGLU_CLAMP_EXP);
-        mid[i] = silu(g) * u * weight;
+    for (m, (&g_val, &u_val)) in mid.iter_mut().zip(gate.iter().zip(up.iter())) {
+        let g = g_val.min(SWIGLU_CLAMP_EXP);
+        let u = u_val.clamp(-SWIGLU_CLAMP_EXP, SWIGLU_CLAMP_EXP);
+        *m = silu(g) * u * weight;
     }
 
     matmul_row(down_w, &mid, out);

@@ -111,43 +111,86 @@ impl WeightView<'_> {
     /// (the loader reads `dims[0]` and `dims[1]` and drops the expert axis
     /// from `dims[2]`). The full tensor's bytes are an outer-stride
     /// concatenation of `n_expert` per-expert blocks of this size.
+    ///
+    /// Multiplications are `checked_mul`'d so a pathological dimension tuple
+    /// fails fast instead of silently wrapping `usize`.
     fn per_expert_bytes(&self) -> usize {
+        let blocks = |out_features: usize, in_features: usize, block: usize, bytes: usize| {
+            out_features
+                .checked_mul(in_features)
+                .and_then(|n| n.checked_div(block))
+                .and_then(|n| n.checked_mul(bytes))
+                .expect("per_expert_bytes: dimension overflow")
+        };
         match *self {
             Self::Q8_0 {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / q8_0::BLOCK_SIZE * q8_0::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                q8_0::BLOCK_SIZE,
+                q8_0::BYTES_PER_BLOCK,
+            ),
             Self::F16 {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features * 2,
+            } => out_features
+                .checked_mul(in_features)
+                .and_then(|n| n.checked_mul(2))
+                .expect("per_expert_bytes: F16 dimension overflow"),
             Self::Q2_K {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / q2_k::BLOCK_SIZE * q2_k::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                q2_k::BLOCK_SIZE,
+                q2_k::BYTES_PER_BLOCK,
+            ),
             Self::IQ2_XXS {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / iq2_xxs::BLOCK_SIZE * iq2_xxs::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                iq2_xxs::BLOCK_SIZE,
+                iq2_xxs::BYTES_PER_BLOCK,
+            ),
             Self::Q4_K {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / q4_k::BLOCK_SIZE * q4_k::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                q4_k::BLOCK_SIZE,
+                q4_k::BYTES_PER_BLOCK,
+            ),
             Self::IQ4_XS {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / iq4_xs::BLOCK_SIZE * iq4_xs::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                iq4_xs::BLOCK_SIZE,
+                iq4_xs::BYTES_PER_BLOCK,
+            ),
             Self::IQ4_NL {
                 out_features,
                 in_features,
                 ..
-            } => out_features * in_features / iq4_nl::BLOCK_SIZE * iq4_nl::BYTES_PER_BLOCK,
+            } => blocks(
+                out_features,
+                in_features,
+                iq4_nl::BLOCK_SIZE,
+                iq4_nl::BYTES_PER_BLOCK,
+            ),
             Self::Unsupported { .. } => 0,
         }
     }
