@@ -42,12 +42,11 @@ pub struct LayerWeights<'a> {
 
     // --- Routed experts ---------------------------------------------------
     /// IQ2_XXS, IQ4_K, or similar — dtype varies by model variant.
-    /// Stored as raw bytes until the quant kernels land (PRs 5–6).
-    pub ffn_gate_exps: &'a [u8],
+    pub ffn_gate_exps: WeightView<'a>,
     /// Same dtype as `ffn_gate_exps`.
-    pub ffn_up_exps: &'a [u8],
+    pub ffn_up_exps: WeightView<'a>,
     /// Q2_K, Q4_K, or similar.
-    pub ffn_down_exps: &'a [u8],
+    pub ffn_down_exps: WeightView<'a>,
 
     // --- Hash routing (layers 0–2 only) -----------------------------------
     pub ffn_gate_tid2eid: Option<&'a [i32]>,
@@ -117,13 +116,12 @@ impl<'a> LayerWeights<'a> {
             ffn_up_shexp: q8_0("ffn_up_shexp.weight")?,
             ffn_down_shexp: q8_0("ffn_down_shexp.weight")?,
 
-            // For the routed experts, the GGUF dtype can be IQ2_XXS, IQ4_K, Q2_K, Q4_K,
-            // etc. The WeightMap accessor will validate the actual dtype when these
-            // variants are added to WeightView. For now we store raw bytes and a
-            // typed view will be built once the quant kernels land (PRs 5–6).
-            ffn_gate_exps: map.tensor_bytes(&format!("{prefix}ffn_gate_exps.weight"))?,
-            ffn_up_exps: map.tensor_bytes(&format!("{prefix}ffn_up_exps.weight"))?,
-            ffn_down_exps: map.tensor_bytes(&format!("{prefix}ffn_down_exps.weight"))?,
+            // Routed experts: dtype varies by model variant (e.g. IQ2_XXS for gate/up
+            // and Q2_K for down in the 16B model). `quant_weight` auto-dispatches by
+            // the actual GGML type recorded in the GGUF tensor metadata.
+            ffn_gate_exps: map.quant_weight(&format!("{prefix}ffn_gate_exps.weight"))?,
+            ffn_up_exps: map.quant_weight(&format!("{prefix}ffn_up_exps.weight"))?,
+            ffn_down_exps: map.quant_weight(&format!("{prefix}ffn_down_exps.weight"))?,
 
             ffn_gate_tid2eid,
         })

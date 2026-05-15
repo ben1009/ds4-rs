@@ -7,3 +7,5 @@
 
 pub mod q8_0;
 pub mod q8_k;
+pub mod q2_k;
+pub mod iq2_xxs;
