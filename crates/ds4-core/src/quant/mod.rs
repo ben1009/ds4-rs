@@ -5,5 +5,7 @@
 //! IQ4_K / Q4_K routed-expert kernels are the next numerical blockers. F16
 //! weight matmul support lives in `ops::matmul`.
 
+pub mod iq2_xxs;
+pub mod q2_k;
 pub mod q8_0;
 pub mod q8_k;
