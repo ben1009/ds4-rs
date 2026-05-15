@@ -63,7 +63,7 @@ struct Args {
     max_tokens: u32,
 
     /// Context size
-    #[arg(long, default_value = "32768")]
+    #[arg(long, default_value = "2048")]
     ctx: u32,
 }
 
@@ -213,7 +213,7 @@ mod tests {
         assert_eq!(args.model.to_str().unwrap(), "./ds4flash.gguf");
         assert!(args.prompt.is_none());
         assert_eq!(args.max_tokens, 256);
-        assert_eq!(args.ctx, 32768);
+        assert_eq!(args.ctx, 2048);
     }
 
     #[test]
