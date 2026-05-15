@@ -20,6 +20,7 @@
 ## Workspace Layout
 
 ```
+dev                     # Task runner wrapper
 Cargo.toml              # Workspace root
 rust-toolchain          # Pinned nightly channel
 Makefile.toml           # cargo-make task definitions

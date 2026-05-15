@@ -45,7 +45,7 @@ ds4 --model ./ds4flash.gguf -p "Hello" -n 64 --ctx 8192
 | `--model` | `./ds4flash.gguf` | Path to the GGUF model file |
 | `-p, --prompt` | — | Prompt for one-shot generation |
 | `-n, --max-tokens` | `256` | Maximum tokens to generate |
-| `--ctx` | `32768` | Context size |
+| `--ctx` | `2048` | Context size (Phase 1 limit: 4096) |
 
 ### Test
 
