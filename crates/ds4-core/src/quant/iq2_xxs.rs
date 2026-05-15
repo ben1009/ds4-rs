@@ -333,8 +333,8 @@ static SIGNED_GRID: LazyLock<[[[i8; 8]; 128]; 256]> = LazyLock::new(|| {
 #[inline]
 fn read_qs_u16(block: &[u8; BYTES_PER_BLOCK]) -> [u16; 32] {
     let mut out = [0u16; 32];
-    for i in 0..32 {
-        out[i] = u16::from_le_bytes([block[offset::QS + i * 2], block[offset::QS + i * 2 + 1]]);
+    for (out_val, chunk) in out.iter_mut().zip(block[offset::QS..].chunks_exact(2)) {
+        *out_val = u16::from_le_bytes([chunk[0], chunk[1]]);
     }
     out
 }
@@ -418,9 +418,12 @@ pub fn dequant(bytes: &[u8], out: &mut [f32]) {
         "iq2_xxs::dequant: out len {} != {n_blocks} * {BLOCK_SIZE}",
         out.len(),
     );
-    for (i, chunk) in bytes.chunks_exact(BYTES_PER_BLOCK).enumerate() {
+    for (chunk, out_block) in bytes
+        .chunks_exact(BYTES_PER_BLOCK)
+        .zip(out.chunks_exact_mut(BLOCK_SIZE))
+    {
         let block: &[u8; BYTES_PER_BLOCK] = chunk.try_into().unwrap();
-        dequant_block(block, &mut out[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]);
+        dequant_block(block, out_block);
     }
 }
 
@@ -451,7 +454,7 @@ pub fn dot_iq2xxs_q8k_block(iq2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) 
     let signed_grid = &*SIGNED_GRID;
 
     let mut bsum = 0i32;
-    let mut q8_off = 0usize;
+    let mut q8_chunks = q8_qs.chunks_exact(16);
 
     for ib32 in 0..(BLOCK_SIZE / 32) {
         let aux0 = u32::from_le_bytes([
@@ -482,9 +485,8 @@ pub fn dot_iq2xxs_q8k_block(iq2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) 
             sumi += dot_iq2_pair_16(
                 &signed_grid[aux8[l]][sign0],
                 &signed_grid[aux8[l + 1]][sign1],
-                &q8_qs[q8_off..q8_off + 16],
+                q8_chunks.next().unwrap(),
             );
-            q8_off += 16;
         }
         bsum += sumi * ls;
     }
@@ -495,14 +497,17 @@ pub fn dot_iq2xxs_q8k_block(iq2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) 
 /// 16-wide dot product: two signed 8-element IQ2_XXS grids against 16 Q8_K qs.
 fn dot_iq2_pair_16(grid0: &[i8; 8], grid1: &[i8; 8], q8: &[u8]) -> i32 {
     debug_assert_eq!(q8.len(), 16);
-    let mut sum = 0i32;
-    for i in 0..8 {
-        sum += (grid0[i] as i32) * (q8[i] as i8 as i32);
-    }
-    for i in 0..8 {
-        sum += (grid1[i] as i32) * (q8[8 + i] as i8 as i32);
-    }
-    sum
+    let (q8_0, q8_1) = q8.split_at(8);
+    grid0
+        .iter()
+        .zip(q8_0)
+        .map(|(&g, &q)| (g as i32) * (q as i8 as i32))
+        .sum::<i32>()
+        + grid1
+            .iter()
+            .zip(q8_1)
+            .map(|(&g, &q)| (g as i32) * (q as i8 as i32))
+            .sum::<i32>()
 }
 
 #[cfg(test)]

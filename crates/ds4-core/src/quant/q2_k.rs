@@ -98,9 +98,12 @@ pub fn dequant(bytes: &[u8], out: &mut [f32]) {
         "q2_k::dequant: out len {} != {n_blocks} * {BLOCK_SIZE}",
         out.len(),
     );
-    for (i, chunk) in bytes.chunks_exact(BYTES_PER_BLOCK).enumerate() {
+    for (chunk, out_block) in bytes
+        .chunks_exact(BYTES_PER_BLOCK)
+        .zip(out.chunks_exact_mut(BLOCK_SIZE))
+    {
         let block: &[u8; BYTES_PER_BLOCK] = chunk.try_into().unwrap();
-        dequant_block(block, &mut out[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]);
+        dequant_block(block, out_block);
     }
 }
 
@@ -143,35 +146,22 @@ pub fn dot_q2k_q8k_block(q2_block: &[u8; BYTES_PER_BLOCK], q8_block: &[u8]) -> f
 
     let mut isum = 0i32;
     let mut is = 0usize;
-    let mut q2_off = 0usize;
-    let mut q8_off = 0usize;
+    let mut q8_chunks = q8_qs.chunks_exact(16);
 
-    for _ in 0..(BLOCK_SIZE / 128) {
+    for q2_chunk32 in q2_qs.chunks_exact(32) {
+        let (q2_c0, q2_c1) = q2_chunk32.split_at(16);
         let mut shift = 0u32;
         for _ in 0..4 {
             let d0 = (q2_scales[is] & 0x0F) as i32;
-            isum += d0
-                * dot_q2_16(
-                    &q2_qs[q2_off..q2_off + 16],
-                    &q8_qs[q8_off..q8_off + 16],
-                    shift,
-                );
+            isum += d0 * dot_q2_16(q2_c0, q8_chunks.next().unwrap(), shift);
             is += 1;
-            q8_off += 16;
 
             let d1 = (q2_scales[is] & 0x0F) as i32;
-            isum += d1
-                * dot_q2_16(
-                    &q2_qs[q2_off + 16..q2_off + 32],
-                    &q8_qs[q8_off..q8_off + 16],
-                    shift,
-                );
+            isum += d1 * dot_q2_16(q2_c1, q8_chunks.next().unwrap(), shift);
             is += 1;
-            q8_off += 16;
 
             shift += 2;
         }
-        q2_off += 32;
     }
 
     dall * isum as f32 - dmin * summs as f32

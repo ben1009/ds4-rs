@@ -418,9 +418,8 @@ fn matmul_row_q2_k(
     act: &[f32],
     out: &mut [f32],
 ) {
-    assert_eq!(
-        in_features % q2_k::BLOCK_SIZE,
-        0,
+    assert!(
+        in_features.is_multiple_of(q2_k::BLOCK_SIZE),
         "matmul_row_q2_k: in_features {in_features} not multiple of {}",
         q2_k::BLOCK_SIZE,
     );
@@ -440,12 +439,16 @@ fn matmul_row_q2_k(
     let mut q8_bytes = vec![0u8; blocks_per_row * q8_k::BYTES_PER_BLOCK];
     q8_k::quantize(act, &mut q8_bytes);
 
-    for n in 0..out_features {
-        let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
         let mut sum = 0.0f32;
-        for (block_idx, block) in wrow.chunks_exact(q2_k::BYTES_PER_BLOCK).enumerate() {
-            let q8_block = &q8_bytes
-                [block_idx * q8_k::BYTES_PER_BLOCK..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
+        for (block, q8_block) in wrow
+            .chunks_exact(q2_k::BYTES_PER_BLOCK)
+            .zip(q8_bytes.chunks_exact(q8_k::BYTES_PER_BLOCK))
+        {
             sum += q2_k::dot_q2k_q8k_block(block.try_into().unwrap(), q8_block);
         }
         out[n] = sum;
@@ -460,9 +463,8 @@ fn matmul_batch_q2_k(
     out: &mut [f32],
     m: usize,
 ) {
-    assert_eq!(
-        in_features % q2_k::BLOCK_SIZE,
-        0,
+    assert!(
+        in_features.is_multiple_of(q2_k::BLOCK_SIZE),
         "matmul_batch_q2_k: in_features {in_features} not multiple of {}",
         q2_k::BLOCK_SIZE,
     );
@@ -485,27 +487,22 @@ fn matmul_batch_q2_k(
 
     out.fill(0.0);
 
-    let mut act_row_off: Vec<usize> = Vec::with_capacity(m);
-    let mut out_row_off: Vec<usize> = Vec::with_capacity(m);
-    for row in 0..m {
-        act_row_off.push(
-            row.checked_mul(q8_row_bytes)
-                .expect("matmul_batch_q2_k: act row offset overflowed usize"),
-        );
-        out_row_off.push(
-            row.checked_mul(out_features)
-                .expect("matmul_batch_q2_k: out row offset overflowed usize"),
-        );
-    }
-
-    for n in 0..out_features {
-        let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
         for (block_idx, block) in wrow.chunks_exact(q2_k::BYTES_PER_BLOCK).enumerate() {
             let block_arr: &[u8; q2_k::BYTES_PER_BLOCK] = block.try_into().unwrap();
-            for row in 0..m {
-                let q8_block = &q8_bytes[act_row_off[row] + block_idx * q8_k::BYTES_PER_BLOCK
-                    ..act_row_off[row] + (block_idx + 1) * q8_k::BYTES_PER_BLOCK];
-                out[out_row_off[row] + n] += q2_k::dot_q2k_q8k_block(block_arr, q8_block);
+            let q8_block_offset = block_idx
+                .checked_mul(q8_k::BYTES_PER_BLOCK)
+                .expect("matmul_batch_q2_k: q8 block offset overflowed usize");
+            for (out_row, q8_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(q8_bytes.chunks_exact(q8_row_bytes))
+            {
+                let q8_block = &q8_row[q8_block_offset..q8_block_offset + q8_k::BYTES_PER_BLOCK];
+                out_row[n] += q2_k::dot_q2k_q8k_block(block_arr, q8_block);
             }
         }
     }
@@ -522,9 +519,8 @@ fn matmul_row_iq2_xxs(
     act: &[f32],
     out: &mut [f32],
 ) {
-    assert_eq!(
-        in_features % iq2_xxs::BLOCK_SIZE,
-        0,
+    assert!(
+        in_features.is_multiple_of(iq2_xxs::BLOCK_SIZE),
         "matmul_row_iq2_xxs: in_features {in_features} not multiple of {}",
         iq2_xxs::BLOCK_SIZE,
     );
@@ -543,12 +539,16 @@ fn matmul_row_iq2_xxs(
     let mut q8_bytes = vec![0u8; blocks_per_row * q8_k::BYTES_PER_BLOCK];
     q8_k::quantize(act, &mut q8_bytes);
 
-    for n in 0..out_features {
-        let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
         let mut sum = 0.0f32;
-        for (block_idx, block) in wrow.chunks_exact(iq2_xxs::BYTES_PER_BLOCK).enumerate() {
-            let q8_block = &q8_bytes
-                [block_idx * q8_k::BYTES_PER_BLOCK..(block_idx + 1) * q8_k::BYTES_PER_BLOCK];
+        for (block, q8_block) in wrow
+            .chunks_exact(iq2_xxs::BYTES_PER_BLOCK)
+            .zip(q8_bytes.chunks_exact(q8_k::BYTES_PER_BLOCK))
+        {
             sum += iq2_xxs::dot_iq2xxs_q8k_block(block.try_into().unwrap(), q8_block);
         }
         out[n] = sum;
@@ -563,9 +563,8 @@ fn matmul_batch_iq2_xxs(
     out: &mut [f32],
     m: usize,
 ) {
-    assert_eq!(
-        in_features % iq2_xxs::BLOCK_SIZE,
-        0,
+    assert!(
+        in_features.is_multiple_of(iq2_xxs::BLOCK_SIZE),
         "matmul_batch_iq2_xxs: in_features {in_features} not multiple of {}",
         iq2_xxs::BLOCK_SIZE,
     );
@@ -587,27 +586,22 @@ fn matmul_batch_iq2_xxs(
 
     out.fill(0.0);
 
-    let mut act_row_off: Vec<usize> = Vec::with_capacity(m);
-    let mut out_row_off: Vec<usize> = Vec::with_capacity(m);
-    for row in 0..m {
-        act_row_off.push(
-            row.checked_mul(q8_row_bytes)
-                .expect("matmul_batch_iq2_xxs: act row offset overflowed usize"),
-        );
-        out_row_off.push(
-            row.checked_mul(out_features)
-                .expect("matmul_batch_iq2_xxs: out row offset overflowed usize"),
-        );
-    }
-
-    for n in 0..out_features {
-        let wrow = &bytes[n * bytes_per_row..(n + 1) * bytes_per_row];
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
         for (block_idx, block) in wrow.chunks_exact(iq2_xxs::BYTES_PER_BLOCK).enumerate() {
             let block_arr: &[u8; iq2_xxs::BYTES_PER_BLOCK] = block.try_into().unwrap();
-            for row in 0..m {
-                let q8_block = &q8_bytes[act_row_off[row] + block_idx * q8_k::BYTES_PER_BLOCK
-                    ..act_row_off[row] + (block_idx + 1) * q8_k::BYTES_PER_BLOCK];
-                out[out_row_off[row] + n] += iq2_xxs::dot_iq2xxs_q8k_block(block_arr, q8_block);
+            let q8_block_offset = block_idx
+                .checked_mul(q8_k::BYTES_PER_BLOCK)
+                .expect("matmul_batch_iq2_xxs: q8 block offset overflowed usize");
+            for (out_row, q8_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(q8_bytes.chunks_exact(q8_row_bytes))
+            {
+                let q8_block = &q8_row[q8_block_offset..q8_block_offset + q8_k::BYTES_PER_BLOCK];
+                out_row[n] += iq2_xxs::dot_iq2xxs_q8k_block(block_arr, q8_block);
             }
         }
     }
