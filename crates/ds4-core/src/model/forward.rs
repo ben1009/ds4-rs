@@ -444,7 +444,7 @@ fn attention_rows(
         // k_pe is a *key*, not a value: it participates in scoring (above) but
         // not in the output weighted sum. The k_pe slice of `oh` stays zero —
         // the per-head MLA up-projection (which actually fills oh from V)
-        // is implemented.
+        // is pending.
         for (i, kv) in latent_window.chunks_exact(KV_LATENT_DIM).enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
