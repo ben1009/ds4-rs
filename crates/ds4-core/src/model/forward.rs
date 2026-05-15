@@ -5,8 +5,9 @@
 //! (no compressor/indexer), no FP8 KV round-trip.
 //!
 //! Missing pieces:
-//! * IQ2_XXS / Q2_K / Q4_K / IQ4_K quant types and matmul dispatch.
-//! * Routed expert MoE is stubbed out; only the shared expert runs.
+//! * Real per-head MLA K/V up-projection inside attention (the decode path currently scores against
+//!   the cached `[kv_latent || k_pe]` directly).
+//! * Learned output HC reduction (the head still stream-sums for now).
 
 use std::sync::Arc;
 
@@ -19,10 +20,11 @@ use crate::{
     model::{WeightMap, kv_cache::KvCache, layer::LayerWeights},
     ops::{
         hc::{hc_control_split, hc_from_plain_embedding, hc_post, hc_weighted_sum},
-        matmul::matmul_row,
+        matmul::{expert_subview, matmul_row},
         norm::{rms_norm, rms_norm_no_weight},
         rope::{apply_rope, apply_rope_inverse},
-        swiglu::swiglu,
+        softmax::sqrt_softplus,
+        swiglu::{silu, swiglu},
     },
     quant::q8_0,
     session::Session,
@@ -50,8 +52,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     }
 
     // --- Token embedding ---------------------------------------------------
+    let token = session.tokens()[pos];
     let mut plain = vec![0.0f32; config.n_embd as usize];
-    embed_token(model, session.tokens()[pos], &mut plain)?;
+    embed_token(model, token, &mut plain)?;
 
     // --- Copy embedding into HC streams ------------------------------------
     let n_hc = config.n_hc as usize;
@@ -92,8 +95,14 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
 
         // FFN sublayer.
         let mut ffn_out = vec![0.0f32; n_embd];
-        let (ffn_post, ffn_comb) =
-            layer_ffn_decode(&mut ffn_out, config, &layer, &after_attn_hc, il as usize)?;
+        let (ffn_post, ffn_comb) = layer_ffn_decode(
+            &mut ffn_out,
+            config,
+            &layer,
+            &after_attn_hc,
+            il as usize,
+            token,
+        )?;
 
         // HC post for FFN.
         hc_post(
@@ -505,9 +514,12 @@ fn layer_ffn_decode(
     layer: &LayerWeights<'_>,
     residual_hc: &[f32],
     il: usize,
+    token: u32,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
+    let n_expert = config.n_expert as usize;
+    let n_expert_used = config.n_expert_used as usize;
 
     // HC pre for FFN.
     let mut ffn_cur = vec![0.0f32; n_embd];
@@ -531,13 +543,18 @@ fn layer_ffn_decode(
     let mut shared_out = vec![0.0f32; n_embd];
     shared_expert_decode(layer, &ffn_norm, &mut shared_out)?;
 
-    // Router + routed experts (stubbed — needs IQ2_XXS / Q2_K).
+    // Routed experts.
     let mut moe_out = vec![0.0f32; n_embd];
-    if layer.ffn_gate_tid2eid.is_some() || il >= 3 {
-        // TODO: implement routed MoE once IQ2_XXS / Q2_K / Q4_K / IQ4_K
-        // quant types and matmul dispatch land (PRs 5–6).
-        // For now, routed expert contribution is zero.
-        moe_out.fill(0.0);
+    if n_expert > 0 && n_expert_used > 0 {
+        routed_moe_decode(
+            layer,
+            &ffn_norm,
+            &mut moe_out,
+            il,
+            token,
+            n_expert,
+            n_expert_used,
+        )?;
     }
 
     // Sum shared + routed.
@@ -549,7 +566,7 @@ fn layer_ffn_decode(
 }
 
 fn shared_expert_decode(layer: &LayerWeights<'_>, x: &[f32], out: &mut [f32]) -> Result<()> {
-    let hidden = 2048usize; // DS4_N_FF_EXP
+    let hidden = layer.ffn_gate_shexp.out_features();
 
     let mut gate = vec![0.0f32; hidden];
     let mut up = vec![0.0f32; hidden];
@@ -561,6 +578,164 @@ fn shared_expert_decode(layer: &LayerWeights<'_>, x: &[f32], out: &mut [f32]) ->
 
     matmul_row(layer.ffn_down_shexp, &mid, out);
     Ok(())
+}
+
+// =========================================================================
+// Routed MoE (decode)
+// =========================================================================
+//
+// Mirrors `layer_routed_moe_one` in antirez/ds4 ds4.c:
+//
+// 1. probs = sqrt(softplus(ffn_gate_inp @ x))    — F16 router matvec, per-elem
+// 2. selected[6]:
+//    * hash layers (`ffn_gate_tid2eid` present): selected[i] = tid2eid[token*6 + i]
+//    * top-k layers: selected = top-k indices of (probs + ffn_exp_probs_b) (bias only steers
+//      selection, not the per-expert weight)
+// 3. weight[i] = probs[selected[i]]              — unbiased sum = max(sum(weight), 2^-14) weight[i]
+//    = (weight[i] / sum) * 1.5         — DS4_EXPERT_WEIGHT_SCALE
+// 4. for each selected expert eid with weight w: gate = ffn_gate_exps[eid] @ x up   =
+//    ffn_up_exps[eid]   @ x clamp gate (positive side) and up (both sides) to ±10 mid  = silu(gate)
+//    * up * w out += ffn_down_exps[eid] @ mid
+
+const EXPERT_WEIGHT_SCALE: f32 = 1.5;
+/// Floor for `sum(unbiased_weights)` before division. Matches `2^-14` (the
+/// smallest normal f16) in the C reference; used to avoid divide-by-zero
+/// when the router output collapses.
+const EXPERT_WEIGHT_SUM_EPS: f32 = 1.0 / 16384.0;
+/// SwiGLU clamp magnitude for routed experts. Matches `DS4_SWIGLU_CLAMP_EXP`.
+const SWIGLU_CLAMP_EXP: f32 = 10.0;
+
+fn routed_moe_decode(
+    layer: &LayerWeights<'_>,
+    x: &[f32],
+    out: &mut [f32],
+    _il: usize,
+    token: u32,
+    n_expert: usize,
+    n_expert_used: usize,
+) -> Result<()> {
+    // Router logits → sqrt(softplus) per-element gating.
+    let mut probs = vec![0.0f32; n_expert];
+    matmul_row(layer.ffn_gate_inp, x, &mut probs);
+    for p in probs.iter_mut() {
+        *p = sqrt_softplus(*p);
+    }
+
+    let mut selected = vec![0usize; n_expert_used];
+    if let Some(table) = layer.ffn_gate_tid2eid {
+        // Hash routing — table is laid out [n_vocab, n_expert_used].
+        let row_off = (token as usize)
+            .checked_mul(n_expert_used)
+            .ok_or_else(|| anyhow::anyhow!("routed_moe: hash router token offset overflow"))?;
+        let row_end = row_off
+            .checked_add(n_expert_used)
+            .ok_or_else(|| anyhow::anyhow!("routed_moe: hash router row end overflow"))?;
+        let row = table.get(row_off..row_end).ok_or_else(|| {
+            anyhow::anyhow!(
+                "routed_moe: hash table out of range for token {token} (need {row_end}, have {})",
+                table.len(),
+            )
+        })?;
+        for (slot, &eid) in row.iter().enumerate() {
+            if eid < 0 || (eid as usize) >= n_expert {
+                bail!("routed_moe: tid2eid[{token},{slot}] = {eid} not in 0..{n_expert}");
+            }
+            selected[slot] = eid as usize;
+        }
+    } else {
+        // Biased top-k. Bias only shifts the *selection*; the per-expert
+        // weight still uses the unbiased prob.
+        let mut selection = probs.clone();
+        if let Some(bias) = layer.ffn_exp_probs_b {
+            for (s, &b) in selection.iter_mut().zip(bias.iter()) {
+                *s += b;
+            }
+        }
+        topk_indices_desc(&selection, n_expert_used, &mut selected);
+    }
+
+    // Per-expert weights from the unbiased probs.
+    let mut weights = vec![0.0f32; n_expert_used];
+    let mut sum = 0.0f32;
+    for (i, &eid) in selected.iter().enumerate() {
+        weights[i] = probs[eid];
+        sum += weights[i];
+    }
+    if sum < EXPERT_WEIGHT_SUM_EPS {
+        sum = EXPERT_WEIGHT_SUM_EPS;
+    }
+    let scale = EXPERT_WEIGHT_SCALE / sum;
+    for w in weights.iter_mut() {
+        *w *= scale;
+    }
+
+    // Accumulate each selected expert.
+    out.fill(0.0);
+    let mut down = vec![0.0f32; out.len()];
+    for (slot, &eid) in selected.iter().enumerate() {
+        run_routed_expert(layer, eid, n_expert, x, weights[slot], &mut down)?;
+        for (o, &d) in out.iter_mut().zip(down.iter()) {
+            *o += d;
+        }
+    }
+
+    Ok(())
+}
+
+fn run_routed_expert(
+    layer: &LayerWeights<'_>,
+    eid: usize,
+    n_expert: usize,
+    x: &[f32],
+    weight: f32,
+    out: &mut [f32],
+) -> Result<()> {
+    let gate_w = expert_subview(layer.ffn_gate_exps, eid, n_expert);
+    let up_w = expert_subview(layer.ffn_up_exps, eid, n_expert);
+    let down_w = expert_subview(layer.ffn_down_exps, eid, n_expert);
+
+    let hidden = gate_w.out_features();
+    let mut gate = vec![0.0f32; hidden];
+    let mut up = vec![0.0f32; hidden];
+    matmul_row(gate_w, x, &mut gate);
+    matmul_row(up_w, x, &mut up);
+
+    let mut mid = vec![0.0f32; hidden];
+    for i in 0..hidden {
+        let g = gate[i].min(SWIGLU_CLAMP_EXP);
+        let u = up[i].clamp(-SWIGLU_CLAMP_EXP, SWIGLU_CLAMP_EXP);
+        mid[i] = silu(g) * u * weight;
+    }
+
+    matmul_row(down_w, &mid, out);
+    Ok(())
+}
+
+/// Pick the indices of the top-`k` largest entries in `values`, in descending
+/// order of value, into `out`. Ties resolve toward the lower index. `k` is
+/// expected to be small (6 for DS4) so a linear scan per slot is cheaper than
+/// a heap.
+fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
+    let n = values.len();
+    debug_assert!(k <= n);
+    debug_assert_eq!(out.len(), k);
+    let mut taken = vec![false; n];
+    for slot in out.iter_mut().take(k) {
+        let mut best_i = usize::MAX;
+        let mut best_v = f32::NEG_INFINITY;
+        for i in 0..n {
+            if taken[i] {
+                continue;
+            }
+            if values[i] > best_v {
+                best_v = values[i];
+                best_i = i;
+            }
+        }
+        debug_assert!(best_i != usize::MAX, "topk_indices_desc: no candidate");
+        taken[best_i] = true;
+        *slot = best_i;
+    }
 }
 
 // =========================================================================
@@ -647,5 +822,81 @@ mod tests {
         let p = rms_scale(&[1.0, 2.0, 3.0], 1e-12);
         let n = rms_scale(&[-1.0, -2.0, -3.0], 1e-12);
         assert!((p - n).abs() < 1e-6);
+    }
+
+    // -----------------------------------------------------------------------
+    // Routed MoE helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn topk_returns_descending_indices() {
+        let v = [0.1f32, 0.9, 0.4, 0.7, 0.2, 0.8];
+        let mut out = [0usize; 3];
+        topk_indices_desc(&v, 3, &mut out);
+        // Descending order: 0.9 (idx 1), 0.8 (idx 5), 0.7 (idx 3).
+        assert_eq!(out, [1, 5, 3]);
+    }
+
+    #[test]
+    fn topk_breaks_ties_toward_lower_index() {
+        let v = [0.5f32, 0.5, 0.5, 0.5];
+        let mut out = [0usize; 2];
+        topk_indices_desc(&v, 2, &mut out);
+        // First scan picks index 0 (strict `>`), second picks index 1.
+        assert_eq!(out, [0, 1]);
+    }
+
+    #[test]
+    fn topk_full_length_is_full_sort() {
+        let v = [3.0f32, 1.0, 4.0, 1.5, 9.0, 2.0];
+        let mut out = [0usize; 6];
+        topk_indices_desc(&v, 6, &mut out);
+        // Sorted descending: 9 (4), 4 (2), 3 (0), 2 (5), 1.5 (3), 1 (1).
+        assert_eq!(out, [4, 2, 0, 5, 3, 1]);
+    }
+
+    #[test]
+    fn topk_handles_negative_values() {
+        let v = [-1.0f32, -3.0, -2.0, -0.5];
+        let mut out = [0usize; 2];
+        topk_indices_desc(&v, 2, &mut out);
+        // Largest is -0.5 (idx 3), then -1.0 (idx 0).
+        assert_eq!(out, [3, 0]);
+    }
+
+    #[test]
+    fn topk_k_one_returns_argmax() {
+        let v = [-5.0f32, 12.5, 3.3, 0.0];
+        let mut out = [0usize; 1];
+        topk_indices_desc(&v, 1, &mut out);
+        assert_eq!(out, [1]);
+    }
+
+    #[test]
+    fn expert_weight_scale_floor_protects_against_collapse() {
+        // Reproduces the C reference's `sum < 6.103515625e-5 -> sum = 6.103515625e-5`
+        // floor: when probs collapse to ~0 the floor caps the rescale factor.
+        let probs = [1e-8f32, 1e-8, 1e-8];
+        let mut sum: f32 = probs.iter().sum();
+        if sum < EXPERT_WEIGHT_SUM_EPS {
+            sum = EXPERT_WEIGHT_SUM_EPS;
+        }
+        let scale = EXPERT_WEIGHT_SCALE / sum;
+        // Without the floor, scale would be ~5e7 — way past the C reference's
+        // bounded ~24576. The floor caps it.
+        assert!(scale <= EXPERT_WEIGHT_SCALE / EXPERT_WEIGHT_SUM_EPS + 1e-3);
+    }
+
+    #[test]
+    fn expert_weights_sum_to_scale_when_probs_nondegenerate() {
+        // Pre-floor: sum(weights/sum) * scale == scale exactly.
+        let probs = [0.2f32, 0.5, 0.3];
+        let sum: f32 = probs.iter().sum();
+        let scaled: Vec<f32> = probs
+            .iter()
+            .map(|&p| p / sum * EXPERT_WEIGHT_SCALE)
+            .collect();
+        let total: f32 = scaled.iter().sum();
+        assert!((total - EXPERT_WEIGHT_SCALE).abs() < 1e-5);
     }
 }

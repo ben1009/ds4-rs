@@ -11,12 +11,15 @@ partial Phase 1 implementation:
 - Landed: `tensor.rs`, Q8_0 dequant + Q8_0/F16 matmul dispatch, RMSNorm,
   partial RoPE + YaRN, Q8_K activation pre-quantisation, softmax, SwiGLU,
   HC split/mix helpers, typed weight accessors, MLA latent KV cache, partial
-  decode forward orchestration, `Session::{prefill, eval_token}` wiring, and
+  decode forward orchestration, `Session::{prefill, eval_token}` wiring,
   the routed-expert quant kernels Q2_K, IQ2_XXS, Q4_K, IQ4_XS, and IQ4_NL
-  (matmul dispatch + Q8_K-activation dot products).
-- Still missing for credible logits: routed MoE assembly, real per-head MLA
-  K/V up-projection in attention, learned output HC reduction, and
-  end-to-end model smoke coverage.
+  (matmul dispatch + Q8_K-activation dot products), and routed MoE assembly
+  (F16 router → `sqrt(softplus)` gating → hash routing for layers 0–2 /
+  biased top-k for layers 3+ → SwiGLU-clamped per-expert MLP → 1.5×
+  rescale, summed with the shared expert).
+- Still missing for credible logits: real per-head MLA K/V up-projection in
+  attention, learned output HC reduction, and end-to-end model smoke
+  coverage.
 - Known Phase 1 limitation: the current decode path can exercise real forward
   code, but it is not numerically complete until the remaining stubs above are
   replaced.
@@ -309,7 +312,7 @@ PRs, so this list is now tracked as status, not literal future PR numbering.
 9. [~] **`model/kv_cache` + attention assembly (single layer, no compressor)**
    — KV cache and partial decode attention are implemented; real MLA K/V
    up-projection is still pending.
-10. [ ] **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
+10. [x] **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
     layer runs.
 11. [~] **`model/forward.rs` + CLI wiring** — session wiring exists and the
     CLI reaches it; logits are not numerically complete until the remaining

@@ -104,6 +104,209 @@ impl WeightView<'_> {
             | Self::Unsupported { in_features, .. } => *in_features,
         }
     }
+
+    /// Byte size of one expert's slice for a 3D routed-expert tensor.
+    ///
+    /// `out_features` and `in_features` are the per-expert dimensions
+    /// (the loader reads `dims[0]` and `dims[1]` and drops the expert axis
+    /// from `dims[2]`). The full tensor's bytes are an outer-stride
+    /// concatenation of `n_expert` per-expert blocks of this size.
+    fn per_expert_bytes(&self) -> usize {
+        match *self {
+            Self::Q8_0 {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / q8_0::BLOCK_SIZE * q8_0::BYTES_PER_BLOCK,
+            Self::F16 {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features * 2,
+            Self::Q2_K {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / q2_k::BLOCK_SIZE * q2_k::BYTES_PER_BLOCK,
+            Self::IQ2_XXS {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / iq2_xxs::BLOCK_SIZE * iq2_xxs::BYTES_PER_BLOCK,
+            Self::Q4_K {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / q4_k::BLOCK_SIZE * q4_k::BYTES_PER_BLOCK,
+            Self::IQ4_XS {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / iq4_xs::BLOCK_SIZE * iq4_xs::BYTES_PER_BLOCK,
+            Self::IQ4_NL {
+                out_features,
+                in_features,
+                ..
+            } => out_features * in_features / iq4_nl::BLOCK_SIZE * iq4_nl::BYTES_PER_BLOCK,
+            Self::Unsupported { .. } => 0,
+        }
+    }
+}
+
+/// Build a per-expert sub-view from a 3D routed-expert weight tensor.
+///
+/// The DS4 routed-expert tensors (`ffn_gate_exps`, `ffn_up_exps`,
+/// `ffn_down_exps`) are stored as `n_expert` contiguous matrices, each
+/// `[out_features, in_features]` in this codebase's convention. The per-expert
+/// byte stride is `out_features * in_features / block_size * bytes_per_block`
+/// (or `out_features * in_features * 2` for F16).
+///
+/// The returned view points at one expert's matrix and can be fed directly
+/// into [`matmul_row`] / [`matmul_batch`].
+///
+/// Panics if `expert_idx >= n_expert` or if the parent's byte length is not
+/// `n_expert * per_expert_bytes` (i.e. the tensor is not actually a 3D
+/// routed-expert pack).
+pub fn expert_subview(
+    parent: WeightView<'_>,
+    expert_idx: usize,
+    n_expert: usize,
+) -> WeightView<'_> {
+    assert!(
+        expert_idx < n_expert,
+        "expert_subview: expert_idx {expert_idx} >= n_expert {n_expert}",
+    );
+    let per_expert = parent.per_expert_bytes();
+    let total_expected = n_expert
+        .checked_mul(per_expert)
+        .expect("expert_subview: total byte budget overflowed usize");
+    let off = expert_idx
+        .checked_mul(per_expert)
+        .expect("expert_subview: expert offset overflowed usize");
+    match parent {
+        WeightView::Q8_0 {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview Q8_0: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::Q8_0 {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::F16 {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview F16: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::F16 {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::Q2_K {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview Q2_K: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::Q2_K {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::IQ2_XXS {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview IQ2_XXS: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::IQ2_XXS {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::Q4_K {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview Q4_K: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::Q4_K {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::IQ4_XS {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview IQ4_XS: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::IQ4_XS {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::IQ4_NL {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            assert_eq!(
+                bytes.len(),
+                total_expected,
+                "expert_subview IQ4_NL: bytes len {} != n_expert ({n_expert}) * per_expert ({per_expert})",
+                bytes.len(),
+            );
+            WeightView::IQ4_NL {
+                bytes: &bytes[off..off + per_expert],
+                out_features,
+                in_features,
+            }
+        }
+        WeightView::Unsupported { dtype_name, .. } => {
+            panic!("expert_subview: unsupported weight dtype {dtype_name}");
+        }
+    }
 }
 
 /// `out[n] = sum_k weight[n, k] * act[k]`
@@ -1894,5 +2097,61 @@ mod tests {
         let mut out = vec![123.0f32; n];
         matmul_row(w, &vec![0.0f32; k], &mut out);
         assert_eq!(out, vec![0.0f32; n]);
+    }
+
+    // -----------------------------------------------------------------------
+    // expert_subview
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expert_subview_q8_0_yields_distinct_per_expert_results() {
+        // Build 3 "experts": each a 1×32 Q8_0 matrix where every quant equals
+        // (eid + 1). Pulling out expert eid and dotting against [1; 32]
+        // should yield 32 * (eid + 1).
+        let n_expert = 3;
+        let n = 1;
+        let k = 32;
+        let mut bytes = Vec::new();
+        for eid in 0..n_expert {
+            let v = (eid as i8) + 1;
+            bytes.extend_from_slice(&block_scale_one([v; 32]));
+        }
+        let parent = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act = vec![1.0f32; k];
+        for eid in 0..n_expert {
+            let sub = expert_subview(parent, eid, n_expert);
+            let mut out = vec![0.0f32; n];
+            matmul_row(sub, &act, &mut out);
+            assert_eq!(out[0], 32.0 * (eid as f32 + 1.0));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "expert_idx")]
+    fn expert_subview_rejects_out_of_range_eid() {
+        let bytes = weight_constant_i8(1, 32, 1);
+        let parent = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 32,
+        };
+        let _ = expert_subview(parent, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "expert_subview Q8_0")]
+    fn expert_subview_rejects_byte_length_mismatch() {
+        // n_expert=2 but bytes only cover 1 expert.
+        let bytes = weight_constant_i8(1, 32, 1);
+        let parent = WeightView::Q8_0 {
+            bytes: &bytes,
+            out_features: 1,
+            in_features: 32,
+        };
+        let _ = expert_subview(parent, 0, 2);
     }
 }

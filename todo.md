@@ -9,7 +9,6 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 - `rfcs/0002-forward-pass.md` is partially implemented, but its status line is stale.
 - `Session::prefill` and `Session::eval_token` now call the forward path, but full numerical correctness is still blocked by the Phase 1 stubs below.
 - `model::forward` exists, but it still contains known Phase 1 stubs:
-  - routed expert MoE is disabled until I-quant / K-quant matmul support lands;
   - attention scores against the cached MLA latent directly instead of doing per-head MLA K/V up-projection;
   - output HC reduction sums streams instead of using learned output combine weights.
 
@@ -52,13 +51,20 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
      `WeightView::Unsupported` placeholders for routed Q4 experts are gone. In-module
      unit tests cover decoding and dot products; reference vectors carry over to item 9.
 
-5. [ ] Replace the routed MoE stub.
+5. [x] Replace the routed MoE stub.
    - Use `ffn_gate_inp` router logits.
    - Implement hash routing for layers 0-2 via `ffn_gate_tid2eid`.
    - Implement biased top-k routing for layers 3+.
    - Apply `sqrt(softplus(logit))` gating and routed expert accumulation.
    - Keep shared expert contribution intact.
    - Validate with focused router / expert tests and `cargo test --workspace`.
+   - Done: `routed_moe_decode` runs the F16 router, picks 6 experts via
+     `tid2eid` on hash layers or biased top-k (with optional
+     `exp_probs_b.bias`) on top-k layers, applies `sqrt(softplus)` gating with
+     the `1/16384` sum floor + 1.5× rescale, runs each routed expert through
+     SwiGLU with the ±10 clamp, and sums into the FFN output. New
+     `expert_subview` slices per-expert bytes from 3D routed-expert tensors.
+     Tests cover top-k, expert byte slicing, and the gating floor.
 
 6. [ ] Replace the attention MLA stub with real per-head K/V up-projection.
    - Cache only `kv_latent` and `k_pe`, as currently designed.

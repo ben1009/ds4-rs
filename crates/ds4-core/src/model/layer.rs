@@ -50,6 +50,11 @@ pub struct LayerWeights<'a> {
 
     // --- Hash routing (layers 0–2 only) -----------------------------------
     pub ffn_gate_tid2eid: Option<&'a [i32]>,
+
+    // --- Top-k routing (layers 3+ only) -----------------------------------
+    /// Per-expert bias added to router probs only for top-k *selection*.
+    /// The unbiased probs are still used for the per-expert weight.
+    pub ffn_exp_probs_b: Option<&'a [f32]>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -84,6 +89,15 @@ impl<'a> LayerWeights<'a> {
                 .checked_mul(map.config.n_vocab as usize)
                 .ok_or_else(|| anyhow::anyhow!("{tid2eid_name}: tid2eid size overflow"))?;
             Some(map.i32_1d(&tid2eid_name, expect_elems)?)
+        } else {
+            None
+        };
+
+        // Top-k bias is optional (only present for layers 3+, where the GGUF
+        // exporter writes it as `blk.{il}.exp_probs_b.bias`).
+        let probs_b_name = format!("{prefix}exp_probs_b.bias");
+        let ffn_exp_probs_b = if map.tensor_info(&probs_b_name).is_some() {
+            Some(map.f32_1d(&probs_b_name, map.config.n_expert as usize)?)
         } else {
             None
         };
@@ -124,6 +138,7 @@ impl<'a> LayerWeights<'a> {
             ffn_down_exps: map.quant_weight(&format!("{prefix}ffn_down_exps.weight"))?,
 
             ffn_gate_tid2eid,
+            ffn_exp_probs_b,
         })
     }
 }
