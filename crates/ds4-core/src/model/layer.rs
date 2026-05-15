@@ -83,9 +83,10 @@ impl<'a> LayerWeights<'a> {
         let f16 = |name: &str| map.f16(&format!("{prefix}{name}"));
 
         // Hash routing table is optional (only present for layers 0–2).
-        // Layout is `[n_expert_used, n_vocab]` (per-token row of expert
-        // ids), so the row stride here must match `n_expert_used` in the
-        // forward-pass indexer (`tid2eid[token * n_expert_used + slot]`).
+        // Layout is `[n_vocab, n_expert_used]` (per-token row of expert
+        // ids, with `n_expert_used` as the inner stride), so the row
+        // stride here must match the forward-pass indexer
+        // (`tid2eid[token * n_expert_used + slot]`).
         let tid2eid_name = format!("{prefix}ffn_gate_tid2eid.weight");
         let ffn_gate_tid2eid = if map.tensor_info(&tid2eid_name).is_some() {
             let n_expert_used = map.config.n_expert_used as usize;
