@@ -41,11 +41,11 @@ pub struct LayerWeights<'a> {
     pub ffn_down_shexp: WeightView<'a>,
 
     // --- Routed experts ---------------------------------------------------
-    /// IQ2_XXS, IQ4_K, or similar — dtype varies by model variant.
+    /// IQ2_XXS, IQ4_XS, or similar — dtype varies by model variant.
     pub ffn_gate_exps: WeightView<'a>,
     /// Same dtype as `ffn_gate_exps`.
     pub ffn_up_exps: WeightView<'a>,
-    /// Q2_K, Q4_K, or similar.
+    /// Q2_K, Q4_K, IQ4_NL, or similar.
     pub ffn_down_exps: WeightView<'a>,
 
     // --- Hash routing (layers 0–2 only) -----------------------------------

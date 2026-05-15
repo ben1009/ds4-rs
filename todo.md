@@ -33,18 +33,24 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 
 ## Forward Pass Correctness
 
-3. [ ] Implement `quant/iq2_xxs` and `quant/q2_k`.
+3. [x] Implement `quant/iq2_xxs` and `quant/q2_k`.
    - Port the block layout and dot-product behavior from the ggml / ds4 reference.
    - Add `WeightView` variants and matmul dispatch for Q8_K activation rows against IQ2_XXS and Q2_K weights.
    - Add unit tests for block decoding and dot products.
    - Add or regenerate committed vectors and update `tests/vectors/manifest.toml`.
    - Validate with `cargo test --workspace`.
+   - Done in `dedf3f8`: kernels, mixed-dtype dot products, `WeightView` variants, and matmul dispatch landed with in-module unit tests. Committed reference vectors / `manifest.toml` entries for IQ2_XXS and Q2_K are still outstanding -- rolled into item 9.
 
-4. [ ] Implement `quant/iq4_k` and `quant/q4_k`.
+4. [x] Implement `quant/iq4_k` and `quant/q4_k`.
    - Mirror the IQ2_XXS / Q2_K implementation pattern for the Q4 expert variants.
    - Extend matmul dispatch and typed weight handling.
    - Add reference-vector coverage.
    - Validate with `cargo test --workspace`.
+   - Done: Q4_K, IQ4_XS, and IQ4_NL kernels (dequant + Q8_K-activation dot product, plus a
+     direct f32 dot path for IQ4_NL's 32-element blocks) are wired through `WeightView`,
+     `quant_weight` auto-dispatch, and `matmul_row` / `matmul_batch`. The previous
+     `WeightView::Unsupported` placeholders for routed Q4 experts are gone. In-module
+     unit tests cover decoding and dot products; reference vectors carry over to item 9.
 
 5. [ ] Replace the routed MoE stub.
    - Use `ffn_gate_inp` router logits.
@@ -78,6 +84,9 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
    - Keep `scripts/regen_vectors.sh` as the source of truth for vector reproduction.
    - Add vectors alongside each op or block implementation, not as one large final batch.
    - Keep `crates/ds4-core/tests/vectors/manifest.toml` in sync.
+   - Backfill committed vectors for the routed-expert quants (IQ2_XXS, Q2_K, Q4_K,
+     IQ4_XS, IQ4_NL) carried over from items 3 and 4: block dequant + Q8_K-activation
+     (or f32-activation, for IQ4_NL) dot product reference vectors.
 
 10. [ ] Revisit Phase 2 only after Phase 1 logits are credible.
     - Session lifecycle operations: rewind, invalidate, and multi-turn flow.

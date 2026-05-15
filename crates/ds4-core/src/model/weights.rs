@@ -87,11 +87,53 @@ impl WeightMap {
         })
     }
 
+    /// Get a Q4_K weight matrix view.
+    pub fn q4_k(&self, name: &str) -> Result<WeightView<'_>> {
+        let info = self.tensor_info(name).with_context(|| name.to_string())?;
+        check_dtype(info, name, GgmlType::Q4_K)?;
+        let bytes = self.tensor_bytes(name)?;
+        let out_features = info.dims[0] as usize;
+        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        Ok(WeightView::Q4_K {
+            bytes,
+            out_features,
+            in_features,
+        })
+    }
+
+    /// Get an IQ4_XS weight matrix view.
+    pub fn iq4_xs(&self, name: &str) -> Result<WeightView<'_>> {
+        let info = self.tensor_info(name).with_context(|| name.to_string())?;
+        check_dtype(info, name, GgmlType::IQ4_XS)?;
+        let bytes = self.tensor_bytes(name)?;
+        let out_features = info.dims[0] as usize;
+        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        Ok(WeightView::IQ4_XS {
+            bytes,
+            out_features,
+            in_features,
+        })
+    }
+
+    /// Get an IQ4_NL weight matrix view.
+    pub fn iq4_nl(&self, name: &str) -> Result<WeightView<'_>> {
+        let info = self.tensor_info(name).with_context(|| name.to_string())?;
+        check_dtype(info, name, GgmlType::IQ4_NL)?;
+        let bytes = self.tensor_bytes(name)?;
+        let out_features = info.dims[0] as usize;
+        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        Ok(WeightView::IQ4_NL {
+            bytes,
+            out_features,
+            in_features,
+        })
+    }
+
     /// Get a quantized weight matrix view, auto-dispatching by the tensor's
     /// actual GGML dtype.
     ///
     /// This is useful for routed-expert tensors whose dtype may vary by model
-    /// variant (e.g. `IQ2_XXS` vs `IQ4_K` for gate/up, `Q2_K` vs `Q4_K` for
+    /// variant (e.g. `IQ2_XXS` vs `IQ4_XS` for gate/up, `Q2_K` vs `Q4_K` for
     /// down). Only types with a matching [`WeightView`] variant are supported;
     /// unsupported dtypes return an error.
     pub fn quant_weight(&self, name: &str) -> Result<WeightView<'_>> {
@@ -120,22 +162,18 @@ impl WeightMap {
                 out_features,
                 in_features,
             }),
-            // Routed-expert tensors also appear as IQ4_NL / IQ4_XS / Q4_K in
-            // some model variants. They are not yet wired to matmul kernels,
-            // but we must keep model loading working so LayerWeights::from_map
-            // does not fail before inference starts (routed MoE is still stubbed).
-            GgmlType::IQ4_NL => Ok(WeightView::Unsupported {
-                dtype_name: "IQ4_NL",
+            GgmlType::Q4_K => Ok(WeightView::Q4_K {
+                bytes,
                 out_features,
                 in_features,
             }),
-            GgmlType::IQ4_XS => Ok(WeightView::Unsupported {
-                dtype_name: "IQ4_XS",
+            GgmlType::IQ4_XS => Ok(WeightView::IQ4_XS {
+                bytes,
                 out_features,
                 in_features,
             }),
-            GgmlType::Q4_K => Ok(WeightView::Unsupported {
-                dtype_name: "Q4_K",
+            GgmlType::IQ4_NL => Ok(WeightView::IQ4_NL {
+                bytes,
                 out_features,
                 in_features,
             }),
