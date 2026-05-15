@@ -7,11 +7,10 @@
 //! * [`matmul_batch`] — `M` activation rows against the same weight, so each weight block is
 //!   dequant'd once per prompt in prefill rather than once per token.
 //!
-//! Implemented weight dtypes currently cover Q8_0 and F16. The routed-expert
-//! IQ2_XXS / Q2_K / IQ4_K / Q4_K paths will extend [`WeightView`] and the
-//! dispatch arm without changing the public matmul signatures.
+//! Implemented weight dtypes cover Q8_0, F16, Q2_K, IQ2_XXS, Q4_K, IQ4_XS,
+//! and IQ4_NL.
 
-use crate::quant::{iq2_xxs, q2_k, q8_0, q8_k};
+use crate::quant::{iq2_xxs, iq4_nl, iq4_xs, q2_k, q4_k, q8_0, q8_k};
 
 /// A weight matrix with shape `[out_features, in_features]` (row-major).
 ///
@@ -46,6 +45,30 @@ pub enum WeightView<'a> {
         out_features: usize,
         in_features: usize,
     },
+    /// Q4_K: `out_features × in_features / 256` blocks of 144 bytes each.
+    /// K-quant 4-bit weights with 6-bit super-block scales/mins; matmul
+    /// quantises activation to Q8_K first.
+    Q4_K {
+        bytes: &'a [u8],
+        out_features: usize,
+        in_features: usize,
+    },
+    /// IQ4_XS: `out_features × in_features / 256` blocks of 136 bytes each.
+    /// Importance-quant 4-bit weights with a 16-entry signed codebook; matmul
+    /// quantises activation to Q8_K first.
+    IQ4_XS {
+        bytes: &'a [u8],
+        out_features: usize,
+        in_features: usize,
+    },
+    /// IQ4_NL: `out_features × in_features / 32` blocks of 18 bytes each.
+    /// Importance-quant 4-bit weights with a 16-entry signed codebook; matmul
+    /// dots against f32 activations directly (no Q8_K pre-quantisation).
+    IQ4_NL {
+        bytes: &'a [u8],
+        out_features: usize,
+        in_features: usize,
+    },
     /// Placeholder for dtypes not yet supported by the matmul kernels.
     /// Model loading succeeds, but calling matmul on this variant panics.
     Unsupported {
@@ -62,6 +85,9 @@ impl WeightView<'_> {
             | Self::F16 { out_features, .. }
             | Self::Q2_K { out_features, .. }
             | Self::IQ2_XXS { out_features, .. }
+            | Self::Q4_K { out_features, .. }
+            | Self::IQ4_XS { out_features, .. }
+            | Self::IQ4_NL { out_features, .. }
             | Self::Unsupported { out_features, .. } => *out_features,
         }
     }
@@ -72,6 +98,9 @@ impl WeightView<'_> {
             | Self::F16 { in_features, .. }
             | Self::Q2_K { in_features, .. }
             | Self::IQ2_XXS { in_features, .. }
+            | Self::Q4_K { in_features, .. }
+            | Self::IQ4_XS { in_features, .. }
+            | Self::IQ4_NL { in_features, .. }
             | Self::Unsupported { in_features, .. } => *in_features,
         }
     }
@@ -123,6 +152,27 @@ pub fn matmul_row(weight: WeightView<'_>, act: &[f32], out: &mut [f32]) {
             in_features,
         } => {
             matmul_row_iq2_xxs(bytes, out_features, in_features, act, out);
+        }
+        WeightView::Q4_K {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_row_q4_k(bytes, out_features, in_features, act, out);
+        }
+        WeightView::IQ4_XS {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_row_iq4_xs(bytes, out_features, in_features, act, out);
+        }
+        WeightView::IQ4_NL {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_row_iq4_nl(bytes, out_features, in_features, act, out);
         }
         WeightView::Unsupported { dtype_name, .. } => {
             panic!("matmul_row: unsupported weight dtype {dtype_name}");
@@ -184,6 +234,27 @@ pub fn matmul_batch(weight: WeightView<'_>, acts: &[f32], out: &mut [f32], m: us
             in_features,
         } => {
             matmul_batch_iq2_xxs(bytes, out_features, in_features, acts, out, m);
+        }
+        WeightView::Q4_K {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_batch_q4_k(bytes, out_features, in_features, acts, out, m);
+        }
+        WeightView::IQ4_XS {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_batch_iq4_xs(bytes, out_features, in_features, acts, out, m);
+        }
+        WeightView::IQ4_NL {
+            bytes,
+            out_features,
+            in_features,
+        } => {
+            matmul_batch_iq4_nl(bytes, out_features, in_features, acts, out, m);
         }
         WeightView::Unsupported { dtype_name, .. } => {
             panic!("matmul_batch: unsupported weight dtype {dtype_name}");
@@ -617,6 +688,305 @@ fn matmul_batch_iq2_xxs(
             {
                 let q8_block = &q8_row[q8_block_offset..q8_block_offset + q8_k::BYTES_PER_BLOCK];
                 out_row[n] += iq2_xxs::dot_iq2xxs_q8k_block(block_arr, q8_block);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q4_K weight matmul
+// ---------------------------------------------------------------------------
+
+fn matmul_row_q4_k(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    act: &[f32],
+    out: &mut [f32],
+) {
+    assert!(
+        in_features.is_multiple_of(q4_k::BLOCK_SIZE),
+        "matmul_row_q4_k: in_features {in_features} not multiple of {}",
+        q4_k::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / q4_k::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * q4_k::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_row_q4_k: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_row_q4_k: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    let mut q8_bytes = vec![0u8; blocks_per_row * q8_k::BYTES_PER_BLOCK];
+    q8_k::quantize(act, &mut q8_bytes);
+
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        let mut sum = 0.0f32;
+        for (block, q8_block) in wrow
+            .chunks_exact(q4_k::BYTES_PER_BLOCK)
+            .zip(q8_bytes.chunks_exact(q8_k::BYTES_PER_BLOCK))
+        {
+            sum += q4_k::dot_q4k_q8k_block(block.try_into().unwrap(), q8_block);
+        }
+        out[n] = sum;
+    }
+}
+
+fn matmul_batch_q4_k(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    acts: &[f32],
+    out: &mut [f32],
+    m: usize,
+) {
+    assert!(
+        in_features.is_multiple_of(q4_k::BLOCK_SIZE),
+        "matmul_batch_q4_k: in_features {in_features} not multiple of {}",
+        q4_k::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / q4_k::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * q4_k::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_batch_q4_k: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_batch_q4_k: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    let q8_row_bytes = blocks_per_row * q8_k::BYTES_PER_BLOCK;
+    let mut q8_bytes = vec![0u8; m * q8_row_bytes];
+    q8_k::quantize(acts, &mut q8_bytes);
+
+    out.fill(0.0);
+
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        for (block_idx, block) in wrow.chunks_exact(q4_k::BYTES_PER_BLOCK).enumerate() {
+            let block_arr: &[u8; q4_k::BYTES_PER_BLOCK] = block.try_into().unwrap();
+            let q8_block_offset = block_idx
+                .checked_mul(q8_k::BYTES_PER_BLOCK)
+                .expect("matmul_batch_q4_k: q8 block offset overflowed usize");
+            for (out_row, q8_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(q8_bytes.chunks_exact(q8_row_bytes))
+            {
+                let q8_block = &q8_row[q8_block_offset..q8_block_offset + q8_k::BYTES_PER_BLOCK];
+                out_row[n] += q4_k::dot_q4k_q8k_block(block_arr, q8_block);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IQ4_XS weight matmul
+// ---------------------------------------------------------------------------
+
+fn matmul_row_iq4_xs(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    act: &[f32],
+    out: &mut [f32],
+) {
+    assert!(
+        in_features.is_multiple_of(iq4_xs::BLOCK_SIZE),
+        "matmul_row_iq4_xs: in_features {in_features} not multiple of {}",
+        iq4_xs::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / iq4_xs::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * iq4_xs::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_row_iq4_xs: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_row_iq4_xs: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    let mut q8_bytes = vec![0u8; blocks_per_row * q8_k::BYTES_PER_BLOCK];
+    q8_k::quantize(act, &mut q8_bytes);
+
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        let mut sum = 0.0f32;
+        for (block, q8_block) in wrow
+            .chunks_exact(iq4_xs::BYTES_PER_BLOCK)
+            .zip(q8_bytes.chunks_exact(q8_k::BYTES_PER_BLOCK))
+        {
+            sum += iq4_xs::dot_iq4xs_q8k_block(block.try_into().unwrap(), q8_block);
+        }
+        out[n] = sum;
+    }
+}
+
+fn matmul_batch_iq4_xs(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    acts: &[f32],
+    out: &mut [f32],
+    m: usize,
+) {
+    assert!(
+        in_features.is_multiple_of(iq4_xs::BLOCK_SIZE),
+        "matmul_batch_iq4_xs: in_features {in_features} not multiple of {}",
+        iq4_xs::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / iq4_xs::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * iq4_xs::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_batch_iq4_xs: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_batch_iq4_xs: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    let q8_row_bytes = blocks_per_row * q8_k::BYTES_PER_BLOCK;
+    let mut q8_bytes = vec![0u8; m * q8_row_bytes];
+    q8_k::quantize(acts, &mut q8_bytes);
+
+    out.fill(0.0);
+
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        for (block_idx, block) in wrow.chunks_exact(iq4_xs::BYTES_PER_BLOCK).enumerate() {
+            let block_arr: &[u8; iq4_xs::BYTES_PER_BLOCK] = block.try_into().unwrap();
+            let q8_block_offset = block_idx
+                .checked_mul(q8_k::BYTES_PER_BLOCK)
+                .expect("matmul_batch_iq4_xs: q8 block offset overflowed usize");
+            for (out_row, q8_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(q8_bytes.chunks_exact(q8_row_bytes))
+            {
+                let q8_block = &q8_row[q8_block_offset..q8_block_offset + q8_k::BYTES_PER_BLOCK];
+                out_row[n] += iq4_xs::dot_iq4xs_q8k_block(block_arr, q8_block);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// IQ4_NL weight matmul (32-element blocks, f32 activations)
+// ---------------------------------------------------------------------------
+
+fn matmul_row_iq4_nl(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    act: &[f32],
+    out: &mut [f32],
+) {
+    assert!(
+        in_features.is_multiple_of(iq4_nl::BLOCK_SIZE),
+        "matmul_row_iq4_nl: in_features {in_features} not multiple of {}",
+        iq4_nl::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / iq4_nl::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * iq4_nl::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_row_iq4_nl: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_row_iq4_nl: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        let mut sum = 0.0f32;
+        for (block, act_chunk) in wrow
+            .chunks_exact(iq4_nl::BYTES_PER_BLOCK)
+            .zip(act.chunks_exact(iq4_nl::BLOCK_SIZE))
+        {
+            sum += iq4_nl::dot_iq4nl_f32_block(
+                block.try_into().unwrap(),
+                act_chunk.try_into().unwrap(),
+            );
+        }
+        out[n] = sum;
+    }
+}
+
+fn matmul_batch_iq4_nl(
+    bytes: &[u8],
+    out_features: usize,
+    in_features: usize,
+    acts: &[f32],
+    out: &mut [f32],
+    _m: usize,
+) {
+    assert!(
+        in_features.is_multiple_of(iq4_nl::BLOCK_SIZE),
+        "matmul_batch_iq4_nl: in_features {in_features} not multiple of {}",
+        iq4_nl::BLOCK_SIZE,
+    );
+    let blocks_per_row = in_features / iq4_nl::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row * iq4_nl::BYTES_PER_BLOCK;
+    let expected_bytes = out_features
+        .checked_mul(bytes_per_row)
+        .expect("matmul_batch_iq4_nl: bytes budget overflowed usize");
+    assert_eq!(
+        bytes.len(),
+        expected_bytes,
+        "matmul_batch_iq4_nl: bytes len {} != {out_features} * {bytes_per_row}",
+        bytes.len(),
+    );
+
+    out.fill(0.0);
+
+    // Dequantise each weight block once into a 32-wide f32 buffer, then sweep
+    // the M activation rows against it. Mirrors the Q8_0 batch shape so each
+    // block's f16 scale + 16 codebook lookups are paid once per call.
+    let mut deq = [0.0f32; iq4_nl::BLOCK_SIZE];
+    for (n, wrow) in bytes
+        .chunks_exact(bytes_per_row)
+        .enumerate()
+        .take(out_features)
+    {
+        for (block_idx, block) in wrow.chunks_exact(iq4_nl::BYTES_PER_BLOCK).enumerate() {
+            iq4_nl::dequant_block(block.try_into().unwrap(), &mut deq);
+            let col_start = block_idx * iq4_nl::BLOCK_SIZE;
+            for (out_row, act_row) in out
+                .chunks_exact_mut(out_features)
+                .zip(acts.chunks_exact(in_features))
+            {
+                let act_chunk = &act_row[col_start..col_start + iq4_nl::BLOCK_SIZE];
+                let mut acc = 0.0f32;
+                for i in 0..iq4_nl::BLOCK_SIZE {
+                    acc += deq[i] * act_chunk[i];
+                }
+                out_row[n] += acc;
             }
         }
     }
@@ -1260,6 +1630,269 @@ mod tests {
         };
         let mut out = vec![123.0f32; n];
         matmul_row(w, &[0.0f32; 256], &mut out);
+        assert_eq!(out, vec![0.0f32; n]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Q4_K integration tests
+    // -----------------------------------------------------------------------
+
+    /// Q4_K bytes where every weight = 1.0 across all 8 sub-blocks.
+    fn weight_constant_q4_k_one(n: usize, k: usize) -> Vec<u8> {
+        use crate::quant::q4_k;
+        assert_eq!(k % q4_k::BLOCK_SIZE, 0);
+        let blocks_per_row = k / q4_k::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(n * blocks_per_row * q4_k::BYTES_PER_BLOCK);
+        for _ in 0..n {
+            for _ in 0..blocks_per_row {
+                let mut block = [0u8; q4_k::BYTES_PER_BLOCK];
+                // d=1.0
+                block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                // scales: encode (sc=1, m=0) for every sub-block.
+                // (See dequant_block_unit_scale_no_min in q4_k.rs.)
+                for s in &mut block[q4_k::offset::SCALES..q4_k::offset::SCALES + 4] {
+                    *s = 0x01;
+                }
+                for s in &mut block[q4_k::offset::SCALES + 8..q4_k::offset::SCALES + 12] {
+                    *s = 0x01;
+                }
+                // qs all 0x11 -> low and high nibbles = 1
+                for q in &mut block[q4_k::offset::QS..q4_k::offset::QS + 128] {
+                    *q = 0x11;
+                }
+                bytes.extend_from_slice(&block);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_row_q4_k_basic() {
+        let n = 2;
+        let k = 256;
+        let bytes = weight_constant_q4_k_one(n, k);
+        let w = WeightView::Q4_K {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act: Vec<f32> = (0..k).map(|i| (i % 4) as f32).collect();
+        // sum = 64 * (0+1+2+3) = 384 per row
+        let mut out = vec![0.0f32; n];
+        matmul_row(w, &act, &mut out);
+        assert!((out[0] - 384.0).abs() < 0.5);
+        assert!((out[1] - 384.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn matmul_batch_q4_k_matches_row_by_row() {
+        let n = 2;
+        let k = 256;
+        let bytes = weight_constant_q4_k_one(n, k);
+        let w = WeightView::Q4_K {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let m = 3;
+        let acts: Vec<f32> = (0..(m * k)).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut ref_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            let mut r = vec![0.0f32; n];
+            matmul_row(w, &acts[row * k..(row + 1) * k], &mut r);
+            ref_out[row * n..(row + 1) * n].copy_from_slice(&r);
+        }
+
+        let mut batch_out = vec![0.0f32; m * n];
+        matmul_batch(w, &acts, &mut batch_out, m);
+
+        assert_eq!(batch_out, ref_out);
+    }
+
+    #[test]
+    fn matmul_row_q4_k_zero_act_yields_zero() {
+        let n = 3;
+        let k = 256;
+        let bytes = weight_constant_q4_k_one(n, k);
+        let w = WeightView::Q4_K {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let mut out = vec![123.0f32; n];
+        matmul_row(w, &[0.0f32; 256], &mut out);
+        assert_eq!(out, vec![0.0f32; n]);
+    }
+
+    // -----------------------------------------------------------------------
+    // IQ4_XS integration tests
+    // -----------------------------------------------------------------------
+
+    /// IQ4_XS bytes where every weight = -127.0 (codebook[0] with signed scale 1).
+    fn weight_constant_iq4_xs_neg127(n: usize, k: usize) -> Vec<u8> {
+        use crate::quant::iq4_xs;
+        assert_eq!(k % iq4_xs::BLOCK_SIZE, 0);
+        let blocks_per_row = k / iq4_xs::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(n * blocks_per_row * iq4_xs::BYTES_PER_BLOCK);
+        for _ in 0..n {
+            for _ in 0..blocks_per_row {
+                let mut block = [0u8; iq4_xs::BYTES_PER_BLOCK];
+                // d=1.0
+                block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                // scales_h = 0xAAAA (every sub-block raw scale high2 = 0b10),
+                // scales_l = 0x11 each (low4 = 1) -> raw = 0x21 = 33 -> signed = 1.
+                block[2..4].copy_from_slice(&0xAAAAu16.to_le_bytes());
+                for s in &mut block[iq4_xs::offset::SCALES_L..iq4_xs::offset::SCALES_L + 4] {
+                    *s = 0x11;
+                }
+                // qs all zero -> codebook[0] = -127 in every position
+                bytes.extend_from_slice(&block);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_row_iq4_xs_basic() {
+        let n = 2;
+        let k = 256;
+        let bytes = weight_constant_iq4_xs_neg127(n, k);
+        let w = WeightView::IQ4_XS {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act = vec![1.0f32; k];
+        // Each weight = -127, so dot = -127 * 256 = -32512.
+        let mut out = vec![0.0f32; n];
+        matmul_row(w, &act, &mut out);
+        // Q8_K quantises act=[1; 256] losslessly only for the max-abs element;
+        // the others round to -127/128. Tolerance proportional to that step.
+        for &v in &out {
+            assert!((v - -32512.0).abs() < 32512.0 / 128.0 + 1.0, "{v}");
+        }
+    }
+
+    #[test]
+    fn matmul_batch_iq4_xs_matches_row_by_row() {
+        let n = 2;
+        let k = 256;
+        let bytes = weight_constant_iq4_xs_neg127(n, k);
+        let w = WeightView::IQ4_XS {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let m = 3;
+        let acts: Vec<f32> = (0..(m * k)).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut ref_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            let mut r = vec![0.0f32; n];
+            matmul_row(w, &acts[row * k..(row + 1) * k], &mut r);
+            ref_out[row * n..(row + 1) * n].copy_from_slice(&r);
+        }
+
+        let mut batch_out = vec![0.0f32; m * n];
+        matmul_batch(w, &acts, &mut batch_out, m);
+
+        assert_eq!(batch_out, ref_out);
+    }
+
+    #[test]
+    fn matmul_row_iq4_xs_zero_act_yields_zero() {
+        let n = 3;
+        let k = 256;
+        let bytes = weight_constant_iq4_xs_neg127(n, k);
+        let w = WeightView::IQ4_XS {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let mut out = vec![123.0f32; n];
+        matmul_row(w, &[0.0f32; 256], &mut out);
+        assert_eq!(out, vec![0.0f32; n]);
+    }
+
+    // -----------------------------------------------------------------------
+    // IQ4_NL integration tests
+    // -----------------------------------------------------------------------
+
+    /// IQ4_NL bytes where every weight = -127.0 (codebook[0] with d=1.0).
+    fn weight_constant_iq4_nl_neg127(n: usize, k: usize) -> Vec<u8> {
+        use crate::quant::iq4_nl;
+        assert_eq!(k % iq4_nl::BLOCK_SIZE, 0);
+        let blocks_per_row = k / iq4_nl::BLOCK_SIZE;
+        let mut bytes = Vec::with_capacity(n * blocks_per_row * iq4_nl::BYTES_PER_BLOCK);
+        for _ in 0..n {
+            for _ in 0..blocks_per_row {
+                let mut block = [0u8; iq4_nl::BYTES_PER_BLOCK];
+                block[0..2].copy_from_slice(&0x3C00u16.to_le_bytes()); // d = 1.0
+                // qs all zero -> all codebook indices = 0 = -127
+                bytes.extend_from_slice(&block);
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn matmul_row_iq4_nl_basic() {
+        let n = 2;
+        let k = 64;
+        let bytes = weight_constant_iq4_nl_neg127(n, k);
+        let w = WeightView::IQ4_NL {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let act = vec![1.0f32; k];
+        // Each weight = -127, dot = -127 * 64 = -8128.
+        let mut out = vec![0.0f32; n];
+        matmul_row(w, &act, &mut out);
+        for &v in &out {
+            assert_eq!(v, -8128.0);
+        }
+    }
+
+    #[test]
+    fn matmul_batch_iq4_nl_matches_row_by_row() {
+        let n = 3;
+        let k = 64;
+        let bytes = weight_constant_iq4_nl_neg127(n, k);
+        let w = WeightView::IQ4_NL {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let m = 4;
+        let acts: Vec<f32> = (0..(m * k)).map(|i| ((i % 5) as f32) - 2.0).collect();
+
+        let mut ref_out = vec![0.0f32; m * n];
+        for row in 0..m {
+            let mut r = vec![0.0f32; n];
+            matmul_row(w, &acts[row * k..(row + 1) * k], &mut r);
+            ref_out[row * n..(row + 1) * n].copy_from_slice(&r);
+        }
+
+        let mut batch_out = vec![0.0f32; m * n];
+        matmul_batch(w, &acts, &mut batch_out, m);
+
+        assert_eq!(batch_out, ref_out);
+    }
+
+    #[test]
+    fn matmul_row_iq4_nl_zero_act_yields_zero() {
+        let n = 3;
+        let k = 64;
+        let bytes = weight_constant_iq4_nl_neg127(n, k);
+        let w = WeightView::IQ4_NL {
+            bytes: &bytes,
+            out_features: n,
+            in_features: k,
+        };
+        let mut out = vec![123.0f32; n];
+        matmul_row(w, &vec![0.0f32; k], &mut out);
         assert_eq!(out, vec![0.0f32; n]);
     }
 }

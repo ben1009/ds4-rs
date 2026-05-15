@@ -11,10 +11,12 @@ partial Phase 1 implementation:
 - Landed: `tensor.rs`, Q8_0 dequant + Q8_0/F16 matmul dispatch, RMSNorm,
   partial RoPE + YaRN, Q8_K activation pre-quantisation, softmax, SwiGLU,
   HC split/mix helpers, typed weight accessors, MLA latent KV cache, partial
-  decode forward orchestration, and `Session::{prefill, eval_token}` wiring.
-- Still missing for credible logits: IQ2_XXS/Q2_K/Q4_K/IQ4_K routed-expert
-  kernels, routed MoE assembly, real per-head MLA K/V up-projection in
-  attention, learned output HC reduction, and end-to-end model smoke coverage.
+  decode forward orchestration, `Session::{prefill, eval_token}` wiring, and
+  the routed-expert quant kernels Q2_K, IQ2_XXS, Q4_K, IQ4_XS, and IQ4_NL
+  (matmul dispatch + Q8_K-activation dot products).
+- Still missing for credible logits: routed MoE assembly, real per-head MLA
+  K/V up-projection in attention, learned output HC reduction, and
+  end-to-end model smoke coverage.
 - Known Phase 1 limitation: the current decode path can exercise real forward
   code, but it is not numerically complete until the remaining stubs above are
   replaced.
@@ -34,7 +36,7 @@ unblock greedy generation via `ds4 -p "..."`.
   router gating, biased-top-k selection.
 - HC (hyper-connection) split/mix using 20 Sinkhorn iterations.
 - Dequantisation for the weight dtypes actually used: F16, Q8_0, Q2_K, Q4_K,
-  IQ2_XXS, IQ4_K. (One dequant path per dtype, no shortcuts.)
+  IQ2_XXS, IQ4_XS, IQ4_NL. (One dequant path per dtype, no shortcuts.)
 - In-memory MLA latent KV cache (512-dim latent + 64-dim decoupled RoPE key
   per token, per layer). Up-projection happens inside the attention kernel.
   No on-disk cache (that's Phase 2), no FP8 round-trip on KV writes yet
@@ -195,15 +197,16 @@ The hot matmuls are *quantised×f32*, not f32×f32:
 |------|--------------|-------|
 | attn Q/KV/out projections | Q8_0 | 5 per layer × 43 layers |
 | MoE shared gate/up/down | Q8_0 | 3 per layer |
-| MoE routed gate/up | IQ2_XXS or IQ4_K | 2 × 6 per layer (top-k=6) |
-| MoE routed down | Q2_K or Q4_K | 1 × 6 per layer |
+| MoE routed gate/up | IQ2_XXS / IQ4_XS / IQ4_NL | 2 × 6 per layer (top-k=6) |
+| MoE routed down | Q2_K / Q4_K | 1 × 6 per layer |
 | HC / router / compressor gates | F16 | ~4 per layer |
 | Output head | Q8_0 | 1 |
 
 A pre-built f32×f32 kernel like `matrixmultiply::sgemm` only helps sites
 where *both* inputs are already f32 — and there are essentially none. All
 the heavy sites need either a block-wise dequant dot product (Q8_0) or an
-activation pre-quantisation to Q8_K (for IQ2_XXS / Q2_K / IQ4_K / Q4_K),
+activation pre-quantisation to Q8_K (for IQ2_XXS / Q2_K / Q4_K / IQ4_XS) or a
+direct f32 dot (IQ4_NL),
 then a block-wise mixed dot product — the same pattern as ggml's
 `ggml_vec_dot_*` kernels.
 
@@ -260,7 +263,7 @@ Per-PR vector ownership (maps to the commit roadmap in §5):
 | 3 (RoPE) | Rotated Q for a single head at positions 0, 1, 127. |
 | 4 (Q8_K pre-quant) | `ds4_quantize_row_q8_K` output for a 256-wide row. |
 | 5 (IQ2_XXS / Q2_K) | One full dot-product of a Q8_K row against an IQ2_XXS and a Q2_K block. |
-| 6 (Q4_K / IQ4_K) | Same shape as (5) for the Q4 variants. |
+| 6 (Q4_K / IQ4_XS / IQ4_NL) | Same shape as (5) for the Q4 variants. |
 | 7 (softmax / SwiGLU / HC Sinkhorn) | 20-iter Sinkhorn on a 4×4 matrix; `sqrt(softplus(x))` for 8 values. |
 | 9 (attention block) | Full layer-0 attention output on a 4-token prefill. |
 | 10 (MoE block) | Router probs + expert outputs for layer 3 on a single token. |
