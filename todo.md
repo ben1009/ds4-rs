@@ -24,11 +24,12 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
    - Validate with `cargo test --workspace`.
    - Done: session now calls `forward_decode`, rejects context overflow before mutation, and rolls token state back when forward fails.
 
-2. [ ] Update RFC / plan status after session wiring.
+2. [x] Update RFC / plan status after session wiring.
    - Change RFC 0002 status from "Draft -- design review only, no code yet" to an implementation-progress status.
    - Mark already-landed roadmap items clearly.
    - Keep the known stubs explicit so they do not look like completed forward-pass behavior.
    - Validate with a documentation grep for stale "no code yet" / obsolete PR numbering.
+   - Done: RFC 0002, `PLAN.md`, and stale code comments now describe the partial implementation state.
 
 ## Forward Pass Correctness
 
@@ -40,7 +41,7 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
    - Validate with `cargo test --workspace`.
 
 4. [ ] Implement `quant/iq4_k` and `quant/q4_k`.
-   - Mirror the PR #5 pattern for the Q4 expert variants.
+   - Mirror the IQ2_XXS / Q2_K implementation pattern for the Q4 expert variants.
    - Extend matmul dispatch and typed weight handling.
    - Add reference-vector coverage.
    - Validate with `cargo test --workspace`.

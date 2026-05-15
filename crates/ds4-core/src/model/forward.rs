@@ -4,7 +4,7 @@
 //! forward pass: single-threaded, f32 activations, sliding-window attention
 //! (no compressor/indexer), no FP8 KV round-trip.
 //!
-//! Missing pieces (PRs 5–6):
+//! Missing pieces:
 //! * IQ2_XXS / Q2_K / Q4_K / IQ4_K quant types and matmul dispatch.
 //! * Routed expert MoE is stubbed out; only the shared expert runs.
 
@@ -206,7 +206,7 @@ fn layer_attention_decode(
     // a single DS4_N_HEAD_DIM = 512 wide row, split into:
     //   * KV_LATENT_DIM = 448 — non-positional ("nope") slice, RMSNorm'd and cached
     //   * K_PE_DIM      =  64 — decoupled RoPE key, RoPE'd and cached separately
-    // The MLA up-projection of the latent into per-head K/V lands in PR #5;
+    // The MLA up-projection of the latent into per-head K/V is still pending;
     // Phase 1 caches both pieces with the canonical dims so the cache asserts
     // don't fire and downstream attention can read the correct shape.
     use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
@@ -390,7 +390,7 @@ fn attention_rows(
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
     let window_len = end_pos - start_pos;
 
-    // Phase 1 stub: until the per-head MLA up-projection lands (PR #5),
+    // Phase 1 stub: until the per-head MLA up-projection lands,
     // we score against the concatenated MLA cache row [kv_latent || k_pe]
     // (448 + 64 = 512 = head_dim). This keeps the full qh dot product
     // covered and folds the decoupled RoPE key into attention so positional
@@ -444,7 +444,7 @@ fn attention_rows(
         // k_pe is a *key*, not a value: it participates in scoring (above) but
         // not in the output weighted sum. The k_pe slice of `oh` stays zero —
         // the per-head MLA up-projection (which actually fills oh from V)
-        // lands with PR #5.
+        // is pending.
         for (i, kv) in latent_window.chunks_exact(KV_LATENT_DIM).enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;

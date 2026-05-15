@@ -1,12 +1,28 @@
 # Design: Forward Pass (Phase 1 Step 2)
 
-Status: **Draft — design review only, no code yet.**
+Status: **Accepted — partial implementation in progress.**
 Replaces the schematic paragraph in `PLAN.md §Step 4`.
+
+## 0. Implementation status
+
+This RFC started as a design-only document. The repository now contains a
+partial Phase 1 implementation:
+
+- Landed: `tensor.rs`, Q8_0 dequant + Q8_0/F16 matmul dispatch, RMSNorm,
+  partial RoPE + YaRN, Q8_K activation pre-quantisation, softmax, SwiGLU,
+  HC split/mix helpers, typed weight accessors, MLA latent KV cache, partial
+  decode forward orchestration, and `Session::{prefill, eval_token}` wiring.
+- Still missing for credible logits: IQ2_XXS/Q2_K/Q4_K/IQ4_K routed-expert
+  kernels, routed MoE assembly, real per-head MLA K/V up-projection in
+  attention, learned output HC reduction, and end-to-end model smoke coverage.
+- Known Phase 1 limitation: the current decode path can exercise real forward
+  code, but it is not numerically complete until the remaining stubs above are
+  replaced.
 
 ## 1. Scope
 
-Implement enough of the DeepSeek V4 Flash forward pass to make the existing
-`Session::prefill` / `Session::eval_token` stubs produce *real* logits and
+Implement enough of the DeepSeek V4 Flash forward pass for
+`Session::prefill` / `Session::eval_token` to produce *real* logits and
 unblock greedy generation via `ds4 -p "..."`.
 
 **In scope (this phase):**
@@ -51,10 +67,10 @@ All new code under `crates/ds4-core/src/`.
 | Module | Responsibility |
 |--------|---------------|
 | `tensor.rs` | Minimal `Tensor<'a>` — borrowed `&[f32]` view with shape + strides, plus safe indexing helpers (`offset(&[i, j, ...])`, `row(i)`, `view_2d`). No autograd, no broadcasting framework. Owned `OwnedTensor` for scratch buffers. |
-| `quant/mod.rs` | Dequant entry point: `dequant(dtype, bytes, out: &mut [f32])`. |
-| `quant/q8_0.rs` | Q8_0 block (34 B/32 elem) → f32. |
-| `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_k.rs` | K-quant and I-quant paths. Each is a direct port of the ggml reference with a test vector per block format. |
-| `quant/q8_k.rs` | f32 → Q8_K (activation pre-quant for IQ2_XXS/Q2_K matmuls). |
+| `quant/mod.rs` | Quant module registry. |
+| `quant/q8_0.rs` | Q8_0 block (34 B/32 elem) → f32. Implemented. |
+| `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_k.rs` | K-quant and I-quant paths. Not implemented yet; next numerical blocker. |
+| `quant/q8_k.rs` | f32 → Q8_K activation pre-quant for routed-expert matmuls. Implemented. |
 | `ops/matmul.rs` | Two signatures sharing dot kernels (§3.8): `matmul_row(weight: WeightView, act: &[f32], out: &mut [f32])` for decode; `matmul_batch(weight: WeightView, acts: &[f32], out: &mut [f32], m: usize)` for prefill. Dispatches to per-dtype dot kernels. Hand-rolled block loops, no external BLAS. |
 | `ops/norm.rs` | `rms_norm(x, weight, eps, out)` and `rms_norm_no_weight` used by HC pre/post and output head. |
 | `ops/rope.rs` | Partial RoPE on the last 64 dims of each 512-dim head, with YaRN scale. Two frequency bases: 10000 (attention) and 160000 (compressor — unused in Phase 1). |
@@ -106,6 +122,8 @@ Phase 1 defers that machinery to Phase 2.
 What Phase 1 *does* implement per layer:
 
 1. Q, K, V from the MLA path (compressed KV latent up-projected per head).
+   Current implementation note: the decode path temporarily scores against
+   `[kv_latent || k_pe]` directly until the real per-head up-projection lands.
 2. Partial RoPE on the last 64 dims of each head; inverse RoPE on the
    attention output before the grouped output projection.
 3. **Sliding-window mask: attend only to positions in
@@ -250,12 +268,10 @@ Per-PR vector ownership (maps to the commit roadmap in §5):
 
 Dumping these from antirez/ds4 needs a small patch that disables FP8 KV
 rounding (so our tolerances stay at `1e-4`) and writes each intermediate
-to a `.bin`. The patch + script land in `scripts/regen_vectors.sh` as part
-of **PR #1** — same PR that produces the first vectors. This is a hard
-prerequisite: without the script, PR #1's vector isn't reproducible and
-later PRs can't land their vectors either. The script is run manually, not
-in CI, but CI *does* check that the committed vectors still match on every
-PR by comparing their SHA against a manifest.
+to a `.bin`. The patch + script live in `scripts/regen_vectors.sh` and are
+treated as a hard prerequisite for reproducible vectors. The script is run
+manually, not in CI, but CI *does* check that the committed vectors still
+match on every PR by comparing their SHA against a manifest.
 
 ### 4.3 End-to-end smoke test
 
@@ -265,33 +281,37 @@ must be deterministic.
 
 ## 5. Commit roadmap
 
-Each bullet = one PR. Ordered for incremental landability.
+Each bullet is an implementation slice. The original review plan used one PR
+per slice; the current repository has landed several slices across existing
+PRs, so this list is now tracked as status, not literal future PR numbering.
 
-1. **`tensor.rs` + `quant/q8_0` + `ops/matmul` (f32×Q8_0 dot kernel) +
+1. [x] **`tensor.rs` + `quant/q8_0` + `ops/matmul` (f32×Q8_0 dot kernel) +
    `scripts/regen_vectors.sh`** — foundational Tensor type lands first so
    subsequent ops build on it. Smallest useful slice: Q8_0 block dequant
    test + a `dot_q8_0_f32` unit test on a known vector. Ships the
    vector-regeneration harness (C-side patch that disables FP8 KV + a
    driver that dumps each op's intermediate) so every later PR can produce
    its own reference vector deterministically.
-2. **`ops/rms_norm`** — unblocks the norm sites.
-3. **`ops/rope` (partial + YaRN)** — isolated, tested with a hand-computed
+2. [x] **`ops/rms_norm`** — unblocks the norm sites.
+3. [x] **`ops/rope` (partial + YaRN)** — isolated, tested with a hand-computed
    rotation.
-4. **`quant/q8_k` + Q8_K activation pre-quant path** — needed before the
+4. [x] **`quant/q8_k` + Q8_K activation pre-quant path** — needed before the
    I-quant matmuls.
-5. **`quant/iq2_xxs` + `quant/q2_k`** — one PR, pair up because expert
+5. [ ] **`quant/iq2_xxs` + `quant/q2_k`** — pair up because expert
    gate/up and down share a block stride.
-6. **`quant/q4_k` + `quant/iq4_k`** — Q4 variant of (5).
-7. **`ops/softmax` + `ops/swiglu` + `ops/hc` (Sinkhorn)** — glue ops.
-8. **`model/weights.rs` typed accessors** — tightens the existing
+6. [ ] **`quant/q4_k` + `quant/iq4_k`** — Q4 variant of (5).
+7. [x] **`ops/softmax` + `ops/swiglu` + `ops/hc` (Sinkhorn)** — glue ops.
+8. [x] **`model/weights.rs` typed accessors** — tightens the existing
    `tensor_bytes` API.
-9. **`model/kv_cache` + attention assembly (single layer, no compressor)**
-   — now we have a working attention block.
-10. **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
+9. [~] **`model/kv_cache` + attention assembly (single layer, no compressor)**
+   — KV cache and partial decode attention are implemented; real MLA K/V
+   up-projection is still pending.
+10. [ ] **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
     layer runs.
-11. **`model/forward.rs` + CLI wiring** — `ds4 -p` produces real logits;
-    lands the final end-to-end reference vector.
-12. **End-to-end smoke test + PLAN.md update.**
+11. [~] **`model/forward.rs` + CLI wiring** — session wiring exists and the
+    CLI reaches it; logits are not numerically complete until the remaining
+    Phase 1 stubs are replaced.
+12. [ ] **End-to-end smoke test + PLAN.md update.**
 
 Roughly 12 PRs. The early ones are small (200–400 lines); the MoE and
 attention ones are larger (600–800). Each one builds and passes
@@ -310,7 +330,7 @@ attention ones are larger (600–800). Each one builds and passes
   run. That patch lives in `scripts/regen_vectors.sh`, not in CI.
 - **Hash-layer routing (layers 0–2).** Requires loading `ffn_gate_tid2eid`
   (I32, 6 × n_vocab = 3 MB). Confirm the tensor exists in the GGUF we
-  target before starting PR #10.
+  target before implementing routed MoE.
 - **Memory at high ctx_size.** MLA latent caching brings the default
   2048-token KV to ~200 MiB and 4096 tokens to ~400 MiB (§3.5) —
   manageable on a dev box. Anything past 4096 errors out until Phase 2
@@ -326,8 +346,9 @@ attention ones are larger (600–800). Each one builds and passes
   numerically correct. Logged as TODOs in the Phase 3 section of `PLAN.md`,
   not plumbed into Phase 1 scope.
 
-## 7. What this PR contains
+## 7. Current repository state
 
-This PR is design only — it adds this `rfcs/0002-forward-pass.md` file and
-nothing else. Approval means "the plan is sound, start implementing".
-Actual code lands in the 12 PRs above, each reviewed independently.
+This RFC is no longer design-only. It remains the Phase 1 reference design,
+but `todo.md` is the current backlog source for the next implementation move.
+When a slice lands, update both this status section and `todo.md` so code,
+tests, and planning docs do not drift.
