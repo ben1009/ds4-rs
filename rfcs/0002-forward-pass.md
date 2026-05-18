@@ -1,16 +1,16 @@
 # Design: Forward Pass (Phase 1 Step 2)
 
-Status: **Accepted — partial implementation in progress.**
+Status: **Accepted — Phase 1 implementation complete; pending real-model smoke validation.**
 Replaces the schematic paragraph in `PLAN.md §Step 4`.
 
 ## 0. Implementation status
 
-This RFC started as a design-only document. The repository now contains a
-partial Phase 1 implementation:
+This RFC started as a design-only document. The Phase 1 forward pass is
+now numerically complete:
 
 - Landed: `tensor.rs`, Q8_0 dequant + Q8_0/F16 matmul dispatch, RMSNorm,
   partial RoPE + YaRN, Q8_K activation pre-quantisation, softmax, SwiGLU,
-  HC split/mix helpers, typed weight accessors, MLA latent KV cache, partial
+  HC split/mix helpers, typed weight accessors, MLA latent KV cache, full
   decode forward orchestration, `Session::{prefill, eval_token}` wiring,
   the routed-expert quant kernels Q2_K, IQ2_XXS, Q4_K, IQ4_XS, and IQ4_NL
   (matmul dispatch + Q8_K-activation dot products), routed MoE assembly
@@ -22,10 +22,14 @@ partial Phase 1 implementation:
   the learned output HC reduction (`rms_norm_no_weight` → F16
   `output_hc_fn` matvec → per-stream `sigmoid_stable + 1e-6` →
   `hc_weighted_sum`).
-- Still missing for credible logits: end-to-end model smoke coverage.
-- Known Phase 1 limitation: the current decode path can exercise real forward
-  code, but it is not numerically complete until the remaining stubs above are
-  replaced.
+- Session lifecycle ops (`Session::rewind`, `Session::invalidate`) and an
+  interactive CLI REPL ship in PRs #28 and #29.
+- An end-to-end smoke harness (`crates/ds4-core/tests/forward_smoke.rs`,
+  gated on `DS4_TEST_MODEL`) exercises tokenizer → prefill → eval_token →
+  argmax against a real DS4 GGUF.
+- Still pending: running that smoke harness against a real DS4 GGUF and
+  recording the result. Phase 2 (raw KV ring, compressor / indexer,
+  on-disk KVC) gates on credible logits from that run.
 
 ## 1. Scope
 
@@ -77,7 +81,7 @@ All new code under `crates/ds4-core/src/`.
 | `tensor.rs` | Minimal `Tensor<'a>` — borrowed `&[f32]` view with shape + strides, plus safe indexing helpers (`offset(&[i, j, ...])`, `row(i)`, `view_2d`). No autograd, no broadcasting framework. Owned `OwnedTensor` for scratch buffers. |
 | `quant/mod.rs` | Quant module registry. |
 | `quant/q8_0.rs` | Q8_0 block (34 B/32 elem) → f32. Implemented. |
-| `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_k.rs` | K-quant and I-quant paths. Not implemented yet; next numerical blocker. |
+| `quant/q2_k.rs` / `q4_k.rs` / `iq2_xxs.rs` / `iq4_xs.rs` / `iq4_nl.rs` | K-quant and I-quant routed-expert paths. All implemented (block dequant + Q8_K-activation dot product, plus a direct f32 dot for IQ4_NL's 32-element blocks). |
 | `quant/q8_k.rs` | f32 → Q8_K activation pre-quant for routed-expert matmuls. Implemented. |
 | `ops/matmul.rs` | Two signatures sharing dot kernels (§3.8): `matmul_row(weight: WeightView, act: &[f32], out: &mut [f32])` for decode; `matmul_batch(weight: WeightView, acts: &[f32], out: &mut [f32], m: usize)` for prefill. Dispatches to per-dtype dot kernels. Hand-rolled block loops, no external BLAS. |
 | `ops/norm.rs` | `rms_norm(x, weight, eps, out)` and `rms_norm_no_weight` used by HC pre/post and output head. |
@@ -292,9 +296,20 @@ match on every PR by comparing their SHA against a manifest.
 
 ### 4.3 End-to-end smoke test
 
-`ds4 -p "hello" -n 16` against a tiny test GGUF (if one exists upstream),
-or against the full model behind `#[ignore]` + an env var. Greedy output
-must be deterministic.
+`crates/ds4-core/tests/forward_smoke.rs` — `#[ignore]`d, gated on the
+`DS4_TEST_MODEL` env var (path to a real DS4 GGUF). Exercises tokenizer →
+prefill → eval_token → argmax. Asserts forward-pass *health* (logits are
+finite, in-range, and the decode step's logits diverge from prefill's),
+not text quality, so it is robust to the Phase 1 limitations called out
+in §3.4 and §6 (sliding-window-only context, no compressor / indexer, no
+FP8 KV round-trip). Run it with:
+
+```text
+DS4_TEST_MODEL=/path/to/ds4flash.gguf \
+    cargo test -p ds4-core --test forward_smoke -- --ignored --nocapture
+```
+
+The CLI binary (`ds4 -p "hello" -n 16`) reaches the same code path.
 
 ## 5. Commit roadmap
 
@@ -314,9 +329,10 @@ PRs, so this list is now tracked as status, not literal future PR numbering.
    rotation.
 4. [x] **`quant/q8_k` + Q8_K activation pre-quant path** — needed before the
    I-quant matmuls.
-5. [ ] **`quant/iq2_xxs` + `quant/q2_k`** — pair up because expert
+5. [x] **`quant/iq2_xxs` + `quant/q2_k`** — pair up because expert
    gate/up and down share a block stride.
-6. [ ] **`quant/q4_k` + `quant/iq4_k`** — Q4 variant of (5).
+6. [x] **`quant/q4_k` + `quant/iq4_xs` + `quant/iq4_nl`** — Q4 variant of (5). Landed as
+   Q4_K + IQ4_XS + IQ4_NL.
 7. [x] **`ops/softmax` + `ops/swiglu` + `ops/hc` (Sinkhorn)** — glue ops.
 8. [x] **`model/weights.rs` typed accessors** — tightens the existing
    `tensor_bytes` API.
@@ -326,10 +342,13 @@ PRs, so this list is now tracked as status, not literal future PR numbering.
    DS4 MLA). The Phase 2 compressor / indexer is still out of scope.
 10. [x] **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
     layer runs.
-11. [~] **`model/forward.rs` + CLI wiring** — session wiring exists and the
-    CLI reaches it; logits are not numerically complete until the remaining
-    Phase 1 stubs are replaced.
-12. [ ] **End-to-end smoke test + PLAN.md update.**
+11. [x] **`model/forward.rs` + CLI wiring** — session and CLI reach the full
+    forward graph; routed MoE, real attention, and learned output HC
+    reduction are all in place. Numerical credibility against a real model
+    is gated on item 12.
+12. [~] **End-to-end smoke test + PLAN.md update.** Smoke harness lives at
+    `crates/ds4-core/tests/forward_smoke.rs` (gated on `DS4_TEST_MODEL`).
+    Running it against a real DS4 GGUF is still pending.
 
 Roughly 12 PRs. The early ones are small (200–400 lines); the MoE and
 attention ones are larger (600–800). Each one builds and passes
