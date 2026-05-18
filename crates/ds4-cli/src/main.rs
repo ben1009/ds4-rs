@@ -1,4 +1,7 @@
-use std::{io::Write, path::PathBuf};
+use std::{
+    io::{BufRead, Write},
+    path::PathBuf,
+};
 
 use anyhow::Result;
 use clap::Parser;
@@ -80,39 +83,206 @@ fn main() -> Result<()> {
     let engine = Engine::open(&args.model)?;
 
     match args.prompt {
-        Some(prompt) => {
-            let mut session = Session::new(engine.clone(), args.ctx)?;
-            let tokens = engine.tokenizer.encode(&prompt, true);
-            tracing::info!("Prompt: {} tokens", tokens.len());
-
-            let stdout = std::io::stdout();
-            let mut handle = stdout.lock();
-            let eos = engine.tokenizer.eos_token();
-
-            let logits = session.prefill(&tokens)?;
-            let mut token = Session::argmax(logits)
-                .ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
-            let mut pending: Vec<u8> = Vec::new();
-
-            for _ in 0..args.max_tokens {
-                if token == eos {
-                    break;
-                }
-                engine.tokenizer.append_token_bytes(token, &mut pending);
-                write_utf8(&mut handle, &mut pending, false)?;
-                handle.flush()?;
-                let logits = session.eval_token(token)?;
-                token = Session::argmax(logits)
-                    .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
-            }
-            write_utf8(&mut handle, &mut pending, true)?;
-            writeln!(handle)?;
-        }
-        None => {
-            println!("Interactive mode not yet implemented. Use -p for one-shot generation.");
-        }
+        Some(prompt) => one_shot(&engine, &prompt, args.max_tokens, args.ctx)?,
+        None => repl(&engine, args.max_tokens, args.ctx)?,
     }
 
+    Ok(())
+}
+
+fn one_shot(
+    engine: &std::sync::Arc<Engine>,
+    prompt: &str,
+    max_tokens: u32,
+    ctx: u32,
+) -> Result<()> {
+    let mut session = Session::new(engine.clone(), ctx)?;
+    let tokens = engine.tokenizer.encode(prompt, true);
+    tracing::info!("Prompt: {} tokens", tokens.len());
+
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    generate_turn(engine, &mut session, &tokens, max_tokens, &mut handle)
+}
+
+/// One parsed line of REPL input.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    /// Generate a response for the user-supplied prompt text.
+    Prompt(String),
+    /// Discard the entire session (`/reset` or `/clear`).
+    Reset,
+    /// Rewind to position `n` (`/rewind <n>`).
+    Rewind(u32),
+    /// Show context size and current position (`/ctx`).
+    ShowCtx,
+    /// Print the help text (`/help`).
+    Help,
+    /// Leave the REPL (`/exit` or `/quit`).
+    Exit,
+    /// Empty input — skip silently.
+    Empty,
+    /// Unknown slash command (`/foo bar` → message echoed back to user).
+    Unknown(String),
+}
+
+/// Parse one line of REPL input. Slash commands are recognised case-
+/// insensitively; everything else falls through as a prompt.
+///
+/// Whitespace handling:
+/// * The trailing newline (`\n` / `\r`) is stripped from any line.
+/// * For *commands* we additionally trim leading whitespace so `  /help` still works.
+/// * For *prompts* we keep all interior and surrounding whitespace (apart from the line terminator)
+///   so indented code, alignment, or trailing spaces survive — matching what `-p` does in one-shot
+///   mode, and what the user actually typed.
+///
+/// No-argument commands reject any trailing junk and route to
+/// [`Command::Unknown`] so a typo like `/reset later` cannot silently
+/// destroy session state.
+fn parse_command(line: &str) -> Command {
+    let stripped = line.trim_end_matches(['\n', '\r']);
+    if stripped.trim().is_empty() {
+        return Command::Empty;
+    }
+    let cmd_view = stripped.trim_start();
+    if let Some(rest) = cmd_view.strip_prefix('/') {
+        let mut parts = rest.splitn(2, char::is_whitespace);
+        let head = parts.next().unwrap_or("").to_ascii_lowercase();
+        let arg = parts.next().unwrap_or("").trim();
+        let no_args = |c: Command| -> Command {
+            if arg.is_empty() {
+                c
+            } else {
+                Command::Unknown(format!("/{head} does not take arguments"))
+            }
+        };
+        return match head.as_str() {
+            "reset" | "clear" => no_args(Command::Reset),
+            "rewind" => match arg.parse::<u32>() {
+                Ok(n) => Command::Rewind(n),
+                Err(_) => {
+                    Command::Unknown(format!("/rewind needs a non-negative integer, got {arg:?}"))
+                }
+            },
+            "ctx" => no_args(Command::ShowCtx),
+            "help" | "?" => no_args(Command::Help),
+            "exit" | "quit" => no_args(Command::Exit),
+            other => Command::Unknown(format!("unknown command /{other}")),
+        };
+    }
+    Command::Prompt(stripped.to_string())
+}
+
+const REPL_HELP: &str = "\
+Commands:
+  /reset            discard the entire session (alias: /clear)
+  /rewind <n>       rewind to position n (drops tokens past it)
+  /ctx              show ctx_size and current position
+  /help             this help (alias: /?)
+  /exit             leave the REPL (alias: /quit)
+Anything else is treated as a prompt.";
+
+fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()> {
+    let mut session = Session::new(engine.clone(), ctx)?;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    let mut input = stdin.lock();
+    let mut line = String::new();
+
+    writeln!(out, "ds4 REPL — /help for commands, /exit to leave.")?;
+    out.flush()?;
+
+    loop {
+        write!(out, "> ")?;
+        out.flush()?;
+        line.clear();
+        let n = input.read_line(&mut line)?;
+        if n == 0 {
+            // EOF (Ctrl-D).
+            writeln!(out)?;
+            return Ok(());
+        }
+
+        match parse_command(&line) {
+            Command::Empty => continue,
+            Command::Exit => return Ok(()),
+            Command::Help => {
+                writeln!(out, "{REPL_HELP}")?;
+            }
+            Command::ShowCtx => {
+                writeln!(
+                    out,
+                    "ctx_size={}  pos={}  tokens={}",
+                    session.ctx_size(),
+                    session.pos(),
+                    session.tokens().len()
+                )?;
+            }
+            Command::Reset => {
+                session.invalidate();
+                writeln!(out, "session reset.")?;
+            }
+            Command::Rewind(n) => {
+                let before = session.pos();
+                session.rewind(n);
+                writeln!(out, "rewound from pos {} to pos {}", before, session.pos())?;
+            }
+            Command::Unknown(msg) => {
+                writeln!(out, "error: {msg} — try /help")?;
+            }
+            Command::Prompt(text) => {
+                // Only prepend BOS for the very first prefill of the session;
+                // multi-turn input is appended without another BOS.
+                let add_bos = session.tokens().is_empty();
+                let tokens = engine.tokenizer.encode(&text, add_bos);
+                if let Err(err) = generate_turn(engine, &mut session, &tokens, max_tokens, &mut out)
+                {
+                    writeln!(out, "error: {err}")?;
+                }
+            }
+        }
+        out.flush()?;
+    }
+}
+
+/// Run one turn against an already-encoded prompt: prefill, then generate up
+/// to `max_tokens` tokens, streaming UTF-8 output. Empty input is a no-op.
+///
+/// Errors leave session state intact: `Session::prefill` and `eval_token`
+/// already roll their own state back on forward failures, so the REPL can
+/// continue with the previous turn's tokens / KV intact. No extra snapshot
+/// is needed at this layer.
+fn generate_turn<W: Write>(
+    engine: &Engine,
+    session: &mut Session,
+    tokens: &[u32],
+    max_tokens: u32,
+    out: &mut W,
+) -> Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+
+    let logits = session.prefill(tokens)?;
+    let mut token =
+        Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
+    let eos = engine.tokenizer.eos_token();
+    let mut pending: Vec<u8> = Vec::new();
+
+    for _ in 0..max_tokens {
+        if token == eos {
+            break;
+        }
+        engine.tokenizer.append_token_bytes(token, &mut pending);
+        write_utf8(out, &mut pending, false)?;
+        out.flush()?;
+        let logits = session.eval_token(token)?;
+        token = Session::argmax(logits)
+            .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
+    }
+    write_utf8(out, &mut pending, true)?;
+    writeln!(out)?;
     Ok(())
 }
 
@@ -267,5 +437,134 @@ mod tests {
     #[test]
     fn args_rejects_invalid_max_tokens() {
         assert!(Args::try_parse_from(["ds4", "-n", "not-a-number"]).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // REPL command parser
+    //
+    // The slash-command surface stays small, but it is the only place in
+    // the CLI that interprets user input — easy to break without tests.
+    // -----------------------------------------------------------------------
+
+    use super::{Command, parse_command};
+
+    #[test]
+    fn parse_empty_line_is_empty() {
+        assert_eq!(parse_command(""), Command::Empty);
+        assert_eq!(parse_command("   \t\n"), Command::Empty);
+    }
+
+    #[test]
+    fn parse_plain_text_is_prompt() {
+        assert_eq!(
+            parse_command("hello world"),
+            Command::Prompt("hello world".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_strips_only_line_terminator_from_prompt() {
+        // Preserve interior + surrounding whitespace so prompts like
+        // indented code or alignment-sensitive text reach the model
+        // unchanged. Only the trailing CR/LF is dropped.
+        assert_eq!(
+            parse_command("   hi\n"),
+            Command::Prompt("   hi".to_string())
+        );
+        assert_eq!(
+            parse_command("foo bar  \r\n"),
+            Command::Prompt("foo bar  ".to_string())
+        );
+        assert_eq!(
+            parse_command("\t\tindented"),
+            Command::Prompt("\t\tindented".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_reset_aliases() {
+        assert_eq!(parse_command("/reset"), Command::Reset);
+        assert_eq!(parse_command("/clear"), Command::Reset);
+        assert_eq!(parse_command("/RESET"), Command::Reset);
+    }
+
+    #[test]
+    fn parse_no_arg_command_with_extra_text_is_unknown() {
+        // Codex P2 fix: a typo like `/reset later` must NOT silently
+        // wipe session state. Anything other than the bare command
+        // routes to Unknown so the REPL can complain instead of acting.
+        for input in [
+            "/reset later",
+            "/clear now",
+            "/ctx 5",
+            "/help me",
+            "/? thing",
+            "/exit now",
+            "/quit please",
+        ] {
+            match parse_command(input) {
+                Command::Unknown(msg) => assert!(
+                    msg.contains("does not take arguments"),
+                    "input {input:?} got msg {msg:?}",
+                ),
+                other => panic!("input {input:?}: expected Unknown, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_leading_whitespace_before_command_still_parses() {
+        // Trim leading whitespace for *commands* only (not prompts).
+        assert_eq!(parse_command("   /help"), Command::Help);
+        assert_eq!(parse_command("\t/reset\n"), Command::Reset);
+    }
+
+    #[test]
+    fn parse_rewind_with_arg() {
+        assert_eq!(parse_command("/rewind 5"), Command::Rewind(5));
+        assert_eq!(parse_command("/rewind  42  "), Command::Rewind(42));
+    }
+
+    #[test]
+    fn parse_rewind_without_arg_is_unknown() {
+        // splitn(2) gives "" as the arg → parse fails → Unknown.
+        match parse_command("/rewind") {
+            Command::Unknown(_) => (),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_rewind_negative_is_unknown() {
+        match parse_command("/rewind -1") {
+            Command::Unknown(_) => (),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ctx_help_exit() {
+        assert_eq!(parse_command("/ctx"), Command::ShowCtx);
+        assert_eq!(parse_command("/help"), Command::Help);
+        assert_eq!(parse_command("/?"), Command::Help);
+        assert_eq!(parse_command("/exit"), Command::Exit);
+        assert_eq!(parse_command("/quit"), Command::Exit);
+    }
+
+    #[test]
+    fn parse_unknown_slash_command() {
+        match parse_command("/nope") {
+            Command::Unknown(msg) => assert!(msg.contains("nope")),
+            other => panic!("expected Unknown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_slash_inside_word_is_prompt() {
+        // Only a leading '/' triggers command parsing.
+        assert_eq!(
+            parse_command("path/to/file"),
+            Command::Prompt("path/to/file".to_string())
+        );
     }
 }
