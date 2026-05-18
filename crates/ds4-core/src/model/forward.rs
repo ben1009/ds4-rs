@@ -222,7 +222,7 @@ fn layer_attention_decode(
     let mut kv_normed = vec![0.0f32; kv_full_dim];
     rms_norm(&kv_raw, layer.attn_kv_a_norm, 1e-6, &mut kv_normed);
 
-    let kv_latent = kv_normed[..KV_LATENT_DIM].to_vec();
+    let kv_latent = &kv_normed[..KV_LATENT_DIM];
     let mut k_pe = kv_normed[KV_LATENT_DIM..].to_vec();
     apply_rope(&mut k_pe, pos, &engine.rope_freqs);
 
@@ -234,7 +234,7 @@ fn layer_attention_decode(
 
     // Store latent + k_pe in the cache and advance the watermark so the
     // just-written token participates in this step's softmax.
-    kv_cache.write_latent(il, pos, &kv_latent)?;
+    kv_cache.write_latent(il, pos, kv_latent)?;
     kv_cache.write_k_pe(il, pos, &k_pe)?;
     if pos + 1 > kv_cache.len() {
         kv_cache.set_pos(pos + 1);
@@ -447,8 +447,8 @@ fn attention_rows_inner(
     debug_assert_eq!(out_heads.len(), n_head * head_dim);
     debug_assert_eq!(q.len(), n_head * head_dim);
     debug_assert_eq!(sinks.len(), n_head);
-    debug_assert_eq!(latent_window.len() % KV_LATENT_DIM, 0);
-    debug_assert_eq!(k_pe_window.len() % K_PE_DIM, 0);
+    debug_assert!(latent_window.len().is_multiple_of(KV_LATENT_DIM));
+    debug_assert!(k_pe_window.len().is_multiple_of(K_PE_DIM));
     let window_len = latent_window.len() / KV_LATENT_DIM;
     debug_assert_eq!(k_pe_window.len() / K_PE_DIM, window_len);
 
