@@ -317,12 +317,12 @@ mod tests {
         u64le(&mut buf, 0);
         let tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
         u64le(&mut buf, 7);
-        kv_u32(&mut buf, "llama.vocab_size", 256);
-        kv_u32(&mut buf, "llama.embedding_length", 16);
-        kv_u32(&mut buf, "llama.attention.head_count", 4);
-        kv_u32(&mut buf, "llama.attention.head_count_kv", 4);
-        kv_u32(&mut buf, "llama.block_count", 2);
-        kv_u32(&mut buf, "llama.feed_forward_length", 32);
+        kv_u32(&mut buf, "deepseek4.vocab_size", 256);
+        kv_u32(&mut buf, "deepseek4.embedding_length", 16);
+        kv_u32(&mut buf, "deepseek4.attention.head_count", 4);
+        kv_u32(&mut buf, "deepseek4.attention.head_count_kv", 4);
+        kv_u32(&mut buf, "deepseek4.block_count", 2);
+        kv_u32(&mut buf, "deepseek4.expert_feed_forward_length", 32);
         kv_arr_string(&mut buf, "tokenizer.ggml.tokens", &tokens);
         std::fs::File::create(path)
             .unwrap()
