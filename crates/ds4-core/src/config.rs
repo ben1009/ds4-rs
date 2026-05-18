@@ -35,15 +35,15 @@ impl ModelConfig {
                 .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))
         };
 
-        let n_vocab = get_u32("llama.vocab_size")?;
-        let n_embd = get_u32("llama.embedding_length")?;
-        let n_head = get_u32("llama.attention.head_count")?;
-        let n_kv_head = get_u32("llama.attention.head_count_kv")?;
-        let n_layer = get_u32("llama.block_count")?;
-        let n_ff = get_u32("llama.feed_forward_length")?;
+        let n_vocab = get_u32("deepseek4.vocab_size")?;
+        let n_embd = get_u32("deepseek4.embedding_length")?;
+        let n_head = get_u32("deepseek4.attention.head_count")?;
+        let n_kv_head = get_u32("deepseek4.attention.head_count_kv")?;
+        let n_layer = get_u32("deepseek4.block_count")?;
+        let n_ff = get_u32("deepseek4.expert_feed_forward_length")?;
 
-        let head_dim = get_u32("llama.attention.key_length")
-            .or_else(|_| get_u32("llama.attention.head_dim"))
+        let head_dim = get_u32("deepseek4.attention.key_length")
+            .or_else(|_| get_u32("deepseek4.attention.head_dim"))
             .unwrap_or_else(|_| n_embd.checked_div(n_head).unwrap_or(n_embd));
 
         Ok(Self {
@@ -53,12 +53,12 @@ impl ModelConfig {
             n_kv_head,
             n_layer,
             n_ff,
-            n_expert: get_u32("llama.expert_count").unwrap_or(0),
-            n_expert_used: get_u32("llama.expert_used_count").unwrap_or(0),
-            n_hc: get_u32("ds4.hc_count").unwrap_or(4),
+            n_expert: get_u32("deepseek4.expert_count").unwrap_or(0),
+            n_expert_used: get_u32("deepseek4.expert_used_count").unwrap_or(0),
+            n_hc: get_u32("deepseek4.hyper_connection.count").unwrap_or(4),
             head_dim,
-            rope_theta: get_f32("llama.rope.freq_base").unwrap_or(10000.0),
-            ctx_size: get_u32("llama.context_length").unwrap_or(32768),
+            rope_theta: get_f32("deepseek4.rope.freq_base").unwrap_or(10000.0),
+            ctx_size: get_u32("deepseek4.context_length").unwrap_or(32768),
         })
     }
 }
@@ -71,12 +71,15 @@ mod tests {
 
     fn base_metadata() -> HashMap<String, Value> {
         let mut m = HashMap::new();
-        m.insert("llama.vocab_size".to_string(), Value::U32(32000));
-        m.insert("llama.embedding_length".to_string(), Value::U32(4096));
-        m.insert("llama.attention.head_count".to_string(), Value::U32(32));
-        m.insert("llama.attention.head_count_kv".to_string(), Value::U32(8));
-        m.insert("llama.block_count".to_string(), Value::U32(32));
-        m.insert("llama.feed_forward_length".to_string(), Value::U32(14336));
+        m.insert("deepseek4.vocab_size".to_string(), Value::U32(32000));
+        m.insert("deepseek4.embedding_length".to_string(), Value::U32(4096));
+        m.insert("deepseek4.attention.head_count".to_string(), Value::U32(32));
+        m.insert("deepseek4.attention.head_count_kv".to_string(), Value::U32(8));
+        m.insert("deepseek4.block_count".to_string(), Value::U32(32));
+        m.insert(
+            "deepseek4.expert_feed_forward_length".to_string(),
+            Value::U32(14336),
+        );
         m
     }
 
@@ -111,7 +114,7 @@ mod tests {
     #[test]
     fn head_dim_uses_key_length_when_present() {
         let mut m = base_metadata();
-        m.insert("llama.attention.key_length".to_string(), Value::U32(256));
+        m.insert("deepseek4.attention.key_length".to_string(), Value::U32(256));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.head_dim, 256);
     }
@@ -119,7 +122,7 @@ mod tests {
     #[test]
     fn head_dim_div_by_zero_falls_back_to_n_embd() {
         let mut m = base_metadata();
-        m.insert("llama.attention.head_count".to_string(), Value::U32(0));
+        m.insert("deepseek4.attention.head_count".to_string(), Value::U32(0));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         // checked_div on 0 returns None, so head_dim falls back to n_embd.
         assert_eq!(cfg.head_dim, 4096);
@@ -128,11 +131,14 @@ mod tests {
     #[test]
     fn optional_overrides_take_effect() {
         let mut m = base_metadata();
-        m.insert("llama.expert_count".to_string(), Value::U32(64));
-        m.insert("llama.expert_used_count".to_string(), Value::U32(2));
-        m.insert("ds4.hc_count".to_string(), Value::U32(8));
-        m.insert("llama.rope.freq_base".to_string(), Value::F32(500000.0));
-        m.insert("llama.context_length".to_string(), Value::U32(16384));
+        m.insert("deepseek4.expert_count".to_string(), Value::U32(64));
+        m.insert("deepseek4.expert_used_count".to_string(), Value::U32(2));
+        m.insert(
+            "deepseek4.hyper_connection.count".to_string(),
+            Value::U32(8),
+        );
+        m.insert("deepseek4.rope.freq_base".to_string(), Value::F32(500000.0));
+        m.insert("deepseek4.context_length".to_string(), Value::U32(16384));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.n_expert, 64);
         assert_eq!(cfg.n_expert_used, 2);
@@ -144,7 +150,7 @@ mod tests {
     #[test]
     fn missing_mandatory_field_errors() {
         let mut m = base_metadata();
-        m.remove("llama.vocab_size");
+        m.remove("deepseek4.vocab_size");
         assert!(ModelConfig::from_metadata(&m).is_err());
     }
 
@@ -152,7 +158,7 @@ mod tests {
     fn type_mismatch_for_u32_errors() {
         let mut m = base_metadata();
         m.insert(
-            "llama.vocab_size".to_string(),
+            "deepseek4.vocab_size".to_string(),
             Value::String("not a number".to_string()),
         );
         let err = ModelConfig::from_metadata(&m).unwrap_err();
@@ -162,7 +168,7 @@ mod tests {
     #[test]
     fn u32_field_accepts_u64_in_range() {
         let mut m = base_metadata();
-        m.insert("llama.vocab_size".to_string(), Value::U64(50000));
+        m.insert("deepseek4.vocab_size".to_string(), Value::U64(50000));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.n_vocab, 50000);
     }
@@ -170,14 +176,14 @@ mod tests {
     #[test]
     fn u32_field_rejects_u64_overflow() {
         let mut m = base_metadata();
-        m.insert("llama.vocab_size".to_string(), Value::U64(u64::MAX));
+        m.insert("deepseek4.vocab_size".to_string(), Value::U64(u64::MAX));
         assert!(ModelConfig::from_metadata(&m).is_err());
     }
 
     #[test]
     fn head_dim_falls_back_to_head_dim_key() {
         let mut m = base_metadata();
-        m.insert("llama.attention.head_dim".to_string(), Value::U32(192));
+        m.insert("deepseek4.attention.head_dim".to_string(), Value::U32(192));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.head_dim, 192);
     }
@@ -185,8 +191,8 @@ mod tests {
     #[test]
     fn key_length_takes_precedence_over_head_dim() {
         let mut m = base_metadata();
-        m.insert("llama.attention.key_length".to_string(), Value::U32(160));
-        m.insert("llama.attention.head_dim".to_string(), Value::U32(192));
+        m.insert("deepseek4.attention.key_length".to_string(), Value::U32(160));
+        m.insert("deepseek4.attention.head_dim".to_string(), Value::U32(192));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.head_dim, 160);
     }
@@ -194,7 +200,7 @@ mod tests {
     #[test]
     fn rope_theta_widens_from_f64() {
         let mut m = base_metadata();
-        m.insert("llama.rope.freq_base".to_string(), Value::F64(123_456.789));
+        m.insert("deepseek4.rope.freq_base".to_string(), Value::F64(123_456.789));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert!((cfg.rope_theta - 123_456.79_f32).abs() < 1.0);
     }
@@ -203,7 +209,7 @@ mod tests {
     fn rope_theta_type_mismatch_falls_back_to_default() {
         let mut m = base_metadata();
         m.insert(
-            "llama.rope.freq_base".to_string(),
+            "deepseek4.rope.freq_base".to_string(),
             Value::String("abc".to_string()),
         );
         let cfg = ModelConfig::from_metadata(&m).unwrap();
@@ -213,12 +219,12 @@ mod tests {
     #[test]
     fn each_mandatory_field_individually_required() {
         let keys = [
-            "llama.vocab_size",
-            "llama.embedding_length",
-            "llama.attention.head_count",
-            "llama.attention.head_count_kv",
-            "llama.block_count",
-            "llama.feed_forward_length",
+            "deepseek4.vocab_size",
+            "deepseek4.embedding_length",
+            "deepseek4.attention.head_count",
+            "deepseek4.attention.head_count_kv",
+            "deepseek4.block_count",
+            "deepseek4.expert_feed_forward_length",
         ];
         for k in keys {
             let mut m = base_metadata();
