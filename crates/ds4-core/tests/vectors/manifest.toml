@@ -61,3 +61,53 @@ source = "examples/gen_vectors_q8_k.rs — quantize_block of one 256-element inp
 path = "q8_k_multi_block.bin"
 sha256 = "8298a39de9c83059aeca13cf03e581cb56cc98f7e6dc6853fad15d2317106d8d"
 source = "examples/gen_vectors_q8_k.rs — quantize() on 3 consecutive blocks with different scales"
+
+[[vectors]]
+path = "iq2_xxs_dequant.bin"
+sha256 = "765e08acbb28d776b30d42133c72b58537a989f5886013c88831deefa75b8155"
+source = "examples/gen_vectors_routed_quants.rs — IQ2_XXS dequant of one synthetic block"
+
+[[vectors]]
+path = "iq2_xxs_dot.bin"
+sha256 = "6a41f5f6e50caef83925404fdfc60ff680f58e0bb6a263acbcec30dc1e766df2"
+source = "examples/gen_vectors_routed_quants.rs — IQ2_XXS × Q8_K block dot product"
+
+[[vectors]]
+path = "q2_k_dequant.bin"
+sha256 = "d959fcda48a17313b69bf4953a46c47edceaebe25b570870bc0a891cbb699ed8"
+source = "examples/gen_vectors_routed_quants.rs — Q2_K dequant of one synthetic block"
+
+[[vectors]]
+path = "q2_k_dot.bin"
+sha256 = "e9bc196bf4deec5464557858511de5259f191fdf0e5d6184eaaa3acdd2e2a846"
+source = "examples/gen_vectors_routed_quants.rs — Q2_K × Q8_K block dot product"
+
+[[vectors]]
+path = "q4_k_dequant.bin"
+sha256 = "2406e70b2f5e470e205b36447a2e61b30b361ecad308126a93dd5bb26d2a836e"
+source = "examples/gen_vectors_routed_quants.rs — Q4_K dequant of one synthetic block"
+
+[[vectors]]
+path = "q4_k_dot.bin"
+sha256 = "f1f3a12dd954ec88e915a88ba3cb102a3469669efcaebdbbac34576df2f993a1"
+source = "examples/gen_vectors_routed_quants.rs — Q4_K × Q8_K block dot product"
+
+[[vectors]]
+path = "iq4_xs_dequant.bin"
+sha256 = "68004e6b379667fb1780cedf3b1d1970ddc4d2769dd7f9f4df414730f624bfbb"
+source = "examples/gen_vectors_routed_quants.rs — IQ4_XS dequant of one synthetic block"
+
+[[vectors]]
+path = "iq4_xs_dot.bin"
+sha256 = "54e3e77d79d40c491c749e83c7d30102c5dd726bfd4f5b542f108fe359788d95"
+source = "examples/gen_vectors_routed_quants.rs — IQ4_XS × Q8_K block dot product"
+
+[[vectors]]
+path = "iq4_nl_dequant.bin"
+sha256 = "5642f06cdf9f6fc361874a411a0f6b5c8fcd24967796a140e99712d686b9457c"
+source = "examples/gen_vectors_routed_quants.rs — IQ4_NL dequant of one synthetic block"
+
+[[vectors]]
+path = "iq4_nl_dot.bin"
+sha256 = "d2ee721779751fdae2ae59d078d51369dbce51f68fa965a17e187d30640a8a17"
+source = "examples/gen_vectors_routed_quants.rs — IQ4_NL × f32 block dot product"
