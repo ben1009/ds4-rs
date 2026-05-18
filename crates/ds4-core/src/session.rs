@@ -106,9 +106,7 @@ impl Session {
         self.tokens.clear();
         self.pos = 0;
         self.kv_cache.set_pos(0);
-        for v in self.logits.iter_mut() {
-            *v = 0.0;
-        }
+        self.logits.fill(0.0);
     }
 
     /// Rewind the session to position `pos`, dropping any tokens / KV state
