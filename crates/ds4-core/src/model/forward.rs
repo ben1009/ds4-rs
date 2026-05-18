@@ -800,7 +800,7 @@ fn output_head(
     //   4. out  = sum_h residual_hc[h] * w[h]                      // [n_embd]
     //
     // The bias/scale tensors are tiny F32 vectors:
-    //   * output_hc_fn.weight    F16 shape [hc_dim, n_hc]
+    //   * output_hc_fn.weight    F16 shape [n_hc, hc_dim]
     //   * output_hc_scale.weight F32 scalar
     //   * output_hc_base.weight  F32 shape [n_hc]
     let mut flat = vec![0.0f32; hc_dim];
