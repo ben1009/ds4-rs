@@ -214,7 +214,7 @@ mod tests {
         u64le(&mut buf, 0);
 
         // We have 7 metadata entries.
-        let tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        let tokens: Vec<String> = crate::tokenizer::synthetic_byte_tokens();
         u64le(&mut buf, 7);
 
         kv_u32(&mut buf, "deepseek4.vocab_size", 256);
