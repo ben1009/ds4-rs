@@ -5,14 +5,17 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 
 ## Current Baseline
 
-- `cargo test --workspace` passes (392 unit tests + 19 CLI tests +
-  manifest check; one ignored end-to-end smoke test gated behind
-  `DS4_TEST_MODEL`).
+- `cargo test --workspace` passes (400 ds4-core unit tests + 31 ds4-cli
+  unit tests + manifest check; one ignored end-to-end smoke test gated
+  behind `DS4_TEST_MODEL`).
 - Phase 1 forward pass is numerically complete: real MLA attention (the
   cached 512-dim row plays K and V across all 64 query heads), routed
   MoE assembly, and learned output HC reduction are all in place.
 - `Session::prefill` and `Session::eval_token` reach the full forward
   graph; the CLI `ds4 -p "..." -n ...` exercises the same code path.
+- Session lifecycle ops (`rewind`, `invalidate`) and an interactive REPL
+  (`/reset`, `/rewind <n>`, `/ctx`, `/help`, `/exit`) have landed
+  (PRs #28, #29). The REPL is the default when no `-p` is supplied.
 - Reference vectors for Q8_0, Q8_K, RMSNorm, RoPE, and the routed-expert
   quants (IQ2_XXS, Q2_K, Q4_K, IQ4_XS, IQ4_NL) are committed under
   `crates/ds4-core/tests/vectors/` and SHA-checked by
@@ -141,11 +144,22 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
      manual review when regeneration is needed. Existing op-level vectors
      for Q8_0, Q8_K, RMSNorm, and RoPE are unchanged.
 
-10. [ ] Revisit Phase 2 only after Phase 1 logits are credible.
-    - Session lifecycle operations: rewind, invalidate, and multi-turn flow.
-    - Raw KV ring behavior and long-context compressor / indexer.
-    - On-disk KVC compatibility.
-    - CLI interactive REPL.
+10. Revisit Phase 2 only after Phase 1 logits are credible
+    (`DS4_TEST_MODEL` run against a real DS4 GGUF gates the unchecked
+    sub-items).
+    - [x] Session lifecycle operations: rewind, invalidate, and multi-turn flow.
+      - Done in #28: `Session::invalidate`, `Session::rewind`,
+        `Session::pos`, `Session::tokens`, and `Session::ctx_size` cover
+        in-memory rewind / invalidate; the REPL exercises multi-turn
+        prefix preservation across turns.
+    - [ ] Raw KV ring behavior and long-context compressor / indexer.
+    - [ ] On-disk KVC compatibility.
+    - [x] CLI interactive REPL.
+      - Done in #29: `repl()` in `crates/ds4-cli/src/main.rs` ships
+        `/reset` (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), and
+        `/exit` (`/quit`). The REPL is the default when no `-p` is
+        supplied. Reasoning-mode toggles (`/think`, `/nothink`) and
+        file-read (`/read`) are still future work.
 
 ## Hygiene (ongoing)
 

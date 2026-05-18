@@ -80,12 +80,17 @@ via the `DS4_TEST_MODEL`-gated integration test in
 
 ## Phase 2: Session + KV Cache
 
-- Multi-turn session lifecycle (create, eval, rewind, invalidate)
+- Multi-turn session lifecycle (create, eval, rewind, invalidate) — **done**
+  (#28). In-memory `Session::rewind` / `Session::invalidate` ship; the
+  REPL exercises multi-turn prefix preservation across turns.
 - Raw KV ring buffer (sliding window in memory)
 - Compressed KV store + ratio-4 indexer
 - On-disk KVC cache (48-byte header + session payload, binary-compatible with ds4)
 - Prefix matching for cache reuse
-- CLI interactive REPL (`/think`, `/nothink`, `/ctx`, `/read`)
+- CLI interactive REPL — **done** (#29). Shipped commands: `/reset`
+  (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), `/exit` (`/quit`).
+  Reasoning-mode toggles (`/think`, `/nothink`) and file-read (`/read`)
+  are still pending.
 
 ## Phase 3: Server
 

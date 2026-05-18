@@ -125,7 +125,7 @@ Three layers of tests are used:
 2. **Cross-reference binary vectors:** Committed `.bin` files under `crates/ds4-core/tests/vectors/` represent known-good outputs. `tests/manifest.rs` checks their SHA-256 against `tests/vectors/manifest.toml` on every CI run.
    * Regeneration is **manual** via `scripts/regen_vectors.sh <op>`.
    * After regeneration, update `manifest.toml` with the new SHAs and run `cargo test -p ds4-core --test manifest`.
-3. **End-to-end smoke:** The CLI `ds4 -p "..."` exercises tokenizer → prefill → eval → argmax → decode. A real model test is planned but currently gated behind future work (no tiny GGUF fixture yet).
+3. **End-to-end smoke:** The CLI `ds4 -p "..."` exercises tokenizer → prefill → eval → argmax → decode. A real-model integration test lives at `crates/ds4-core/tests/forward_smoke.rs`, gated behind `DS4_TEST_MODEL` (path to a real DS4 GGUF). Run it with `DS4_TEST_MODEL=/path/to/ds4flash.gguf cargo test -p ds4-core --test forward_smoke -- --ignored`.
 
 ### CI Safety Checks
 
@@ -160,12 +160,9 @@ Additional security measures:
 
 ## Current Status & Known Limitations (as of latest commit)
 
-* **Phase 1 is in progress.** The workspace scaffold, GGUF loader, tokenizer, tensor views, Q8_0/Q8_K quant kernels, RMSNorm, RoPE, softmax, SwiGLU, HC helpers, typed weight accessors, MLA latent KV cache, partial decode forward orchestration, and CLI wiring have landed.
-* **Known Phase 1 stubs (see `todo.md`):**
-  * Routed MoE assembly (hash routing for layers 0–2, biased top-k for layers 3+) is disabled.
-  * Attention scores against cached MLA latent directly instead of real per-head K/V up-projection.
-  * Output HC reduction sums streams instead of using learned output combine weights.
-* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Long-range context via compressor/indexer is Phase 2.
+* **Phase 1 forward pass is numerically complete.** The workspace scaffold, GGUF loader, tokenizer, tensor views, all Phase 1 quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL), RMSNorm, partial RoPE + YaRN, softmax, SwiGLU, HC helpers, typed weight accessors, MLA latent KV cache, real attention (the cached 512-dim row plays K and V across all 64 query heads — no separate per-head up-projection, matching antirez/ds4), routed MoE assembly (hash routing for layers 0–2, biased top-k for layers 3+), learned output HC reduction, and CLI wiring have landed. Real-model validation against a DS4 GGUF is gated behind `DS4_TEST_MODEL` (see Testing Strategy).
+* **Session lifecycle and REPL.** `Session::rewind`, `Session::invalidate`, `Session::pos`, `Session::tokens`, and `Session::ctx_size` ship in `crates/ds4-core/src/session.rs`. The CLI exposes an interactive REPL (default when no `-p` is supplied) with `/reset` (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), and `/exit` (`/quit`). Reasoning-mode toggles (`/think`, `/nothink`) and file-read (`/read`) are not yet implemented.
+* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Long-range context via raw KV ring + compressor/indexer, on-disk KVC, and prefix matching are Phase 2.
 * **Performance:** CPU reference, single-threaded, seconds-per-token on commodity hardware. SIMD/threading/GPU are deferred.
 * **Binary name:** `ds4` (from `ds4-cli/src/main.rs`).
 * **Default model path:** `./ds4flash.gguf` (override with `--model`).
