@@ -74,7 +74,10 @@ mod tests {
         m.insert("deepseek4.vocab_size".to_string(), Value::U32(32000));
         m.insert("deepseek4.embedding_length".to_string(), Value::U32(4096));
         m.insert("deepseek4.attention.head_count".to_string(), Value::U32(32));
-        m.insert("deepseek4.attention.head_count_kv".to_string(), Value::U32(8));
+        m.insert(
+            "deepseek4.attention.head_count_kv".to_string(),
+            Value::U32(8),
+        );
         m.insert("deepseek4.block_count".to_string(), Value::U32(32));
         m.insert(
             "deepseek4.expert_feed_forward_length".to_string(),
@@ -114,7 +117,10 @@ mod tests {
     #[test]
     fn head_dim_uses_key_length_when_present() {
         let mut m = base_metadata();
-        m.insert("deepseek4.attention.key_length".to_string(), Value::U32(256));
+        m.insert(
+            "deepseek4.attention.key_length".to_string(),
+            Value::U32(256),
+        );
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.head_dim, 256);
     }
@@ -191,7 +197,10 @@ mod tests {
     #[test]
     fn key_length_takes_precedence_over_head_dim() {
         let mut m = base_metadata();
-        m.insert("deepseek4.attention.key_length".to_string(), Value::U32(160));
+        m.insert(
+            "deepseek4.attention.key_length".to_string(),
+            Value::U32(160),
+        );
         m.insert("deepseek4.attention.head_dim".to_string(), Value::U32(192));
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert_eq!(cfg.head_dim, 160);
@@ -200,7 +209,10 @@ mod tests {
     #[test]
     fn rope_theta_widens_from_f64() {
         let mut m = base_metadata();
-        m.insert("deepseek4.rope.freq_base".to_string(), Value::F64(123_456.789));
+        m.insert(
+            "deepseek4.rope.freq_base".to_string(),
+            Value::F64(123_456.789),
+        );
         let cfg = ModelConfig::from_metadata(&m).unwrap();
         assert!((cfg.rope_theta - 123_456.79_f32).abs() < 1.0);
     }
