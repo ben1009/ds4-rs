@@ -22,29 +22,34 @@ pub struct ModelConfig {
 impl ModelConfig {
     pub fn from_metadata(metadata: &std::collections::HashMap<String, Value>) -> Result<Self> {
         let get_u32 = |key: &str| -> Result<u32> {
-            metadata
+            let v = metadata
                 .get(key)
-                .and_then(|v| v.to_u32())
-                .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))
+                .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))?;
+            v.to_u32()
+                .ok_or_else(|| anyhow::anyhow!("Type mismatch for {key}: expected u32"))
         };
 
         let get_f32 = |key: &str| -> Result<f32> {
-            metadata
+            let v = metadata
                 .get(key)
-                .and_then(|v| v.to_f32())
-                .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))
+                .ok_or_else(|| anyhow::anyhow!("Missing metadata key: {key}"))?;
+            v.to_f32()
+                .ok_or_else(|| anyhow::anyhow!("Type mismatch for {key}: expected f32"))
         };
 
         let n_vocab = get_u32("deepseek4.vocab_size")?;
         let n_embd = get_u32("deepseek4.embedding_length")?;
         let n_head = get_u32("deepseek4.attention.head_count")?;
+        if n_head == 0 {
+            anyhow::bail!("deepseek4.attention.head_count must be > 0");
+        }
         let n_kv_head = get_u32("deepseek4.attention.head_count_kv")?;
         let n_layer = get_u32("deepseek4.block_count")?;
         let n_ff = get_u32("deepseek4.expert_feed_forward_length")?;
 
         let head_dim = get_u32("deepseek4.attention.key_length")
             .or_else(|_| get_u32("deepseek4.attention.head_dim"))
-            .unwrap_or_else(|_| n_embd.checked_div(n_head).unwrap_or(n_embd));
+            .unwrap_or(n_embd / n_head);
 
         Ok(Self {
             n_vocab,
@@ -126,12 +131,14 @@ mod tests {
     }
 
     #[test]
-    fn head_dim_div_by_zero_falls_back_to_n_embd() {
+    fn head_count_zero_errors() {
         let mut m = base_metadata();
         m.insert("deepseek4.attention.head_count".to_string(), Value::U32(0));
-        let cfg = ModelConfig::from_metadata(&m).unwrap();
-        // checked_div on 0 returns None, so head_dim falls back to n_embd.
-        assert_eq!(cfg.head_dim, 4096);
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("head_count"),
+            "expected head_count error, got: {err}"
+        );
     }
 
     #[test]
@@ -168,7 +175,11 @@ mod tests {
             Value::String("not a number".to_string()),
         );
         let err = ModelConfig::from_metadata(&m).unwrap_err();
-        assert!(err.to_string().contains("Missing metadata key"));
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Type mismatch") && msg.contains("deepseek4.vocab_size"),
+            "expected type-mismatch error mentioning the key, got: {msg}"
+        );
     }
 
     #[test]
