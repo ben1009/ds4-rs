@@ -842,8 +842,8 @@ const HC_EPS: f32 = 1.0e-6;
 fn output_hc_weights(pre: &[f32], scale: f32, base: &[f32], weights: &mut [f32]) {
     debug_assert_eq!(pre.len(), weights.len());
     debug_assert_eq!(base.len(), weights.len());
-    for (i, w) in weights.iter_mut().enumerate() {
-        *w = sigmoid_stable(pre[i] * scale + base[i]) + HC_EPS;
+    for (w, (&p, &b)) in weights.iter_mut().zip(pre.iter().zip(base.iter())) {
+        *w = sigmoid_stable(p * scale + b) + HC_EPS;
     }
 }
 
