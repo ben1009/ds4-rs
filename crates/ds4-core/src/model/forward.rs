@@ -392,7 +392,7 @@ fn attention_rows(
     // full 512-dim row before split, and RoPE rotated only the last 64 dims.
     // So Q · K and Σ wᵢ · V both run over the concatenated [latent || k_pe]
     // row, matching `layer_attention_rows_one` in antirez/ds4 ds4.c.
-    debug_assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
+    assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
 
     let latent_prefix = kv_cache.latent_layer_prefix(il, end_pos);
     let k_pe_prefix = kv_cache.k_pe_layer_prefix(il, end_pos);
@@ -443,13 +443,13 @@ fn attention_rows_inner(
 
     let head_dim = KV_LATENT_DIM + K_PE_DIM;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
-    debug_assert_eq!(out_heads.len(), n_head * head_dim);
-    debug_assert_eq!(q.len(), n_head * head_dim);
-    debug_assert_eq!(sinks.len(), n_head);
-    debug_assert!(latent_window.len().is_multiple_of(KV_LATENT_DIM));
-    debug_assert!(k_pe_window.len().is_multiple_of(K_PE_DIM));
+    assert_eq!(out_heads.len(), n_head * head_dim);
+    assert_eq!(q.len(), n_head * head_dim);
+    assert_eq!(sinks.len(), n_head);
+    assert!(latent_window.len().is_multiple_of(KV_LATENT_DIM));
+    assert!(k_pe_window.len().is_multiple_of(K_PE_DIM));
     let window_len = latent_window.len() / KV_LATENT_DIM;
-    debug_assert_eq!(k_pe_window.len() / K_PE_DIM, window_len);
+    assert_eq!(k_pe_window.len() / K_PE_DIM, window_len);
 
     let mut scores = vec![0.0f32; window_len];
 
@@ -840,8 +840,8 @@ const HC_EPS: f32 = 1.0e-6;
 /// Pure math, factored out for testing — matches `output_hc_head_one` in
 /// antirez/ds4 ds4.c.
 fn output_hc_weights(pre: &[f32], scale: f32, base: &[f32], weights: &mut [f32]) {
-    debug_assert_eq!(pre.len(), weights.len());
-    debug_assert_eq!(base.len(), weights.len());
+    assert_eq!(pre.len(), weights.len());
+    assert_eq!(base.len(), weights.len());
     for (w, (&p, &b)) in weights.iter_mut().zip(pre.iter().zip(base.iter())) {
         *w = sigmoid_stable(p * scale + b) + HC_EPS;
     }
