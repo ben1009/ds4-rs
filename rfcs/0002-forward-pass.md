@@ -13,13 +13,16 @@ partial Phase 1 implementation:
   HC split/mix helpers, typed weight accessors, MLA latent KV cache, partial
   decode forward orchestration, `Session::{prefill, eval_token}` wiring,
   the routed-expert quant kernels Q2_K, IQ2_XXS, Q4_K, IQ4_XS, and IQ4_NL
-  (matmul dispatch + Q8_K-activation dot products), and routed MoE assembly
+  (matmul dispatch + Q8_K-activation dot products), routed MoE assembly
   (F16 router → `sqrt(softplus)` gating → hash routing for layers 0–2 /
   biased top-k for layers 3+ → SwiGLU-clamped per-expert MLP → 1.5×
-  rescale, summed with the shared expert).
-- Still missing for credible logits: real per-head MLA K/V up-projection in
-  attention, learned output HC reduction, and end-to-end model smoke
-  coverage.
+  rescale, summed with the shared expert), the full MLA attention path
+  (full DS4_N_HEAD_DIM = 512 row used as both K and V, no separate per-
+  head up-projection — matches `layer_attention_rows_one` in ds4.c), and
+  the learned output HC reduction (`rms_norm_no_weight` → F16
+  `output_hc_fn` matvec → per-stream `sigmoid_stable + 1e-6` →
+  `hc_weighted_sum`).
+- Still missing for credible logits: end-to-end model smoke coverage.
 - Known Phase 1 limitation: the current decode path can exercise real forward
   code, but it is not numerically complete until the remaining stubs above are
   replaced.
@@ -126,9 +129,14 @@ Phase 1 defers that machinery to Phase 2.
 
 What Phase 1 *does* implement per layer:
 
-1. Q, K, V from the MLA path (compressed KV latent up-projected per head).
-   Current implementation note: the decode path temporarily scores against
-   `[kv_latent || k_pe]` directly until the real per-head up-projection lands.
+1. Q, K, V from the MLA path. The KV side is a single `attn_kv` matvec
+   that produces one DS4_N_HEAD_DIM = 512 row per token, RMSNorm'd as a
+   whole with the 512-wide `attn_kv_a_norm` weight. There is *no* per-
+   head K/V up-projection weight in DS4 MLA: the same 512-dim row is
+   used unchanged as both K (for scoring) and V (for the weighted sum)
+   across all 64 query heads. Caching splits the row for storage only —
+   `[..448]` → `kv_latent`, `[448..512]` → `k_pe` after RoPE — and
+   attention recomposes them on read.
 2. Partial RoPE on the last 64 dims of each head; inverse RoPE on the
    attention output before the grouped output projection.
 3. **Sliding-window mask: attend only to positions in
@@ -153,25 +161,28 @@ lands in Phase 2.
 ### 3.5 KV cache layout — MLA latent caching
 
 MLA's whole point is that K/V don't need to live in the cache as
-`[n_head × head_dim]` per token. The compressor projects each token down to
-a 512-dim latent (`attn_kv_a_norm` output) plus a 64-dim decoupled RoPE key
-(`k_pe`), and attention up-projects on the fly per query-head. So we cache
-the *latent*, not the materialised K/V.
+`[n_head × head_dim]` per token. The KV down-projection produces one
+DS4_N_HEAD_DIM = 512 row per token, and that single row plays the role
+of both K and V across all 64 query heads. We split it for storage —
+448 dims for the non-positional ("nope") slice cached as `kv_latent`,
+64 dims for the decoupled RoPE key cached as `k_pe` — but attention
+reads them back as one logical row.
 
 Per-token cache footprint (f32):
 
 | Tensor | Dim | Bytes/token |
 |--------|-----|-------------|
-| `kv_latent` (pre-expand) | 512 | 2 KiB |
-| `k_pe` (decoupled RoPE key) | 64 | 256 B |
-| **Total** | 576 | **2.25 KiB** |
+| `kv_latent` (nope half) | 448 | 1.75 KiB |
+| `k_pe` (RoPE half) | 64 | 256 B |
+| **Total** | 512 | **2 KiB** |
 
-For `ctx_size = 4096` and 43 layers: `4096 × 43 × 2.25 KiB ≈ 396 MiB`.
-vs ~23 GiB for materialised K/V per-head — ~60× smaller.
+For `ctx_size = 4096` and 43 layers: `4096 × 43 × 2 KiB ≈ 352 MiB`.
+vs ~23 GiB for materialised K/V per-head — ~67× smaller.
 
 Layout: two flat `Vec<f32>`s per session, indexed `[layer][pos][dim]`.
-Up-projection runs inside the attention kernel using the same `attn_kv` /
-`attn_k_nope` / `attn_v` weights as prefill — there is no second copy.
+The split is for cache layout only; the model has no separate per-head
+K/V up-projection weights — `attn_kv` produces the full 512-dim row
+once, and attention scores / aggregates it directly.
 
 Default `ctx_size = 2048` (~200 MiB KV) for the Phase 1 smoke test;
 configurable up to 4096. We surface a clear error past that until Phase 2
@@ -309,9 +320,10 @@ PRs, so this list is now tracked as status, not literal future PR numbering.
 7. [x] **`ops/softmax` + `ops/swiglu` + `ops/hc` (Sinkhorn)** — glue ops.
 8. [x] **`model/weights.rs` typed accessors** — tightens the existing
    `tensor_bytes` API.
-9. [~] **`model/kv_cache` + attention assembly (single layer, no compressor)**
-   — KV cache and partial decode attention are implemented; real MLA K/V
-   up-projection is still pending.
+9. [x] **`model/kv_cache` + attention assembly (single layer, no compressor)**
+   — KV cache and decode attention landed; the cached 512-dim row is
+   used directly as both K and V (no separate per-head up-projection in
+   DS4 MLA). The Phase 2 compressor / indexer is still out of scope.
 10. [x] **MoE assembly (hash-layer + top-k variants) + full layer** — now a full
     layer runs.
 11. [~] **`model/forward.rs` + CLI wiring** — session wiring exists and the
