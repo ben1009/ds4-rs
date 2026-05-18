@@ -21,8 +21,9 @@ use crate::gguf::Value;
 
 /// Number of distinct codepoints produced by `gpt2_byte_to_codepoint`.
 /// 33–126 ∪ 161–172 ∪ 174–255 are kept as-is (188 codepoints); the remaining
-/// 68 non-printable bytes are remapped to codepoints 256..324.
-const N_BYTE_CODEPOINTS: usize = 256;
+/// 68 non-printable bytes are remapped to codepoints 256..324. The
+/// codepoint range is therefore 0..324; `cp_to_byte` is sized by this max.
+const N_BYTE_CP_MAX: usize = 324;
 
 /// Cached GPT-2 byte → printable codepoint table. Built once on first use;
 /// `byte_encode` and the test/synthetic helpers all read from it.
@@ -48,12 +49,14 @@ fn build_byte_to_cp() -> [u32; 256] {
     out
 }
 
-/// Inverse of `build_byte_to_cp`: codepoint → raw byte. Returns `None` for
-/// codepoints outside the encoded range.
-fn build_cp_to_byte(byte_to_cp: &[u32; 256]) -> HashMap<u32, u8> {
-    let mut out = HashMap::with_capacity(N_BYTE_CODEPOINTS);
+/// Inverse of `build_byte_to_cp`: codepoint → raw byte. Indexed by
+/// codepoint; entries outside the GPT-2 byte map (cp ≥ N_BYTE_CP_MAX or
+/// unmapped values inside the range) hold `-1`. Replaces the per-decode
+/// HashMap lookup with an O(1) array index on the hot path.
+fn build_cp_to_byte(byte_to_cp: &[u32; 256]) -> [i16; N_BYTE_CP_MAX] {
+    let mut out = [-1i16; N_BYTE_CP_MAX];
     for (b, &cp) in byte_to_cp.iter().enumerate() {
-        out.insert(cp, b as u8);
+        out[cp as usize] = b as i16;
     }
     out
 }
@@ -67,7 +70,9 @@ pub struct Tokenizer {
     /// Lower rank = earlier in the merge file = applied first.
     merge_rank: HashMap<String, usize>,
     /// codepoint → raw byte (inverse of GPT-2 byte encoding) for decode.
-    cp_to_byte: HashMap<u32, u8>,
+    /// Indexed by codepoint; `-1` = no mapping (codepoint is part of a
+    /// special token, not a byte-encoded character).
+    cp_to_byte: [i16; N_BYTE_CP_MAX],
     bos_token: u32,
     eos_token: u32,
 }
@@ -186,14 +191,17 @@ impl Tokenizer {
         // Repeatedly merge the lowest-rank adjacent pair until none apply.
         // Quadratic in symbol count; pieces are short (single words /
         // identifiers) so this matches `bpe_emit_piece` in ds4.c without the
-        // extra heap-bookkeeping the byte-level path needs.
+        // extra heap-bookkeeping the byte-level path needs. The lookup key
+        // is built into a single reused `String` buffer to keep allocations
+        // out of the inner loop.
+        let mut key = String::new();
         loop {
             let mut best_i: Option<usize> = None;
             let mut best_rank = usize::MAX;
             for i in 0..sym.len().saturating_sub(1) {
                 let (lo_a, len_a) = sym[i];
                 let (lo_b, len_b) = sym[i + 1];
-                let mut key = String::with_capacity(len_a + 1 + len_b);
+                key.clear();
                 key.push_str(&encoded[lo_a..lo_a + len_a]);
                 key.push(' ');
                 key.push_str(&encoded[lo_b..lo_b + len_b]);
@@ -214,24 +222,20 @@ impl Tokenizer {
         }
 
         // Emit token IDs. If a merged symbol isn't in the vocab, fall back
-        // to per-byte lookup over its encoded UTF-8 bytes.
+        // to per-codepoint lookup. The encoded string contains codepoints
+        // outside the ASCII range (the GPT-2 byte map remaps non-printable
+        // bytes to U+0100..U+0143, which are 2-byte UTF-8), so we must
+        // iterate codepoints, not raw UTF-8 bytes — splitting a multi-byte
+        // codepoint yields invalid UTF-8 and the lookup silently drops.
+        let mut buf = [0u8; 4];
         for (lo, len) in sym {
             let s = &encoded[lo..lo + len];
             if let Some(&id) = self.token_to_id.get(s) {
                 out.push(id);
             } else {
-                for &raw_byte in s.as_bytes() {
-                    // The encoded string is valid UTF-8, but a single byte of
-                    // a multi-byte codepoint isn't a valid lookup key. Fall
-                    // back to a single-byte vocab lookup over the encoded
-                    // bytes — mirrors `table_get(... ptr+j, 1 ...)` in
-                    // `bpe_emit_piece`. Vocabularies that include all 1-byte
-                    // codepoints individually will hit; multi-byte codepoint
-                    // bytes silently drop, just like the C reference.
-                    let one = [raw_byte];
-                    if let Ok(bs) = std::str::from_utf8(&one)
-                        && let Some(&id) = self.token_to_id.get(bs)
-                    {
+                for ch in s.chars() {
+                    let bs = ch.encode_utf8(&mut buf);
+                    if let Some(&id) = self.token_to_id.get(bs) {
                         out.push(id);
                     }
                 }
@@ -254,8 +258,14 @@ impl Tokenizer {
         let s = self.decode(token_id);
         for ch in s.chars() {
             let cp = ch as u32;
-            match self.cp_to_byte.get(&cp) {
-                Some(&b) => out.push(b),
+            let mapped = if (cp as usize) < N_BYTE_CP_MAX {
+                let v = self.cp_to_byte[cp as usize];
+                if v >= 0 { Some(v as u8) } else { None }
+            } else {
+                None
+            };
+            match mapped {
+                Some(b) => out.push(b),
                 None => {
                     // Codepoint outside the GPT-2 byte-map range — emit it as
                     // its UTF-8 bytes. This shouldn't normally happen for a
@@ -645,7 +655,7 @@ mod tests {
         let cp_to_byte = build_cp_to_byte(byte_to_cp);
         for b in 0u8..=255 {
             let cp = byte_to_cp[b as usize];
-            assert_eq!(cp_to_byte[&cp], b);
+            assert_eq!(cp_to_byte[cp as usize], b as i16);
         }
     }
 
