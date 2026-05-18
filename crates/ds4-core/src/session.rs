@@ -98,8 +98,8 @@ impl Session {
     /// After this, `pos() == 0`, `tokens().is_empty()`, and the KV cache
     /// watermark is back at zero — but the underlying KV `Vec<f32>`s are
     /// not reallocated, so the next prefill / eval reuses them in place.
-    /// `logits` keeps its `n_vocab` length so callers that hold a stale
-    /// reference can still observe a valid (but zeroed) buffer.
+    /// `logits` is zeroed to ensure that any subsequent access (e.g. via
+    /// an empty prefill) does not return stale predictions.
     ///
     /// Mirrors `ds4_session_invalidate` in antirez/ds4 ds4.c.
     pub fn invalidate(&mut self) {
@@ -117,14 +117,24 @@ impl Session {
     /// the C reference, where rewinding past the end is a no-op rather than
     /// an error. Rewinding to the current length is a no-op too.
     ///
+    /// When truncation actually occurs, the cached `logits` buffer is also
+    /// zeroed: it contained the prediction for the token *after* the old
+    /// end of the sequence, which is now stale. The C reference doesn't
+    /// face this (no logits cache); the Rust port has to invalidate it
+    /// explicitly so a follow-up `prefill(&[])` doesn't return predictions
+    /// for a position that no longer exists.
+    ///
     /// The KV cache watermark moves with the token list. The underlying
     /// `Vec<f32>` buffers are kept (no reallocation); subsequent writes
     /// overwrite the now-stale entries.
     pub fn rewind(&mut self, pos: u32) {
         let target = (pos as usize).min(self.tokens.len());
-        self.tokens.truncate(target);
-        self.pos = target as u32;
-        self.kv_cache.set_pos(target);
+        if target < self.tokens.len() {
+            self.tokens.truncate(target);
+            self.pos = target as u32;
+            self.kv_cache.set_pos(target);
+            self.logits.fill(0.0);
+        }
     }
 
     /// Greedy argmax: select the token with highest logit.
@@ -518,20 +528,23 @@ mod tests {
     )]
     #[test]
     fn rewind_to_zero_matches_invalidate_for_position_state() {
-        // Both end up at pos=0 / empty tokens / kv watermark 0; only
-        // logits behaviour diverges (rewind preserves last logits, invalidate
-        // zeros them).
+        // Both end up at pos=0 / empty tokens / kv watermark 0, and both
+        // zero the logits to prevent stale predictions from being observed.
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 8).unwrap();
         s.tokens.extend_from_slice(&[1, 2, 3]);
         s.pos = 3;
         s.kv_cache_mut().set_pos(3);
+        for v in s.logits.iter_mut() {
+            *v = 5.0;
+        }
 
         s.rewind(0);
 
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
         assert_eq!(s.kv_cache().len(), 0);
+        assert!(s.logits.iter().all(|&v| v == 0.0));
     }
 
     #[cfg_attr(
