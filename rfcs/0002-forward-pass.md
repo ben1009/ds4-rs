@@ -331,7 +331,7 @@ PRs, so this list is now tracked as status, not literal future PR numbering.
    I-quant matmuls.
 5. [x] **`quant/iq2_xxs` + `quant/q2_k`** — pair up because expert
    gate/up and down share a block stride.
-6. [x] **`quant/q4_k` + `quant/iq4_k`** — Q4 variant of (5). Landed as
+6. [x] **`quant/q4_k` + `quant/iq4_xs` + `quant/iq4_nl`** — Q4 variant of (5). Landed as
    Q4_K + IQ4_XS + IQ4_NL.
 7. [x] **`ops/softmax` + `ops/swiglu` + `ops/hc` (Sinkhorn)** — glue ops.
 8. [x] **`model/weights.rs` typed accessors** — tightens the existing
