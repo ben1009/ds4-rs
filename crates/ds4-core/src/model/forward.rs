@@ -222,9 +222,8 @@ fn layer_attention_decode(
     let mut kv_normed = vec![0.0f32; kv_full_dim];
     rms_norm(&kv_raw, layer.attn_kv_a_norm, 1e-6, &mut kv_normed);
 
-    let kv_latent = &kv_normed[..KV_LATENT_DIM];
-    let mut k_pe = kv_normed[KV_LATENT_DIM..].to_vec();
-    apply_rope(&mut k_pe, pos, &engine.rope_freqs);
+    let (kv_latent, k_pe) = kv_normed.split_at_mut(KV_LATENT_DIM);
+    apply_rope(k_pe, pos, &engine.rope_freqs);
 
     // RoPE per head on Q (uses precomputed frequency cache from Engine).
     for h in 0..n_head {
@@ -235,7 +234,7 @@ fn layer_attention_decode(
     // Store latent + k_pe in the cache and advance the watermark so the
     // just-written token participates in this step's softmax.
     kv_cache.write_latent(il, pos, kv_latent)?;
-    kv_cache.write_k_pe(il, pos, &k_pe)?;
+    kv_cache.write_k_pe(il, pos, k_pe)?;
     if pos + 1 > kv_cache.len() {
         kv_cache.set_pos(pos + 1);
     }
