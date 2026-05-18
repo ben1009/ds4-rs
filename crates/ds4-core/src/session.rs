@@ -93,6 +93,42 @@ impl Session {
         Ok(&self.logits)
     }
 
+    /// Discard all session state, keeping the allocated KV buffer for reuse.
+    ///
+    /// After this, `pos() == 0`, `tokens().is_empty()`, and the KV cache
+    /// watermark is back at zero — but the underlying KV `Vec<f32>`s are
+    /// not reallocated, so the next prefill / eval reuses them in place.
+    /// `logits` keeps its `n_vocab` length so callers that hold a stale
+    /// reference can still observe a valid (but zeroed) buffer.
+    ///
+    /// Mirrors `ds4_session_invalidate` in antirez/ds4 ds4.c.
+    pub fn invalidate(&mut self) {
+        self.tokens.clear();
+        self.pos = 0;
+        self.kv_cache.set_pos(0);
+        for v in self.logits.iter_mut() {
+            *v = 0.0;
+        }
+    }
+
+    /// Rewind the session to position `pos`, dropping any tokens / KV state
+    /// past it. Mirrors `ds4_session_rewind` in antirez/ds4 ds4.c, which
+    /// clamps the requested position into `[0, current_len]`.
+    ///
+    /// `pos` past the current length is silently clamped down — matching
+    /// the C reference, where rewinding past the end is a no-op rather than
+    /// an error. Rewinding to the current length is a no-op too.
+    ///
+    /// The KV cache watermark moves with the token list. The underlying
+    /// `Vec<f32>` buffers are kept (no reallocation); subsequent writes
+    /// overwrite the now-stale entries.
+    pub fn rewind(&mut self, pos: u32) {
+        let target = (pos as usize).min(self.tokens.len());
+        self.tokens.truncate(target);
+        self.pos = target as u32;
+        self.kv_cache.set_pos(target);
+    }
+
     /// Greedy argmax: select the token with highest logit.
     /// NaN values are ignored. Returns `None` if `logits` is empty.
     pub fn argmax(logits: &[f32]) -> Option<u32> {
@@ -381,5 +417,193 @@ mod tests {
             Session::argmax(&[f32::NEG_INFINITY, f32::NEG_INFINITY]),
             None
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Lifecycle: invalidate / rewind
+    //
+    // These ops manipulate session state directly (tokens, pos, KV
+    // watermark) and don't go through the forward path, so they're
+    // testable with synthetic state from the minimal GGUF — no real model
+    // weights needed.
+    // -----------------------------------------------------------------------
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn invalidate_clears_tokens_pos_kv_and_zeros_logits() {
+        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+
+        // Seed synthetic state without going through forward.
+        s.tokens.extend_from_slice(&[10, 20, 30]);
+        s.pos = 3;
+        let lat = vec![1.5f32; KV_LATENT_DIM];
+        let pe = vec![2.5f32; K_PE_DIM];
+        for p in 0..3 {
+            s.kv_cache_mut().write_latent(0, p, &lat).unwrap();
+            s.kv_cache_mut().write_k_pe(0, p, &pe).unwrap();
+        }
+        s.kv_cache_mut().set_pos(3);
+        for v in s.logits.iter_mut() {
+            *v = 7.0;
+        }
+
+        s.invalidate();
+
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().len(), 0);
+        assert_eq!(s.logits.len(), engine.config.n_vocab as usize);
+        assert!(s.logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn invalidate_on_fresh_session_is_noop() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 4).unwrap();
+        s.invalidate();
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().len(), 0);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn invalidate_keeps_kv_buffer_allocated() {
+        // The whole point of invalidate over reallocating: the KV `Vec<f32>`
+        // capacity (n_layer * ctx_size * dim) survives the call so the next
+        // turn doesn't pay the alloc cost.
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        let cap_before = s.kv_cache().ctx_size();
+        s.tokens.extend_from_slice(&[1, 2]);
+        s.pos = 2;
+        s.kv_cache_mut().set_pos(2);
+        s.invalidate();
+        assert_eq!(s.kv_cache().ctx_size(), cap_before);
+        assert_eq!(s.kv_cache().n_layer(), engine.config.n_layer as usize);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_truncates_tokens_and_kv_watermark() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[10, 20, 30, 40, 50]);
+        s.pos = 5;
+        s.kv_cache_mut().set_pos(5);
+
+        s.rewind(2);
+
+        assert_eq!(s.pos(), 2);
+        assert_eq!(s.tokens(), &[10, 20]);
+        assert_eq!(s.kv_cache().len(), 2);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_to_zero_matches_invalidate_for_position_state() {
+        // Both end up at pos=0 / empty tokens / kv watermark 0; only
+        // logits behaviour diverges (rewind preserves last logits, invalidate
+        // zeros them).
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[1, 2, 3]);
+        s.pos = 3;
+        s.kv_cache_mut().set_pos(3);
+
+        s.rewind(0);
+
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().len(), 0);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_past_end_clamps_to_current_length() {
+        // Matches `ds4_session_rewind`: `pos > checkpoint.len -> pos = checkpoint.len`.
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[1, 2, 3]);
+        s.pos = 3;
+        s.kv_cache_mut().set_pos(3);
+
+        s.rewind(99);
+
+        assert_eq!(s.pos(), 3);
+        assert_eq!(s.tokens(), &[1, 2, 3]);
+        assert_eq!(s.kv_cache().len(), 3);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_to_current_length_is_noop() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[7, 8]);
+        s.pos = 2;
+        s.kv_cache_mut().set_pos(2);
+
+        s.rewind(2);
+
+        assert_eq!(s.pos(), 2);
+        assert_eq!(s.tokens(), &[7, 8]);
+        assert_eq!(s.kv_cache().len(), 2);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_then_grow_back_overwrites_stale_kv() {
+        // After a rewind, the KV buffer past the new watermark is stale but
+        // still allocated. Subsequent writes should land at the new offset
+        // without surfacing the old data.
+        use crate::model::kv_cache::KV_LATENT_DIM;
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        let stale = vec![9.0f32; KV_LATENT_DIM];
+        let fresh = vec![1.0f32; KV_LATENT_DIM];
+
+        s.tokens.extend_from_slice(&[1, 2, 3]);
+        s.pos = 3;
+        for p in 0..3 {
+            s.kv_cache_mut().write_latent(0, p, &stale).unwrap();
+        }
+        s.kv_cache_mut().set_pos(3);
+
+        s.rewind(1);
+        s.tokens.push(99);
+        s.pos = 2;
+        s.kv_cache_mut().write_latent(0, 1, &fresh).unwrap();
+        s.kv_cache_mut().set_pos(2);
+
+        assert_eq!(s.kv_cache().read_latent(0, 0), stale.as_slice());
+        assert_eq!(s.kv_cache().read_latent(0, 1), fresh.as_slice());
     }
 }
