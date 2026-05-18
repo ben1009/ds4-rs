@@ -148,30 +148,49 @@ enum Command {
 
 /// Parse one line of REPL input. Slash commands are recognised case-
 /// insensitively; everything else falls through as a prompt.
+///
+/// Whitespace handling:
+/// * The trailing newline (`\n` / `\r`) is stripped from any line.
+/// * For *commands* we additionally trim leading whitespace so `  /help` still works.
+/// * For *prompts* we keep all interior and surrounding whitespace (apart from the line terminator)
+///   so indented code, alignment, or trailing spaces survive — matching what `-p` does in one-shot
+///   mode, and what the user actually typed.
+///
+/// No-argument commands reject any trailing junk and route to
+/// [`Command::Unknown`] so a typo like `/reset later` cannot silently
+/// destroy session state.
 fn parse_command(line: &str) -> Command {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
+    let stripped = line.trim_end_matches(['\n', '\r']);
+    if stripped.trim().is_empty() {
         return Command::Empty;
     }
-    if let Some(rest) = trimmed.strip_prefix('/') {
+    let cmd_view = stripped.trim_start();
+    if let Some(rest) = cmd_view.strip_prefix('/') {
         let mut parts = rest.splitn(2, char::is_whitespace);
         let head = parts.next().unwrap_or("").to_ascii_lowercase();
         let arg = parts.next().unwrap_or("").trim();
+        let no_args = |c: Command| -> Command {
+            if arg.is_empty() {
+                c
+            } else {
+                Command::Unknown(format!("/{head} does not take arguments"))
+            }
+        };
         return match head.as_str() {
-            "reset" | "clear" => Command::Reset,
+            "reset" | "clear" => no_args(Command::Reset),
             "rewind" => match arg.parse::<u32>() {
                 Ok(n) => Command::Rewind(n),
                 Err(_) => {
                     Command::Unknown(format!("/rewind needs a non-negative integer, got {arg:?}"))
                 }
             },
-            "ctx" => Command::ShowCtx,
-            "help" | "?" => Command::Help,
-            "exit" | "quit" => Command::Exit,
+            "ctx" => no_args(Command::ShowCtx),
+            "help" | "?" => no_args(Command::Help),
+            "exit" | "quit" => no_args(Command::Exit),
             other => Command::Unknown(format!("unknown command /{other}")),
         };
     }
-    Command::Prompt(trimmed.to_string())
+    Command::Prompt(stripped.to_string())
 }
 
 const REPL_HELP: &str = "\
@@ -459,8 +478,22 @@ mod tests {
     }
 
     #[test]
-    fn parse_strips_surrounding_whitespace_from_prompt() {
-        assert_eq!(parse_command("   hi\n"), Command::Prompt("hi".to_string()));
+    fn parse_strips_only_line_terminator_from_prompt() {
+        // Preserve interior + surrounding whitespace so prompts like
+        // indented code or alignment-sensitive text reach the model
+        // unchanged. Only the trailing CR/LF is dropped.
+        assert_eq!(
+            parse_command("   hi\n"),
+            Command::Prompt("   hi".to_string())
+        );
+        assert_eq!(
+            parse_command("foo bar  \r\n"),
+            Command::Prompt("foo bar  ".to_string())
+        );
+        assert_eq!(
+            parse_command("\t\tindented"),
+            Command::Prompt("\t\tindented".to_string())
+        );
     }
 
     #[test]
@@ -468,6 +501,37 @@ mod tests {
         assert_eq!(parse_command("/reset"), Command::Reset);
         assert_eq!(parse_command("/clear"), Command::Reset);
         assert_eq!(parse_command("/RESET"), Command::Reset);
+    }
+
+    #[test]
+    fn parse_no_arg_command_with_extra_text_is_unknown() {
+        // Codex P2 fix: a typo like `/reset later` must NOT silently
+        // wipe session state. Anything other than the bare command
+        // routes to Unknown so the REPL can complain instead of acting.
+        for input in [
+            "/reset later",
+            "/clear now",
+            "/ctx 5",
+            "/help me",
+            "/? thing",
+            "/exit now",
+            "/quit please",
+        ] {
+            match parse_command(input) {
+                Command::Unknown(msg) => assert!(
+                    msg.contains("does not take arguments"),
+                    "input {input:?} got msg {msg:?}",
+                ),
+                other => panic!("input {input:?}: expected Unknown, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_leading_whitespace_before_command_still_parses() {
+        // Trim leading whitespace for *commands* only (not prompts).
+        assert_eq!(parse_command("   /help"), Command::Help);
+        assert_eq!(parse_command("\t/reset\n"), Command::Reset);
     }
 
     #[test]
