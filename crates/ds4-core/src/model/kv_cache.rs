@@ -2,11 +2,14 @@
 //!
 //! See rfcs/0002-forward-pass.md §3.5 and antirez/ds4 ds4.c. The KV down-
 //! projection produces a single 512-dim row per token (DS4_N_HEAD_DIM),
-//! split into:
+//! split for storage into:
 //!   * 448-dim kv_latent (the "nope" part — no positional encoding)
 //!   * 64-dim  k_pe      (the decoupled RoPE key)
 //!
-//! Up-projection happens inside the attention kernel.
+//! DS4 MLA has no separate per-head K/V up-projection weight — the same
+//! 512-dim row is used unchanged as both K (for scoring) and V (for the
+//! weighted sum) across all 64 query heads. The split is purely a cache-
+//! layout choice (latent half is identity, k_pe half receives RoPE).
 //!
 //! Per-token footprint (f32): 448 + 64 = 512 floats = 2 KiB.
 //! For ctx=4096 and 43 layers: ~352 MiB.

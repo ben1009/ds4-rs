@@ -60,7 +60,7 @@ pub struct LayerWeights<'a> {
 impl<'a> LayerWeights<'a> {
     /// Load all tensors for layer `il` from the weight map.
     pub fn from_map(map: &'a WeightMap, il: u32) -> Result<Self> {
-        use crate::model::kv_cache::KV_LATENT_DIM;
+        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
 
         let prefix = format!("blk.{il}.");
         let n_embd = map.config.n_embd as usize;
@@ -117,7 +117,12 @@ impl<'a> LayerWeights<'a> {
             attn_q_a_norm: f32_1d("attn_q_a_norm.weight", q_a_rank)?,
             attn_q_b: q8_0("attn_q_b.weight")?,
             attn_kv: q8_0("attn_kv.weight")?,
-            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", KV_LATENT_DIM)?,
+            // attn_kv_a_norm spans the full N_HEAD_DIM (= KV_LATENT_DIM + K_PE_DIM = 512)
+            // row produced by attn_kv. The C reference (`rms_norm_weight(kv, raw,
+            // attn_kv_a_norm, DS4_N_HEAD_DIM, DS4_RMS_EPS)`) normalises the entire
+            // 512-dim row with a 512-wide weight; the split into latent / k_pe
+            // happens *after* the norm, when RoPE rotates the last 64 dims.
+            attn_kv_a_norm: f32_1d("attn_kv_a_norm.weight", KV_LATENT_DIM + K_PE_DIM)?,
             attn_sinks: f32_1d("attn_sinks.weight", n_head)?,
             attn_output_a: q8_0("attn_output_a.weight")?,
             attn_output_b: q8_0("attn_output_b.weight")?,
