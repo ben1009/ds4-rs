@@ -5,7 +5,7 @@
 
 A Rust port of [antirez/ds4](https://github.com/antirez/ds4): a single-model inference engine for **DeepSeek V4 Flash**.
 
-> **Status:** Phase 1 — core engine and CLI are under active development. The forward pass is partially implemented; see [`todo.md`](todo.md) for current blockers.
+> **Status:** Phase 1 forward pass is numerically complete and pending validation against a real DS4 GGUF (gated behind `DS4_TEST_MODEL`). Interactive REPL and session lifecycle (`rewind`, `invalidate`) are wired up. See [`todo.md`](todo.md) for the current backlog.
 
 ## Goals
 
@@ -31,12 +31,18 @@ cargo build --release
 ### Run
 
 ```bash
-# One-shot generation
+# One-shot generation (use -p)
 ds4 -p "What is Rust?" -n 128
+
+# Interactive REPL (default when no -p is supplied)
+ds4
 
 # With explicit model path and context size
 ds4 --model ./ds4flash.gguf -p "Hello" -n 64 --ctx 8192
 ```
+
+In the REPL, `/help` (or `/?`) lists the slash commands: `/reset`
+(`/clear`), `/rewind <n>`, `/ctx`, `/exit` (`/quit`).
 
 ### CLI Options
 
