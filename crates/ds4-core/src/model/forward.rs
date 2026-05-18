@@ -3,11 +3,6 @@
 //! See rfcs/0002-forward-pass.md §2 / §3. Phase 1 implements a CPU reference
 //! forward pass: single-threaded, f32 activations, sliding-window attention
 //! (no compressor/indexer), no FP8 KV round-trip.
-//!
-//! Missing pieces:
-//! * Real per-head MLA K/V up-projection inside attention (the decode path currently scores against
-//!   the cached `[kv_latent || k_pe]` directly).
-//! * Learned output HC reduction (the head still stream-sums for now).
 
 use std::sync::Arc;
 
@@ -24,7 +19,7 @@ use crate::{
         norm::{rms_norm, rms_norm_no_weight},
         rope::{apply_rope, apply_rope_inverse},
         softmax::sqrt_softplus,
-        swiglu::{silu, swiglu},
+        swiglu::{sigmoid_stable, silu, swiglu},
     },
     quant::q8_0,
     session::Session,
@@ -211,28 +206,24 @@ fn layer_attention_decode(
         n_head_dim,
     )?;
 
-    // KV projection (matches antirez/ds4 ds4.c). The attn_kv matmul produces
-    // a single DS4_N_HEAD_DIM = 512 wide row, split into:
-    //   * KV_LATENT_DIM = 448 — non-positional ("nope") slice, RMSNorm'd and cached
-    //   * K_PE_DIM      =  64 — decoupled RoPE key, RoPE'd and cached separately
-    // The MLA up-projection of the latent into per-head K/V is still pending;
-    // Phase 1 caches both pieces with the canonical dims so the cache asserts
-    // don't fire and downstream attention can read the correct shape.
+    // KV projection (matches antirez/ds4 ds4.c `layer_kv_projection_normed_one`).
+    // The attn_kv matmul produces a single DS4_N_HEAD_DIM = 512 wide row, which
+    // is RMSNorm'd as one vector with the 512-wide attn_kv_a_norm weight, then
+    // split into:
+    //   * KV_LATENT_DIM = 448 — non-positional ("nope") slice cached as latent
+    //   * K_PE_DIM      =  64 — decoupled RoPE key, RoPE'd in place and cached
+    // Attention scores Q against the full concatenated [latent || k_pe] row
+    // and the value weighted-sum runs over that same 512-dim row.
     use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
     let kv_full_dim = KV_LATENT_DIM + K_PE_DIM;
     let mut kv_raw = vec![0.0f32; kv_full_dim];
     matmul_row(layer.attn_kv, &attn_norm, &mut kv_raw);
 
-    let mut kv_latent = vec![0.0f32; KV_LATENT_DIM];
-    rms_norm(
-        &kv_raw[..KV_LATENT_DIM],
-        layer.attn_kv_a_norm,
-        1e-6,
-        &mut kv_latent,
-    );
+    let mut kv_normed = vec![0.0f32; kv_full_dim];
+    rms_norm(&kv_raw, layer.attn_kv_a_norm, 1e-6, &mut kv_normed);
 
-    let mut k_pe = kv_raw[KV_LATENT_DIM..].to_vec();
-    apply_rope(&mut k_pe, pos, &engine.rope_freqs);
+    let (kv_latent, k_pe) = kv_normed.split_at_mut(KV_LATENT_DIM);
+    apply_rope(k_pe, pos, &engine.rope_freqs);
 
     // RoPE per head on Q (uses precomputed frequency cache from Engine).
     for h in 0..n_head {
@@ -242,8 +233,8 @@ fn layer_attention_decode(
 
     // Store latent + k_pe in the cache and advance the watermark so the
     // just-written token participates in this step's softmax.
-    kv_cache.write_latent(il, pos, &kv_latent)?;
-    kv_cache.write_k_pe(il, pos, &k_pe)?;
+    kv_cache.write_latent(il, pos, kv_latent)?;
+    kv_cache.write_k_pe(il, pos, k_pe)?;
     if pos + 1 > kv_cache.len() {
         kv_cache.set_pos(pos + 1);
     }
@@ -395,16 +386,13 @@ fn attention_rows(
 ) -> Result<()> {
     use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
 
-    let sinks = layer.attn_sinks;
-    let kq_scale = 1.0 / (head_dim as f32).sqrt();
-    let window_len = end_pos - start_pos;
-
-    // Phase 1 stub: until the per-head MLA up-projection lands,
-    // we score against the concatenated MLA cache row [kv_latent || k_pe]
-    // (448 + 64 = 512 = head_dim). This keeps the full qh dot product
-    // covered and folds the decoupled RoPE key into attention so positional
-    // info isn't dropped.
-    debug_assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
+    // DS4 MLA: the KV cache row is split for storage but logically a single
+    // DS4_N_HEAD_DIM = 512 vector per token, used as *both* K (for scoring)
+    // and V (for the weighted sum). `attn_kv_a_norm` already normalised the
+    // full 512-dim row before split, and RoPE rotated only the last 64 dims.
+    // So Q · K and Σ wᵢ · V both run over the concatenated [latent || k_pe]
+    // row, matching `layer_attention_rows_one` in antirez/ds4 ds4.c.
+    assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
 
     let latent_prefix = kv_cache.latent_layer_prefix(il, end_pos);
     let k_pe_prefix = kv_cache.k_pe_layer_prefix(il, end_pos);
@@ -422,6 +410,46 @@ fn attention_rows(
         .ok_or_else(|| anyhow::anyhow!("attention window: k_pe end overflow"))?;
     let latent_window = &latent_prefix[lat_lo..lat_hi];
     let k_pe_window = &k_pe_prefix[pe_lo..pe_hi];
+
+    attention_rows_inner(
+        out_heads,
+        layer.attn_sinks,
+        q,
+        latent_window,
+        k_pe_window,
+        n_head,
+    );
+    Ok(())
+}
+
+/// Sink-aware attention over the cached KV window. Shared math between the
+/// per-layer decode call and unit tests — no `LayerWeights` dependency so the
+/// math can be exercised against hand-crafted inputs.
+///
+/// Buffer contract:
+/// * `latent_window` is `[window_len, KV_LATENT_DIM]` row-major.
+/// * `k_pe_window`   is `[window_len, K_PE_DIM]` row-major (same `window_len`).
+/// * `q`, `out_heads` are `[n_head, head_dim]`, `head_dim = KV_LATENT_DIM + K_PE_DIM`.
+/// * `sinks` has one logit per head.
+fn attention_rows_inner(
+    out_heads: &mut [f32],
+    sinks: &[f32],
+    q: &[f32],
+    latent_window: &[f32],
+    k_pe_window: &[f32],
+    n_head: usize,
+) {
+    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+
+    let head_dim = KV_LATENT_DIM + K_PE_DIM;
+    let kq_scale = 1.0 / (head_dim as f32).sqrt();
+    assert_eq!(out_heads.len(), n_head * head_dim);
+    assert_eq!(q.len(), n_head * head_dim);
+    assert_eq!(sinks.len(), n_head);
+    assert!(latent_window.len().is_multiple_of(KV_LATENT_DIM));
+    assert!(k_pe_window.len().is_multiple_of(K_PE_DIM));
+    let window_len = latent_window.len() / KV_LATENT_DIM;
+    assert_eq!(k_pe_window.len() / K_PE_DIM, window_len);
 
     let mut scores = vec![0.0f32; window_len];
 
@@ -448,17 +476,20 @@ fn attention_rows(
             }
         }
 
+        let (oh_latent, oh_pe) = oh.split_at_mut(KV_LATENT_DIM);
         let mut denom = (sinks[h] - max_score).exp();
-        let oh_latent = &mut oh[..KV_LATENT_DIM];
-        // k_pe is a *key*, not a value: it participates in scoring (above) but
-        // not in the output weighted sum. The k_pe slice of `oh` stays zero —
-        // the per-head MLA up-projection (which actually fills oh from V)
-        // is pending.
-        for (i, kv) in latent_window.chunks_exact(KV_LATENT_DIM).enumerate() {
+        for (i, (kv, k_pe)) in latent_window
+            .chunks_exact(KV_LATENT_DIM)
+            .zip(k_pe_window.chunks_exact(K_PE_DIM))
+            .enumerate()
+        {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            for (o, &k) in oh_latent.iter_mut().zip(kv.iter()) {
-                *o += k * weight;
+            for (o, &v) in oh_latent.iter_mut().zip(kv.iter()) {
+                *o += v * weight;
+            }
+            for (o, &v) in oh_pe.iter_mut().zip(k_pe.iter()) {
+                *o += v * weight;
             }
         }
 
@@ -467,8 +498,6 @@ fn attention_rows(
             *v *= inv;
         }
     }
-
-    Ok(())
 }
 
 fn grouped_out_decode(
@@ -760,16 +789,34 @@ fn output_head(
 ) -> Result<()> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
+    let hc_dim = n_hc
+        .checked_mul(n_embd)
+        .ok_or_else(|| anyhow::anyhow!("output_head: HC dim overflow"))?;
 
-    // Reduce HC streams to a single vector.
+    // Learned HC reduction (matches `output_hc_head_one` in antirez/ds4 ds4.c):
+    //   1. flat = rms_norm_no_weight(residual_hc, eps=1e-6)        // [hc_dim]
+    //   2. pre  = output_hc_fn @ flat                              // [n_hc]
+    //   3. w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + eps_hc
+    //   4. out  = sum_h residual_hc[h] * w[h]                      // [n_embd]
+    //
+    // The bias/scale tensors are tiny F32 vectors:
+    //   * output_hc_fn.weight    F16 shape [n_hc, hc_dim]
+    //   * output_hc_scale.weight F32 scalar
+    //   * output_hc_base.weight  F32 shape [n_hc]
+    let mut flat = vec![0.0f32; hc_dim];
+    rms_norm_no_weight(residual_hc, 1e-6, &mut flat);
+
+    let hc_fn = model.f16("output_hc_fn.weight")?;
+    let mut pre = vec![0.0f32; n_hc];
+    matmul_row(hc_fn, &flat, &mut pre);
+
+    let scale = model.f32_1d("output_hc_scale.weight", 1)?;
+    let base = model.f32_1d("output_hc_base.weight", n_hc)?;
+    let mut weights = vec![0.0f32; n_hc];
+    output_hc_weights(&pre, scale[0], base, &mut weights);
+
     let mut plain = vec![0.0f32; n_embd];
-    // The output uses a learned combine matrix, but for Phase 1 we can sum
-    // the streams. TODO: load output_weights from GGUF and do proper HC reduce.
-    for stream in residual_hc.chunks_exact(n_embd).take(n_hc) {
-        for (p, &s) in plain.iter_mut().zip(stream) {
-            *p += s;
-        }
-    }
+    hc_weighted_sum(residual_hc, &weights, &mut plain, n_embd, n_hc);
 
     // Final RMSNorm.
     let mut norm = vec![0.0f32; n_embd];
@@ -781,6 +828,23 @@ fn output_head(
     matmul_row(output_weight, &norm, logits);
 
     Ok(())
+}
+
+/// Per-stream weight epsilon for the output HC reduction.
+/// Matches `DS4_HC_EPS` in antirez/ds4 ds4.c (= 1e-6f).
+const HC_EPS: f32 = 1.0e-6;
+
+/// Compute per-stream output HC weights:
+/// `weights[i] = sigmoid_stable(pre[i] * scale + base[i]) + HC_EPS`.
+///
+/// Pure math, factored out for testing — matches `output_hc_head_one` in
+/// antirez/ds4 ds4.c.
+fn output_hc_weights(pre: &[f32], scale: f32, base: &[f32], weights: &mut [f32]) {
+    assert_eq!(pre.len(), weights.len());
+    assert_eq!(base.len(), weights.len());
+    for (w, (&p, &b)) in weights.iter_mut().zip(pre.iter().zip(base.iter())) {
+        *w = sigmoid_stable(p * scale + b) + HC_EPS;
+    }
 }
 
 #[cfg(test)]
@@ -921,5 +985,219 @@ mod tests {
             .collect();
         let total: f32 = scaled.iter().sum();
         assert!((total - EXPERT_WEIGHT_SCALE).abs() < 1e-5);
+    }
+
+    // -----------------------------------------------------------------------
+    // Attention (MLA) — covers the [latent || k_pe] path.
+    //
+    // These tests exercise `attention_rows_inner`, the pure helper that takes
+    // already-cached latent / k_pe rows and produces per-head attention output.
+    // They guard against the previous stub behavior where the k_pe slice of
+    // each head output was left as zeros.
+    // -----------------------------------------------------------------------
+
+    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+
+    fn head_dim_test() -> usize {
+        KV_LATENT_DIM + K_PE_DIM
+    }
+
+    #[test]
+    fn attention_single_kv_row_is_that_row() {
+        // With one cached token, softmax weight on that single row is 1.0
+        // (the sink only affects the denominator, but the row itself dominates
+        // when its dot is far above the sink). Pick q=k so the score is large
+        // positive; the output should be ~equal to the cached row across the
+        // full 512 dims, including the k_pe tail.
+        let head_dim = head_dim_test();
+        let n_head = 1usize;
+
+        // q = the cached row.
+        let mut q = vec![0.0f32; n_head * head_dim];
+        for (i, v) in q.iter_mut().enumerate() {
+            *v = ((i % 17) as f32 - 8.0) * 0.01;
+        }
+
+        let latent: Vec<f32> = q[..KV_LATENT_DIM].to_vec();
+        let k_pe: Vec<f32> = q[KV_LATENT_DIM..].to_vec();
+        let sinks = vec![-1e30f32; n_head];
+
+        let mut out = vec![0.0f32; n_head * head_dim];
+        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+
+        // With sink at -inf and one row, the weighted sum equals that row.
+        for i in 0..head_dim {
+            assert!(
+                (out[i] - q[i]).abs() < 1e-5,
+                "dim {i}: out={} q={}",
+                out[i],
+                q[i],
+            );
+        }
+        // Specifically: the k_pe tail (the previously-broken slice) is
+        // non-zero and matches the cached row.
+        assert!(out[KV_LATENT_DIM..].iter().any(|&v| v.abs() > 0.0));
+    }
+
+    #[test]
+    fn attention_dominated_sink_zeros_output() {
+        // With a single row but the sink logit *huge* relative to any score,
+        // the row's softmax weight collapses to ~0 and the output goes to ~0
+        // across the full head_dim — both latent and k_pe halves.
+        let head_dim = head_dim_test();
+        let n_head = 1usize;
+
+        let q = vec![0.1f32; n_head * head_dim];
+        let latent = vec![0.5f32; KV_LATENT_DIM];
+        let k_pe = vec![0.5f32; K_PE_DIM];
+        let sinks = vec![1e6f32; n_head];
+
+        let mut out = vec![0.0f32; n_head * head_dim];
+        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+
+        for (i, &v) in out.iter().enumerate() {
+            assert!(v.abs() < 1e-3, "dim {i} not collapsed: {v}");
+        }
+    }
+
+    #[test]
+    fn attention_uniform_rows_average_into_full_head() {
+        // Three identical rows, sink set far below scores. The weighted
+        // average over identical rows is just that row, so the output should
+        // equal the row across all 512 dims (latent and k_pe).
+        let head_dim = head_dim_test();
+        let n_head = 2usize;
+        let window = 3usize;
+
+        let mut latent = vec![0.0f32; window * KV_LATENT_DIM];
+        let mut k_pe = vec![0.0f32; window * K_PE_DIM];
+        let lat_row: Vec<f32> = (0..KV_LATENT_DIM).map(|i| (i as f32) * 0.001).collect();
+        let pe_row: Vec<f32> = (0..K_PE_DIM).map(|i| (i as f32) * 0.01 + 1.0).collect();
+        for r in 0..window {
+            latent[r * KV_LATENT_DIM..(r + 1) * KV_LATENT_DIM].copy_from_slice(&lat_row);
+            k_pe[r * K_PE_DIM..(r + 1) * K_PE_DIM].copy_from_slice(&pe_row);
+        }
+
+        // Pick q so the per-row dot is identical across rows (rows are
+        // identical) and sink << score.
+        let mut q = vec![0.0f32; n_head * head_dim];
+        for h in 0..n_head {
+            for d in 0..head_dim {
+                q[h * head_dim + d] = if d < KV_LATENT_DIM {
+                    lat_row[d]
+                } else {
+                    pe_row[d - KV_LATENT_DIM]
+                };
+            }
+        }
+        let sinks = vec![-1e30f32; n_head];
+
+        let mut out = vec![0.0f32; n_head * head_dim];
+        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+
+        for h in 0..n_head {
+            let oh = &out[h * head_dim..(h + 1) * head_dim];
+            for d in 0..KV_LATENT_DIM {
+                assert!(
+                    (oh[d] - lat_row[d]).abs() < 1e-4,
+                    "head {h} latent dim {d}: oh={} expected={}",
+                    oh[d],
+                    lat_row[d],
+                );
+            }
+            for d in 0..K_PE_DIM {
+                assert!(
+                    (oh[KV_LATENT_DIM + d] - pe_row[d]).abs() < 1e-4,
+                    "head {h} k_pe dim {d}: oh={} expected={}",
+                    oh[KV_LATENT_DIM + d],
+                    pe_row[d],
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_per_head_independence() {
+        // Two heads with different sink logits should produce different
+        // outputs even with the same q/k/v window. Catches accidental
+        // sharing across heads.
+        let head_dim = head_dim_test();
+        let n_head = 2usize;
+
+        let q = vec![0.1f32; n_head * head_dim];
+        let latent = vec![0.3f32; KV_LATENT_DIM];
+        let k_pe = vec![0.4f32; K_PE_DIM];
+        let sinks = vec![-100.0f32, 100.0f32];
+
+        let mut out = vec![0.0f32; n_head * head_dim];
+        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+
+        let head0 = &out[..head_dim];
+        let head1 = &out[head_dim..];
+        // Head 0 with sink << score should pull in the row; head 1 with sink
+        // >> score should collapse near zero.
+        let mag0: f32 = head0.iter().map(|v| v.abs()).sum();
+        let mag1: f32 = head1.iter().map(|v| v.abs()).sum();
+        assert!(
+            mag0 > mag1 * 10.0,
+            "head0 mag {mag0} should dominate {mag1}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Output HC reduction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn output_hc_weights_match_reference_formula() {
+        // Spot-check against the C reference:
+        //   w[i] = sigmoid_stable(pre[i] * scale + base[i]) + HC_EPS
+        let pre = [0.0f32, 1.0, -1.0, 2.0];
+        let scale = 0.5f32;
+        let base = [0.0f32, -0.25, 0.5, 1.0];
+        let mut got = [0.0f32; 4];
+        output_hc_weights(&pre, scale, &base, &mut got);
+
+        for (i, &w) in got.iter().enumerate() {
+            let z = pre[i] * scale + base[i];
+            let expected = 1.0 / (1.0 + (-z).exp()) + HC_EPS;
+            assert!(
+                (w - expected).abs() < 1e-6,
+                "i={i}: got {w} want {expected}",
+            );
+        }
+    }
+
+    #[test]
+    fn output_hc_weights_floor_above_eps() {
+        // sigmoid_stable saturates at 0 / 1 for large magnitude inputs; the
+        // +HC_EPS floor keeps weights strictly positive.
+        let pre = [-1e6f32, 1e6];
+        let base = [0.0f32, 0.0];
+        let mut w = [0.0f32; 2];
+        output_hc_weights(&pre, 1.0, &base, &mut w);
+        assert!(
+            w[0] >= HC_EPS,
+            "negative-saturated weight {} below eps",
+            w[0]
+        );
+        assert!(
+            w[1] > 1.0 - 1e-3,
+            "positive-saturated weight {} too low",
+            w[1]
+        );
+        assert!(w[0].is_finite() && w[1].is_finite());
+    }
+
+    #[test]
+    fn output_hc_weights_zero_input_is_half() {
+        // sigmoid(0) = 0.5, so weights collapse to 0.5 + eps when pre/base/scale all zero.
+        let pre = [0.0f32; 4];
+        let base = [0.0f32; 4];
+        let mut w = [0.0f32; 4];
+        output_hc_weights(&pre, 0.0, &base, &mut w);
+        for v in w {
+            assert!((v - (0.5 + HC_EPS)).abs() < 1e-6);
+        }
     }
 }

@@ -33,10 +33,11 @@ usage() {
 Usage: $(basename "$0") <op>
 
 Available ops:
-  q8_0        Regenerate Q8_0 dequant + matmul reference vectors.
-  q8_k        Regenerate Q8_K activation pre-quantisation reference vectors.
-  rms_norm    Regenerate RMSNorm (weighted + no-weight) reference vectors.
-  rope        Regenerate partial RoPE + YaRN reference vectors.
+  q8_0           Regenerate Q8_0 dequant + matmul reference vectors.
+  q8_k           Regenerate Q8_K activation pre-quantisation reference vectors.
+  rms_norm       Regenerate RMSNorm (weighted + no-weight) reference vectors.
+  rope           Regenerate partial RoPE + YaRN reference vectors.
+  routed_quants  Regenerate IQ2_XXS / Q2_K / Q4_K / IQ4_XS / IQ4_NL dequant + dot reference vectors.
 EOF
     exit 1
 }
@@ -89,6 +90,22 @@ regen_rope() {
     summary rope_plain_pos127.bin rope_yarn_pos0.bin rope_yarn_pos127.bin rope_yarn_inverse.bin
 }
 
+regen_routed_quants() {
+    # IQ2_XXS / Q2_K / Q4_K / IQ4_XS / IQ4_NL: dequant is pure block
+    # arithmetic (no f32 reductions), and the dot products against
+    # Q8_K (or, for IQ4_NL, f32) activations have a fixed left-to-right
+    # accumulation order. Reproducible across platforms; manifest SHA
+    # check guards byte-stability.
+    cd "$REPO_ROOT"
+    cargo run --quiet -p ds4-core --example gen_vectors_routed_quants
+    summary \
+        iq2_xxs_dequant.bin iq2_xxs_dot.bin \
+        q2_k_dequant.bin    q2_k_dot.bin \
+        q4_k_dequant.bin    q4_k_dot.bin \
+        iq4_xs_dequant.bin  iq4_xs_dot.bin \
+        iq4_nl_dequant.bin  iq4_nl_dot.bin
+}
+
 main() {
     if [ $# -ne 1 ]; then
         usage
@@ -106,6 +123,9 @@ main() {
             ;;
         rope)
             regen_rope
+            ;;
+        routed_quants)
+            regen_routed_quants
             ;;
         -h|--help)
             usage

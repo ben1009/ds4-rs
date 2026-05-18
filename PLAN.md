@@ -8,11 +8,18 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 
 **Goal:** Load model weights, run forward pass, generate tokens greedily via `ds4 -p "hello"`.
 
-**Status:** In progress. GGUF/config/tokenizer plumbing, core op helpers,
-partial decode forward orchestration, MLA latent KV cache, routed MoE
-assembly, and session/CLI wiring have landed. Phase 1 logits are not
-numerically complete yet: real MLA K/V up-projection, learned output HC
-reduction, and end-to-end smoke coverage remain tracked in `todo.md`.
+**Status:** Forward pass numerically complete; pending smoke validation
+against a real GGUF. GGUF / config / tokenizer plumbing, all Phase 1
+quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL), core op
+helpers (RMSNorm, partial RoPE + YaRN, softmax, SwiGLU, HC Sinkhorn), the
+MLA latent KV cache, the full attention path (single 512-dim cached row
+used as both K and V — no separate per-head up-projection), the routed
+MoE assembly (hash routing for layers 0–2 / biased top-k for layers 3+),
+and the learned output HC reduction have landed. `Session::prefill` and
+`Session::eval_token` reach the full forward graph; the CLI `ds4 -p
+"..." -n ...` exercises tokenizer → prefill → eval → argmax → decode
+end-to-end. `crates/ds4-core/tests/forward_smoke.rs` (gated behind
+`DS4_TEST_MODEL`) validates forward-pass health against a real model.
 
 ### Step 1 — Workspace scaffold
 
@@ -23,8 +30,9 @@ Status: **done**.
 
 ### Step 2 — `ds4-core`: GGUF parser + config + model
 
-Status: **partially done**. The loader and typed weight accessors exist; routed
-expert quant typed accessors are still blocked on the remaining quant kernels.
+Status: **done.** The loader, typed weight accessors, and all Phase 1
+quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL) are in
+place; routed-expert tensors auto-dispatch via `WeightMap::quant_weight`.
 
 | File | Responsibility |
 |------|---------------|
@@ -42,9 +50,10 @@ Status: **done for the current Phase 1 path**.
 
 ### Step 4 — `ds4-core`: engine + session
 
-Status: **partial**. `Session::prefill` and `Session::eval_token` now call the
-decode forward path and preserve session/KV state on errors. The forward graph
-still contains the numerical stubs listed in `todo.md`.
+Status: **done for Phase 1.** `Session::prefill` and `Session::eval_token`
+run the full decode forward path (real MLA attention + learned output HC
+reduction), preserve session / KV state on errors, and reject context
+overflow before mutating state.
 
 | File | Responsibility |
 |------|---------------|
@@ -60,9 +69,10 @@ Output head: HC reduction → norm → LM head → logits.
 
 ### Step 5 — `ds4-cli`: one-shot generation
 
-Status: **wired, pending credible logits**. The CLI reaches session prefill and
-generation, but real model smoke validation waits for the remaining Phase 1
-forward-pass work.
+Status: **wired.** The CLI exercises tokenizer → session prefill →
+eval_token → argmax → decode end-to-end. Real-model smoke validation runs
+via the `DS4_TEST_MODEL`-gated integration test in
+`crates/ds4-core/tests/forward_smoke.rs`.
 
 | File | Responsibility |
 |------|---------------|
