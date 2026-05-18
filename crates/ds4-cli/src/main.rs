@@ -102,27 +102,7 @@ fn one_shot(
 
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    let eos = engine.tokenizer.eos_token();
-
-    let logits = session.prefill(&tokens)?;
-    let mut token =
-        Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
-    let mut pending: Vec<u8> = Vec::new();
-
-    for _ in 0..max_tokens {
-        if token == eos {
-            break;
-        }
-        engine.tokenizer.append_token_bytes(token, &mut pending);
-        write_utf8(&mut handle, &mut pending, false)?;
-        handle.flush()?;
-        let logits = session.eval_token(token)?;
-        token = Session::argmax(logits)
-            .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
-    }
-    write_utf8(&mut handle, &mut pending, true)?;
-    writeln!(handle)?;
-    Ok(())
+    generate_turn(engine, &mut session, &tokens, max_tokens, &mut handle)
 }
 
 /// One parsed line of REPL input.
@@ -252,7 +232,12 @@ fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()
                 writeln!(out, "error: {msg} — try /help")?;
             }
             Command::Prompt(text) => {
-                if let Err(err) = generate_turn(engine, &mut session, &text, max_tokens, &mut out) {
+                // Only prepend BOS for the very first prefill of the session;
+                // multi-turn input is appended without another BOS.
+                let add_bos = session.tokens().is_empty();
+                let tokens = engine.tokenizer.encode(&text, add_bos);
+                if let Err(err) = generate_turn(engine, &mut session, &tokens, max_tokens, &mut out)
+                {
                     writeln!(out, "error: {err}")?;
                 }
             }
@@ -261,25 +246,25 @@ fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()
     }
 }
 
-/// Run one turn: encode `text`, prefill, generate up to `max_tokens` tokens,
-/// stream UTF-8 output. Errors leave the session state intact (Session
-/// already rolls back on forward errors), so the REPL can continue.
+/// Run one turn against an already-encoded prompt: prefill, then generate up
+/// to `max_tokens` tokens, streaming UTF-8 output. Empty input is a no-op.
+///
+/// Errors leave session state intact: `Session::prefill` and `eval_token`
+/// already roll their own state back on forward failures, so the REPL can
+/// continue with the previous turn's tokens / KV intact. No extra snapshot
+/// is needed at this layer.
 fn generate_turn<W: Write>(
     engine: &Engine,
     session: &mut Session,
-    text: &str,
+    tokens: &[u32],
     max_tokens: u32,
     out: &mut W,
 ) -> Result<()> {
-    // Only prepend BOS for the very first prefill of the session; after
-    // that, multi-turn input is appended without another BOS.
-    let add_bos = session.tokens().is_empty();
-    let tokens = engine.tokenizer.encode(text, add_bos);
     if tokens.is_empty() {
         return Ok(());
     }
 
-    let logits = session.prefill(&tokens)?;
+    let logits = session.prefill(tokens)?;
     let mut token =
         Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
     let eos = engine.tokenizer.eos_token();
