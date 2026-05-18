@@ -24,6 +24,13 @@ use crate::gguf::Value;
 /// 68 non-printable bytes are remapped to codepoints 256..324.
 const N_BYTE_CODEPOINTS: usize = 256;
 
+/// Cached GPT-2 byte → printable codepoint table. Built once on first use;
+/// `byte_encode` and the test/synthetic helpers all read from it.
+fn byte_to_cp() -> &'static [u32; 256] {
+    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(build_byte_to_cp)
+}
+
 /// GPT-2 byte → printable codepoint table.
 /// `byte_to_cp[b]` gives the encoded codepoint for raw byte `b`.
 fn build_byte_to_cp() -> [u32; 256] {
@@ -114,8 +121,8 @@ impl Tokenizer {
             .and_then(|v| v.to_u32())
             .unwrap_or(1);
 
-        let byte_to_cp = build_byte_to_cp();
-        let cp_to_byte = build_cp_to_byte(&byte_to_cp);
+        let byte_to_cp = byte_to_cp();
+        let cp_to_byte = build_cp_to_byte(byte_to_cp);
 
         // Validate that every raw byte has a single-codepoint token in the
         // vocab. Missing byte tokens mean the vocab is incompatible — bail
@@ -171,14 +178,10 @@ impl Tokenizer {
         // Initial symbol list: one entry per UTF-8 char of `encoded`, stored
         // as (byte_offset, byte_len). Working on byte indices avoids building
         // owned Strings inside the merge loop.
-        let bytes = encoded.as_bytes();
-        let mut sym: Vec<(usize, usize)> = Vec::with_capacity(bytes.len());
-        let mut off = 0usize;
-        while off < bytes.len() {
-            let n = utf8_len_from_first_byte(bytes[off]).min(bytes.len() - off);
-            sym.push((off, n));
-            off += n;
-        }
+        let mut sym: Vec<(usize, usize)> = encoded
+            .char_indices()
+            .map(|(i, ch)| (i, ch.len_utf8()))
+            .collect();
 
         // Repeatedly merge the lowest-rank adjacent pair until none apply.
         // Quadratic in symbol count; pieces are short (single words /
@@ -296,7 +299,7 @@ impl Tokenizer {
 /// (`byte_encode` in ds4.c). Each input byte becomes exactly one Unicode
 /// codepoint in the encoded output.
 fn byte_encode(bytes: &[u8]) -> String {
-    let table = build_byte_to_cp();
+    let table = byte_to_cp();
     let mut out = String::with_capacity(bytes.len() * 2);
     let mut buf = [0u8; 4];
     for &b in bytes {
@@ -329,7 +332,7 @@ fn utf8_len_from_first_byte(c: u8) -> usize {
 /// don't otherwise care about the tokenizer.
 #[cfg(test)]
 pub(crate) fn synthetic_byte_tokens() -> Vec<String> {
-    let table = build_byte_to_cp();
+    let table = byte_to_cp();
     let mut out = Vec::with_capacity(256);
     let mut buf = [0u8; 4];
     for b in 0u32..256 {
@@ -553,8 +556,8 @@ mod tests {
     /// of extra (non-merge) tokens. The vocab is initialised with all 256
     /// GPT-2 byte codepoints in canonical order so byte fallback works.
     fn tok(merges: &[(&str, &str)], extra: &[&str]) -> Tokenizer {
-        let byte_to_cp = build_byte_to_cp();
-        let cp_to_byte = build_cp_to_byte(&byte_to_cp);
+        let byte_to_cp = byte_to_cp();
+        let cp_to_byte = build_cp_to_byte(byte_to_cp);
 
         // Canonical byte tokens first: one single-codepoint token per byte
         // value in raw-byte order. This means tokens[b] is the encoded token
@@ -603,7 +606,7 @@ mod tests {
 
     /// Encoded form of a single raw byte (one-character string).
     fn enc(b: u8) -> String {
-        let table = build_byte_to_cp();
+        let table = byte_to_cp();
         let cp = table[b as usize];
         let mut buf = [0u8; 4];
         char::from_u32(cp)
@@ -620,15 +623,15 @@ mod tests {
 
     #[test]
     fn byte_encoding_keeps_printable_ascii() {
-        let table = build_byte_to_cp();
-        for b in [b'A', b'z', b'5', b'!', b'~'] {
+        let table = byte_to_cp();
+        for b in *b"Az5!~" {
             assert_eq!(table[b as usize], b as u32);
         }
     }
 
     #[test]
     fn byte_encoding_remaps_nonprintable_bytes() {
-        let table = build_byte_to_cp();
+        let table = byte_to_cp();
         // 0x00 and 0x20 (space) are remapped to codepoints >= 256.
         assert!(table[0] >= 256);
         assert!(table[0x20] >= 256);
@@ -638,8 +641,8 @@ mod tests {
     #[test]
     fn byte_encode_is_invertible() {
         // Every byte 0..=255 round-trips through encode → cp_to_byte.
-        let byte_to_cp = build_byte_to_cp();
-        let cp_to_byte = build_cp_to_byte(&byte_to_cp);
+        let byte_to_cp = byte_to_cp();
+        let cp_to_byte = build_cp_to_byte(byte_to_cp);
         for b in 0u8..=255 {
             let cp = byte_to_cp[b as usize];
             assert_eq!(cp_to_byte[&cp], b);
@@ -882,7 +885,7 @@ mod tests {
     fn from_metadata_builds_tokenizer() {
         // Build a vocab: 256 byte tokens (in encoded form) + one merged
         // token for the encoded "Hi" pair.
-        let byte_to_cp = build_byte_to_cp();
+        let byte_to_cp = byte_to_cp();
         let mut buf = [0u8; 4];
         let mut tokens_v: Vec<Value> = (0u32..256)
             .map(|b| {
@@ -915,7 +918,7 @@ mod tests {
     #[test]
     fn from_metadata_missing_byte_token_fails() {
         // Vocab with all but one byte codepoint.
-        let byte_to_cp = build_byte_to_cp();
+        let byte_to_cp = byte_to_cp();
         let mut buf = [0u8; 4];
         let mut tokens_v: Vec<Value> = Vec::with_capacity(255);
         for b in 0u32..256 {
@@ -955,7 +958,7 @@ mod tests {
 
     #[test]
     fn from_metadata_default_bos_eos_when_absent() {
-        let byte_to_cp = build_byte_to_cp();
+        let byte_to_cp = byte_to_cp();
         let mut buf = [0u8; 4];
         let tokens_v: Vec<Value> = (0u32..256)
             .map(|b| {
@@ -976,7 +979,7 @@ mod tests {
 
     #[test]
     fn from_metadata_ignores_malformed_merge_entries() {
-        let byte_to_cp = build_byte_to_cp();
+        let byte_to_cp = byte_to_cp();
         let mut buf = [0u8; 4];
         let mut tokens_v: Vec<Value> = (0u32..256)
             .map(|b| {
@@ -1006,7 +1009,7 @@ mod tests {
 
     #[test]
     fn from_metadata_works_without_merges() {
-        let byte_to_cp = build_byte_to_cp();
+        let byte_to_cp = byte_to_cp();
         let mut buf = [0u8; 4];
         let tokens_v: Vec<Value> = (0u32..256)
             .map(|b| {
