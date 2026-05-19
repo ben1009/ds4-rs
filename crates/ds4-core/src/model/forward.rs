@@ -522,11 +522,49 @@ fn grouped_out_decode(
             .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: low len overflow"))?
     ];
 
-    for (group_input, group_output) in heads
+    // `attn_output_a` is logically n_groups stacked `(group_dim, rank)`
+    // matrices along the out axis (matches `matvec_q8_0_grouped_rows` in
+    // antirez/ds4 ds4.c — the loader correctly reads in=group_dim,
+    // out=n_groups*rank). Slice the weight bytes per group so each
+    // matmul_row sees its own (group_dim → rank) submatrix.
+    let (bytes, total_in, total_out) = match layer.attn_output_a {
+        crate::ops::matmul::WeightView::Q8_0 {
+            bytes,
+            in_features,
+            out_features,
+        } => (bytes, in_features, out_features),
+        _ => bail!("grouped_out_decode: attn_output_a must be Q8_0"),
+    };
+    if total_in != group_dim {
+        bail!("grouped_out_decode: attn_output_a in_features {total_in} != group_dim {group_dim}",);
+    }
+    let expected_out = n_groups
+        .checked_mul(rank)
+        .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: expected_out overflow"))?;
+    if total_out != expected_out {
+        bail!(
+            "grouped_out_decode: attn_output_a out_features {total_out} != n_groups*rank {expected_out}",
+        );
+    }
+    let blocks_per_row = group_dim / q8_0::BLOCK_SIZE;
+    let bytes_per_row = blocks_per_row
+        .checked_mul(q8_0::BYTES_PER_BLOCK)
+        .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: bytes_per_row overflow"))?;
+    let bytes_per_group = rank
+        .checked_mul(bytes_per_row)
+        .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: bytes_per_group overflow"))?;
+
+    for (g, (group_input, group_output)) in heads
         .chunks_exact(group_dim)
         .zip(low.chunks_exact_mut(rank))
+        .enumerate()
     {
-        matmul_row(layer.attn_output_a, group_input, group_output);
+        let group_view = crate::ops::matmul::WeightView::Q8_0 {
+            bytes: &bytes[g * bytes_per_group..(g + 1) * bytes_per_group],
+            in_features: group_dim,
+            out_features: rank,
+        };
+        matmul_row(group_view, group_input, group_output);
     }
 
     matmul_row(layer.attn_output_b, &low, out);
