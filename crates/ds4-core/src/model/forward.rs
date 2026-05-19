@@ -546,9 +546,9 @@ fn grouped_out_decode(
             "grouped_out_decode: attn_output_a out_features {total_out} != n_groups*rank {expected_out}",
         );
     }
-    let blocks_per_row = group_dim / 32;
+    let blocks_per_row = group_dim / q8_0::BLOCK_SIZE;
     let bytes_per_row = blocks_per_row
-        .checked_mul(34)
+        .checked_mul(q8_0::BYTES_PER_BLOCK)
         .ok_or_else(|| anyhow::anyhow!("grouped_out_decode: bytes_per_row overflow"))?;
     let bytes_per_group = rank
         .checked_mul(bytes_per_row)
