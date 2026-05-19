@@ -817,13 +817,9 @@ fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
             // All remaining values are NaN / -inf. Fall back to the lowest
             // unselected index so we keep emitting distinct slots and the
             // forward pass can continue.
-            for i in 0..values.len() {
-                if !out[..slot].contains(&i) {
-                    best_i = i;
-                    break;
-                }
-            }
-            debug_assert_ne!(best_i, usize::MAX, "k > values.len() should be impossible");
+            best_i = (0..values.len())
+                .find(|i| !out[..slot].contains(i))
+                .expect("topk_indices_desc: k > values.len() should be impossible");
         }
         out[slot] = best_i;
     }
