@@ -50,6 +50,9 @@ impl ModelConfig {
         let n_layer = get_u32("deepseek4.block_count")?;
         let n_ff = get_u32("deepseek4.expert_feed_forward_length")?;
         let q_lora_rank = get_u32("deepseek4.attention.q_lora_rank")?;
+        if q_lora_rank == 0 {
+            anyhow::bail!("deepseek4.attention.q_lora_rank must be > 0");
+        }
 
         let head_dim = get_u32("deepseek4.attention.key_length")
             .or_else(|_| get_u32("deepseek4.attention.head_dim"))
@@ -148,6 +151,17 @@ mod tests {
         assert!(
             err.to_string().contains("head_count"),
             "expected head_count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn q_lora_rank_zero_errors() {
+        let mut m = base_metadata();
+        m.insert("deepseek4.attention.q_lora_rank".to_string(), Value::U32(0));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("q_lora_rank"),
+            "expected q_lora_rank error, got: {err}"
         );
     }
 
