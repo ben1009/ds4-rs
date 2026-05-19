@@ -25,10 +25,6 @@ use crate::{
     session::Session,
 };
 
-/// Width of the local attention window in decode. Matches `DS4_SWA_K`
-/// in antirez/ds4 ds4.c — the recent-tokens prefix scored at every layer.
-const SLIDING_WINDOW: usize = 128;
-
 /// Run a single decode step: compute logits for the token at `session.pos()`.
 ///
 /// **Contract:** `session.pos()` must be the index of the token to evaluate
@@ -209,21 +205,17 @@ fn layer_attention_decode(
     // KV projection (matches antirez/ds4 ds4.c `layer_kv_projection_normed_one`).
     // The attn_kv matmul produces a single DS4_N_HEAD_DIM = 512 wide row, which
     // is RMSNorm'd as one vector with the 512-wide attn_kv_a_norm weight, then
-    // split into:
-    //   * KV_LATENT_DIM = 448 — non-positional ("nope") slice cached as latent
-    //   * K_PE_DIM      =  64 — decoupled RoPE key, RoPE'd in place and cached
-    // Attention scores Q against the full concatenated [latent || k_pe] row
-    // and the value weighted-sum runs over that same 512-dim row.
-    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
-    let kv_full_dim = KV_LATENT_DIM + K_PE_DIM;
-    let mut kv_raw = vec![0.0f32; kv_full_dim];
+    // RoPE'd in place over the trailing K_PE_DIM tail. The merged row is pushed
+    // into the per-layer raw ring buffer; the ring enforces the SWA window
+    // itself (oldest-evicting on overflow).
+    use crate::model::kv_cache::{HEAD_DIM, KV_LATENT_DIM};
+    let mut kv_raw = [0.0f32; HEAD_DIM];
     matmul_row(layer.attn_kv, &attn_norm, &mut kv_raw);
 
-    let mut kv_normed = vec![0.0f32; kv_full_dim];
+    let mut kv_normed = [0.0f32; HEAD_DIM];
     rms_norm(&kv_raw, layer.attn_kv_a_norm, 1e-6, &mut kv_normed);
 
-    let (kv_latent, k_pe) = kv_normed.split_at_mut(KV_LATENT_DIM);
-    apply_rope(k_pe, pos, &engine.rope_freqs);
+    apply_rope(&mut kv_normed[KV_LATENT_DIM..], pos, &engine.rope_freqs);
 
     // RoPE per head on Q (uses precomputed frequency cache from Engine).
     for h in 0..n_head {
@@ -231,22 +223,11 @@ fn layer_attention_decode(
         apply_rope(qh, pos, &engine.rope_freqs);
     }
 
-    // Store latent + k_pe in the cache and advance the watermark so the
-    // just-written token participates in this step's softmax.
-    kv_cache.write_latent(il, pos, kv_latent)?;
-    kv_cache.write_k_pe(il, pos, k_pe)?;
-    if pos + 1 > kv_cache.len() {
-        kv_cache.set_pos(pos + 1);
-    }
+    kv_cache.layer_mut(il).push(&kv_normed);
 
     // Attention over cached KV rows.
     let mut heads = vec![0.0f32; q_dim];
-    let kv_len = (pos + 1).min(kv_cache.ctx_size());
-    let start_pos = kv_len.saturating_sub(SLIDING_WINDOW);
-
-    attention_rows(
-        &mut heads, layer, &q, kv_cache, il, start_pos, kv_len, n_head, n_head_dim,
-    )?;
+    attention_rows(&mut heads, layer, &q, kv_cache, il, n_head, n_head_dim)?;
 
     // Inverse RoPE per head on attention output before grouped projection.
     for h in 0..n_head {
@@ -379,46 +360,20 @@ fn attention_rows(
     q: &[f32],
     kv_cache: &KvCache,
     il: usize,
-    start_pos: usize,
-    end_pos: usize,
     n_head: usize,
     head_dim: usize,
 ) -> Result<()> {
-    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+    use crate::model::kv_cache::HEAD_DIM;
 
-    // DS4 MLA: the KV cache row is split for storage but logically a single
-    // DS4_N_HEAD_DIM = 512 vector per token, used as *both* K (for scoring)
-    // and V (for the weighted sum). `attn_kv_a_norm` already normalised the
-    // full 512-dim row before split, and RoPE rotated only the last 64 dims.
-    // So Q · K and Σ wᵢ · V both run over the concatenated [latent || k_pe]
-    // row, matching `layer_attention_rows_one` in antirez/ds4 ds4.c.
-    assert_eq!(head_dim, KV_LATENT_DIM + K_PE_DIM);
+    // DS4 MLA: the cached row is a single HEAD_DIM = 512 vector, used as
+    // *both* K (for scoring) and V (for the weighted sum). `attn_kv_a_norm`
+    // already normalised the full row before RoPE rotated only the last 64
+    // dims. Q · K and Σ wᵢ · V both run over the same 512-dim row, matching
+    // `layer_attention_rows_one` in antirez/ds4 ds4.c.
+    assert_eq!(head_dim, HEAD_DIM);
 
-    let latent_prefix = kv_cache.latent_layer_prefix(il, end_pos);
-    let k_pe_prefix = kv_cache.k_pe_layer_prefix(il, end_pos);
-    let lat_lo = start_pos
-        .checked_mul(KV_LATENT_DIM)
-        .ok_or_else(|| anyhow::anyhow!("attention window: latent start overflow"))?;
-    let lat_hi = end_pos
-        .checked_mul(KV_LATENT_DIM)
-        .ok_or_else(|| anyhow::anyhow!("attention window: latent end overflow"))?;
-    let pe_lo = start_pos
-        .checked_mul(K_PE_DIM)
-        .ok_or_else(|| anyhow::anyhow!("attention window: k_pe start overflow"))?;
-    let pe_hi = end_pos
-        .checked_mul(K_PE_DIM)
-        .ok_or_else(|| anyhow::anyhow!("attention window: k_pe end overflow"))?;
-    let latent_window = &latent_prefix[lat_lo..lat_hi];
-    let k_pe_window = &k_pe_prefix[pe_lo..pe_hi];
-
-    attention_rows_inner(
-        out_heads,
-        layer.attn_sinks,
-        q,
-        latent_window,
-        k_pe_window,
-        n_head,
-    );
+    let kv_window = kv_cache.layer(il).rows();
+    attention_rows_inner(out_heads, layer.attn_sinks, q, kv_window, n_head);
     Ok(())
 }
 
@@ -427,68 +382,54 @@ fn attention_rows(
 /// math can be exercised against hand-crafted inputs.
 ///
 /// Buffer contract:
-/// * `latent_window` is `[window_len, KV_LATENT_DIM]` row-major.
-/// * `k_pe_window`   is `[window_len, K_PE_DIM]` row-major (same `window_len`).
-/// * `q`, `out_heads` are `[n_head, head_dim]`, `head_dim = KV_LATENT_DIM + K_PE_DIM`.
+/// * `kv_window` is `[window_len, HEAD_DIM]` row-major.
+/// * `q`, `out_heads` are `[n_head, HEAD_DIM]`.
 /// * `sinks` has one logit per head.
 fn attention_rows_inner(
     out_heads: &mut [f32],
     sinks: &[f32],
     q: &[f32],
-    latent_window: &[f32],
-    k_pe_window: &[f32],
+    kv_window: &[f32],
     n_head: usize,
 ) {
-    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+    use crate::model::kv_cache::{HEAD_DIM, SWA};
 
-    let head_dim = KV_LATENT_DIM + K_PE_DIM;
+    let head_dim = HEAD_DIM;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
     assert_eq!(out_heads.len(), n_head * head_dim);
     assert_eq!(q.len(), n_head * head_dim);
     assert_eq!(sinks.len(), n_head);
-    assert!(latent_window.len().is_multiple_of(KV_LATENT_DIM));
-    assert!(k_pe_window.len().is_multiple_of(K_PE_DIM));
-    let window_len = latent_window.len() / KV_LATENT_DIM;
-    assert_eq!(k_pe_window.len() / K_PE_DIM, window_len);
+    assert!(kv_window.len().is_multiple_of(head_dim));
+    let window_len = kv_window.len() / head_dim;
+    assert!(
+        window_len <= SWA,
+        "attention_rows_inner: window_len {window_len} > SWA {SWA}"
+    );
 
-    let mut scores = vec![0.0f32; window_len];
+    let mut scores_buf = [0.0f32; SWA];
+    let scores = &mut scores_buf[..window_len];
 
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
-        let qh_latent = &qh[..KV_LATENT_DIM];
-        let qh_pe = &qh[KV_LATENT_DIM..];
         let oh = &mut out_heads[h * head_dim..(h + 1) * head_dim];
         oh.fill(0.0);
 
         let mut max_score = sinks[h];
 
-        for (i, (kv, k_pe)) in latent_window
-            .chunks_exact(KV_LATENT_DIM)
-            .zip(k_pe_window.chunks_exact(K_PE_DIM))
-            .enumerate()
-        {
-            let s_latent: f32 = qh_latent.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum();
-            let s_pe: f32 = qh_pe.iter().zip(k_pe.iter()).map(|(&q, &k)| q * k).sum();
-            let score = (s_latent + s_pe) * kq_scale;
+        for (i, kv) in kv_window.chunks_exact(head_dim).enumerate() {
+            let dot: f32 = qh.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum();
+            let score = dot * kq_scale;
             scores[i] = score;
             if score > max_score {
                 max_score = score;
             }
         }
 
-        let (oh_latent, oh_pe) = oh.split_at_mut(KV_LATENT_DIM);
         let mut denom = (sinks[h] - max_score).exp();
-        for (i, (kv, k_pe)) in latent_window
-            .chunks_exact(KV_LATENT_DIM)
-            .zip(k_pe_window.chunks_exact(K_PE_DIM))
-            .enumerate()
-        {
+        for (i, kv) in kv_window.chunks_exact(head_dim).enumerate() {
             let weight = (scores[i] - max_score).exp();
             denom += weight;
-            for (o, &v) in oh_latent.iter_mut().zip(kv.iter()) {
-                *o += v * weight;
-            }
-            for (o, &v) in oh_pe.iter_mut().zip(k_pe.iter()) {
+            for (o, &v) in oh.iter_mut().zip(kv.iter()) {
                 *o += v * weight;
             }
         }
@@ -1058,45 +999,35 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Attention (MLA) — covers the [latent || k_pe] path.
+    // Attention (MLA) — covers the merged 512-dim KV row.
     //
     // These tests exercise `attention_rows_inner`, the pure helper that takes
-    // already-cached latent / k_pe rows and produces per-head attention output.
-    // They guard against the previous stub behavior where the k_pe slice of
-    // each head output was left as zeros.
+    // already-cached rows and produces per-head attention output. Each cached
+    // row is HEAD_DIM = 512 wide (no latent/k_pe split at this layer — the
+    // ring stores the merged post-RoPE row).
     // -----------------------------------------------------------------------
 
-    use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
-
-    fn head_dim_test() -> usize {
-        KV_LATENT_DIM + K_PE_DIM
-    }
+    use crate::model::kv_cache::HEAD_DIM;
 
     #[test]
     fn attention_single_kv_row_is_that_row() {
         // With one cached token, softmax weight on that single row is 1.0
-        // (the sink only affects the denominator, but the row itself dominates
-        // when its dot is far above the sink). Pick q=k so the score is large
-        // positive; the output should be ~equal to the cached row across the
-        // full 512 dims, including the k_pe tail.
-        let head_dim = head_dim_test();
+        // when the sink is far below the dot. Pick q = the cached row so the
+        // dot is large positive; the output should equal that row.
         let n_head = 1usize;
 
-        // q = the cached row.
-        let mut q = vec![0.0f32; n_head * head_dim];
+        let mut q = vec![0.0f32; n_head * HEAD_DIM];
         for (i, v) in q.iter_mut().enumerate() {
             *v = ((i % 17) as f32 - 8.0) * 0.01;
         }
 
-        let latent: Vec<f32> = q[..KV_LATENT_DIM].to_vec();
-        let k_pe: Vec<f32> = q[KV_LATENT_DIM..].to_vec();
+        let kv: Vec<f32> = q.clone();
         let sinks = vec![-1e30f32; n_head];
 
-        let mut out = vec![0.0f32; n_head * head_dim];
-        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+        let mut out = vec![0.0f32; n_head * HEAD_DIM];
+        attention_rows_inner(&mut out, &sinks, &q, &kv, n_head);
 
-        // With sink at -inf and one row, the weighted sum equals that row.
-        for i in 0..head_dim {
+        for i in 0..HEAD_DIM {
             assert!(
                 (out[i] - q[i]).abs() < 1e-5,
                 "dim {i}: out={} q={}",
@@ -1104,26 +1035,19 @@ mod tests {
                 q[i],
             );
         }
-        // Specifically: the k_pe tail (the previously-broken slice) is
-        // non-zero and matches the cached row.
-        assert!(out[KV_LATENT_DIM..].iter().any(|&v| v.abs() > 0.0));
     }
 
     #[test]
     fn attention_dominated_sink_zeros_output() {
-        // With a single row but the sink logit *huge* relative to any score,
-        // the row's softmax weight collapses to ~0 and the output goes to ~0
-        // across the full head_dim — both latent and k_pe halves.
-        let head_dim = head_dim_test();
+        // Sink logit huge relative to any score → row weight collapses to ~0
+        // and the output goes to ~0 across the full HEAD_DIM.
         let n_head = 1usize;
-
-        let q = vec![0.1f32; n_head * head_dim];
-        let latent = vec![0.5f32; KV_LATENT_DIM];
-        let k_pe = vec![0.5f32; K_PE_DIM];
+        let q = vec![0.1f32; n_head * HEAD_DIM];
+        let kv = vec![0.5f32; HEAD_DIM];
         let sinks = vec![1e6f32; n_head];
 
-        let mut out = vec![0.0f32; n_head * head_dim];
-        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+        let mut out = vec![0.0f32; n_head * HEAD_DIM];
+        attention_rows_inner(&mut out, &sinks, &q, &kv, n_head);
 
         for (i, &v) in out.iter().enumerate() {
             assert!(v.abs() < 1e-3, "dim {i} not collapsed: {v}");
@@ -1133,54 +1057,33 @@ mod tests {
     #[test]
     fn attention_uniform_rows_average_into_full_head() {
         // Three identical rows, sink set far below scores. The weighted
-        // average over identical rows is just that row, so the output should
-        // equal the row across all 512 dims (latent and k_pe).
-        let head_dim = head_dim_test();
+        // average over identical rows is just that row.
         let n_head = 2usize;
         let window = 3usize;
 
-        let mut latent = vec![0.0f32; window * KV_LATENT_DIM];
-        let mut k_pe = vec![0.0f32; window * K_PE_DIM];
-        let lat_row: Vec<f32> = (0..KV_LATENT_DIM).map(|i| (i as f32) * 0.001).collect();
-        let pe_row: Vec<f32> = (0..K_PE_DIM).map(|i| (i as f32) * 0.01 + 1.0).collect();
+        let row: Vec<f32> = (0..HEAD_DIM).map(|i| (i as f32) * 0.001).collect();
+        let mut kv = vec![0.0f32; window * HEAD_DIM];
         for r in 0..window {
-            latent[r * KV_LATENT_DIM..(r + 1) * KV_LATENT_DIM].copy_from_slice(&lat_row);
-            k_pe[r * K_PE_DIM..(r + 1) * K_PE_DIM].copy_from_slice(&pe_row);
+            kv[r * HEAD_DIM..(r + 1) * HEAD_DIM].copy_from_slice(&row);
         }
 
-        // Pick q so the per-row dot is identical across rows (rows are
-        // identical) and sink << score.
-        let mut q = vec![0.0f32; n_head * head_dim];
+        let mut q = vec![0.0f32; n_head * HEAD_DIM];
         for h in 0..n_head {
-            for d in 0..head_dim {
-                q[h * head_dim + d] = if d < KV_LATENT_DIM {
-                    lat_row[d]
-                } else {
-                    pe_row[d - KV_LATENT_DIM]
-                };
-            }
+            q[h * HEAD_DIM..(h + 1) * HEAD_DIM].copy_from_slice(&row);
         }
         let sinks = vec![-1e30f32; n_head];
 
-        let mut out = vec![0.0f32; n_head * head_dim];
-        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+        let mut out = vec![0.0f32; n_head * HEAD_DIM];
+        attention_rows_inner(&mut out, &sinks, &q, &kv, n_head);
 
         for h in 0..n_head {
-            let oh = &out[h * head_dim..(h + 1) * head_dim];
-            for d in 0..KV_LATENT_DIM {
+            let oh = &out[h * HEAD_DIM..(h + 1) * HEAD_DIM];
+            for d in 0..HEAD_DIM {
                 assert!(
-                    (oh[d] - lat_row[d]).abs() < 1e-4,
-                    "head {h} latent dim {d}: oh={} expected={}",
+                    (oh[d] - row[d]).abs() < 1e-4,
+                    "head {h} dim {d}: oh={} expected={}",
                     oh[d],
-                    lat_row[d],
-                );
-            }
-            for d in 0..K_PE_DIM {
-                assert!(
-                    (oh[KV_LATENT_DIM + d] - pe_row[d]).abs() < 1e-4,
-                    "head {h} k_pe dim {d}: oh={} expected={}",
-                    oh[KV_LATENT_DIM + d],
-                    pe_row[d],
+                    row[d],
                 );
             }
         }
@@ -1191,21 +1094,16 @@ mod tests {
         // Two heads with different sink logits should produce different
         // outputs even with the same q/k/v window. Catches accidental
         // sharing across heads.
-        let head_dim = head_dim_test();
         let n_head = 2usize;
-
-        let q = vec![0.1f32; n_head * head_dim];
-        let latent = vec![0.3f32; KV_LATENT_DIM];
-        let k_pe = vec![0.4f32; K_PE_DIM];
+        let q = vec![0.1f32; n_head * HEAD_DIM];
+        let kv = vec![0.4f32; HEAD_DIM];
         let sinks = vec![-100.0f32, 100.0f32];
 
-        let mut out = vec![0.0f32; n_head * head_dim];
-        attention_rows_inner(&mut out, &sinks, &q, &latent, &k_pe, n_head);
+        let mut out = vec![0.0f32; n_head * HEAD_DIM];
+        attention_rows_inner(&mut out, &sinks, &q, &kv, n_head);
 
-        let head0 = &out[..head_dim];
-        let head1 = &out[head_dim..];
-        // Head 0 with sink << score should pull in the row; head 1 with sink
-        // >> score should collapse near zero.
+        let head0 = &out[..HEAD_DIM];
+        let head1 = &out[HEAD_DIM..];
         let mag0: f32 = head0.iter().map(|v| v.abs()).sum();
         let mag1: f32 = head1.iter().map(|v| v.abs()).sum();
         assert!(

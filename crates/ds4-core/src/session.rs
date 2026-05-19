@@ -49,13 +49,17 @@ impl Session {
 
         let start_len = self.tokens.len();
         let start_pos = self.pos;
-        let start_kv_pos = self.kv_cache.len();
+        let logits_snapshot = self.logits.clone();
         self.tokens.reserve(tokens.len());
         for &token in tokens.iter().take(tokens.len()) {
             if let Err(err) = self.eval_token(token) {
+                // `eval_token` already restores the KV ring per call (see
+                // its rollback path), so we only need to undo our own
+                // bookkeeping: drop any tokens we pushed and put back the
+                // logits we'd have returned without this prefill call.
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
-                self.kv_cache.set_pos(start_kv_pos);
+                self.logits = logits_snapshot;
                 return Err(err);
             }
         }
@@ -72,11 +76,17 @@ impl Session {
             );
         }
 
+        // forward_decode pushes one row into each layer's KV ring as it walks
+        // the layer stack (see model::forward), so a fallible op past the
+        // first push leaves earlier layers with a ghost row that doesn't
+        // correspond to any committed token. The ring's append-and-shift
+        // means a later successful eval can't compensate. Snapshot before
+        // running forward and restore on any error path.
+        let kv_snapshot = self.kv_cache.snapshot();
         self.tokens.push(token);
         self.pos = (self.tokens.len() - 1) as u32;
 
         let engine = self.engine.clone();
-        let start_kv_pos = self.kv_cache.len();
         match model::forward::forward_decode(self, &engine) {
             Ok(logits) => {
                 self.logits = logits;
@@ -85,7 +95,7 @@ impl Session {
             Err(err) => {
                 self.tokens.pop();
                 self.pos = self.tokens.len() as u32;
-                self.kv_cache.set_pos(start_kv_pos);
+                self.kv_cache.restore(kv_snapshot);
                 return Err(err);
             }
         }
@@ -93,48 +103,55 @@ impl Session {
         Ok(&self.logits)
     }
 
-    /// Discard all session state, keeping the allocated KV buffer for reuse.
+    /// Discard all session state, keeping the allocated KV buffers for reuse.
     ///
-    /// After this, `pos() == 0`, `tokens().is_empty()`, and the KV cache
-    /// watermark is back at zero — but the underlying KV `Vec<f32>`s are
-    /// not reallocated, so the next prefill / eval reuses them in place.
-    /// `logits` is zeroed to ensure that any subsequent access (e.g. via
-    /// an empty prefill) does not return stale predictions.
+    /// After this, `pos() == 0`, `tokens().is_empty()`, and every layer's
+    /// ring watermark is back at zero — but the underlying `Vec<f32>`s are
+    /// not reallocated. `logits` is zeroed so any subsequent access (e.g.
+    /// via an empty prefill) does not return stale predictions.
     ///
     /// Mirrors `ds4_session_invalidate` in antirez/ds4 ds4.c.
     pub fn invalidate(&mut self) {
         self.tokens.clear();
         self.pos = 0;
-        self.kv_cache.set_pos(0);
+        self.kv_cache.clear_all();
         self.logits.fill(0.0);
     }
 
-    /// Rewind the session to position `pos`, dropping any tokens / KV state
-    /// past it. Mirrors `ds4_session_rewind` in antirez/ds4 ds4.c, which
-    /// clamps the requested position into `[0, current_len]`.
+    /// Rewind the session to position `target`, dropping any tokens past it.
     ///
-    /// `pos` past the current length is silently clamped down — matching
-    /// the C reference, where rewinding past the end is a no-op rather than
-    /// an error. Rewinding to the current length is a no-op too.
+    /// The raw KV ring discards rows older than `cap_raw`, so we cannot
+    /// truncate the cache by absolute position the way the old split-storage
+    /// implementation did. Instead this is a clear-and-replay: clear every
+    /// layer's ring, truncate `tokens` to `target`, then re-run
+    /// `forward_decode` for each remaining token to rebuild the ring.
     ///
-    /// When truncation actually occurs, the cached `logits` buffer is also
-    /// zeroed: it contained the prediction for the token *after* the old
-    /// end of the sequence, which is now stale. The C reference doesn't
-    /// face this (no logits cache); the Rust port has to invalidate it
-    /// explicitly so a follow-up `prefill(&[])` doesn't return predictions
-    /// for a position that no longer exists.
+    /// `target == self.tokens.len()` is a no-op. `target == 0` is equivalent
+    /// to [`Session::invalidate`] (no replay needed). `target` past the end
+    /// is silently clamped down, matching the C reference.
     ///
-    /// The KV cache watermark moves with the token list. The underlying
-    /// `Vec<f32>` buffers are kept (no reallocation); subsequent writes
-    /// overwrite the now-stale entries.
-    pub fn rewind(&mut self, pos: u32) {
-        let target = (pos as usize).min(self.tokens.len());
-        if target < self.tokens.len() {
-            self.tokens.truncate(target);
-            self.pos = target as u32;
-            self.kv_cache.set_pos(target);
-            self.logits.fill(0.0);
+    /// If replay fails partway through, the session is left in a clean-but-
+    /// empty state (equivalent to a fresh `invalidate()`) and the error is
+    /// returned to the caller.
+    pub fn rewind(&mut self, target: u32) -> Result<()> {
+        let target = (target as usize).min(self.tokens.len());
+        if target == self.tokens.len() {
+            return Ok(());
         }
+        if target == 0 {
+            self.invalidate();
+            return Ok(());
+        }
+
+        let replay: Vec<u32> = self.tokens[..target].to_vec();
+        self.invalidate();
+        for tok in replay {
+            if let Err(err) = self.eval_token(tok) {
+                self.invalidate();
+                return Err(err);
+            }
+        }
+        Ok(())
     }
 
     /// Greedy argmax: select the token with highest logit.
@@ -331,9 +348,10 @@ mod tests {
         assert_eq!(s.pos(), 0);
         assert_eq!(s.ctx_size(), 256);
         assert!(s.tokens().is_empty());
-        assert_eq!(s.kv_cache().len(), 0);
         assert_eq!(s.kv_cache().n_layer(), engine.config.n_layer as usize);
-        assert_eq!(s.kv_cache().ctx_size(), 256);
+        for il in 0..s.kv_cache().n_layer() {
+            assert_eq!(s.kv_cache().layer(il).n_raw(), 0);
+        }
     }
 
     #[test]
@@ -348,6 +366,64 @@ mod tests {
         assert!(err.to_string().contains("context overflow"));
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_eval_token_failure_restores_seeded_kv_state() {
+        // forward_decode pushes per-layer as it walks the layer stack, so a
+        // mid-forward error leaves earlier layers with a ghost row unless
+        // eval_token snapshots and restores. The minimal-GGUF Engine errors
+        // at token_embd before any push, so this is a sanity check rather
+        // than a true mid-forward reproducer — but it pins the contract.
+        use crate::model::kv_cache::HEAD_DIM;
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+
+        let seed: Vec<f32> = (0..HEAD_DIM).map(|i| 3.0 + i as f32 * 0.001).collect();
+        for il in 0..engine.config.n_layer as usize {
+            s.kv_cache_mut().layer_mut(il).push(&seed);
+        }
+
+        let err = s.eval_token(5).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        for il in 0..engine.config.n_layer as usize {
+            assert_eq!(s.kv_cache().layer(il).n_raw(), 1);
+            assert_eq!(s.kv_cache().layer(il).rows(), seed.as_slice());
+        }
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_prefill_failure_restores_pre_existing_kv_state() {
+        // The minimal-GGUF Engine has no `token_embd.weight`, so any
+        // prefill / eval errors out before pushing into the ring. Pre-seed
+        // the cache with synthetic rows, kick off a prefill, and verify the
+        // seeded rows are still there after the rollback.
+        use crate::model::kv_cache::HEAD_DIM;
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 16).unwrap();
+
+        let seed: Vec<f32> = (0..HEAD_DIM).map(|i| 7.0 + i as f32 * 0.001).collect();
+        s.kv_cache_mut().layer_mut(0).push(&seed);
+        s.kv_cache_mut().layer_mut(1).push(&seed);
+
+        let err = s.prefill(&[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 1);
+        assert_eq!(s.kv_cache().layer(1).n_raw(), 1);
+        assert_eq!(s.kv_cache().layer(0).rows(), seed.as_slice());
+        assert_eq!(s.kv_cache().layer(1).rows(), seed.as_slice());
     }
 
     #[test]
@@ -376,25 +452,6 @@ mod tests {
         assert!(err.to_string().contains("context overflow"));
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
-    }
-
-    #[test]
-    #[cfg_attr(
-        miri,
-        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
-    )]
-    fn session_kv_cache_mut_round_trips_writes() {
-        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
-        let engine = open_engine();
-        let mut s = Session::new(engine.clone(), 8).unwrap();
-        let lat = vec![3.0f32; KV_LATENT_DIM];
-        let pe = vec![4.0f32; K_PE_DIM];
-        s.kv_cache_mut().write_latent(0, 0, &lat).unwrap();
-        s.kv_cache_mut().write_k_pe(0, 0, &pe).unwrap();
-        s.kv_cache_mut().set_pos(1);
-        assert_eq!(s.kv_cache().len(), 1);
-        assert_eq!(s.kv_cache().read_latent(0, 0), lat.as_slice());
-        assert_eq!(s.kv_cache().read_k_pe(0, 0), pe.as_slice());
     }
 
     #[test]
@@ -431,11 +488,15 @@ mod tests {
     // -----------------------------------------------------------------------
     // Lifecycle: invalidate / rewind
     //
-    // These ops manipulate session state directly (tokens, pos, KV
-    // watermark) and don't go through the forward path, so they're
-    // testable with synthetic state from the minimal GGUF — no real model
-    // weights needed.
+    // These ops manipulate session state directly (tokens, pos, KV ring)
+    // and don't go through the forward path, so they're testable with
+    // synthetic state from the minimal GGUF — no real model weights needed.
     // -----------------------------------------------------------------------
+
+    fn synth_row(seed: f32) -> Vec<f32> {
+        use crate::model::kv_cache::HEAD_DIM;
+        (0..HEAD_DIM).map(|i| seed + i as f32 * 0.001).collect()
+    }
 
     #[cfg_attr(
         miri,
@@ -443,20 +504,15 @@ mod tests {
     )]
     #[test]
     fn invalidate_clears_tokens_pos_kv_and_zeros_logits() {
-        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 8).unwrap();
 
         // Seed synthetic state without going through forward.
         s.tokens.extend_from_slice(&[10, 20, 30]);
         s.pos = 3;
-        let lat = vec![1.5f32; KV_LATENT_DIM];
-        let pe = vec![2.5f32; K_PE_DIM];
-        for p in 0..3 {
-            s.kv_cache_mut().write_latent(0, p, &lat).unwrap();
-            s.kv_cache_mut().write_k_pe(0, p, &pe).unwrap();
+        for _ in 0..3 {
+            s.kv_cache_mut().layer_mut(0).push(&synth_row(1.5));
         }
-        s.kv_cache_mut().set_pos(3);
         for v in s.logits.iter_mut() {
             *v = 7.0;
         }
@@ -465,7 +521,7 @@ mod tests {
 
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
-        assert_eq!(s.kv_cache().len(), 0);
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 0);
         assert_eq!(s.logits.len(), engine.config.n_vocab as usize);
         assert!(s.logits.iter().all(|&v| v == 0.0));
     }
@@ -481,7 +537,7 @@ mod tests {
         s.invalidate();
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
-        assert_eq!(s.kv_cache().len(), 0);
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 0);
     }
 
     #[cfg_attr(
@@ -489,83 +545,18 @@ mod tests {
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
     #[test]
-    fn invalidate_keeps_kv_buffer_allocated() {
-        // The whole point of invalidate over reallocating: the KV `Vec<f32>`
-        // capacity (n_layer * ctx_size * dim) survives the call so the next
-        // turn doesn't pay the alloc cost.
+    fn invalidate_keeps_kv_cap_unchanged() {
+        // The whole point of invalidate over reallocating: the KV ring's
+        // cap_raw survives the call so the next turn doesn't pay alloc cost.
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 8).unwrap();
-        let cap_before = s.kv_cache().ctx_size();
+        let cap_before = s.kv_cache().cap_raw();
         s.tokens.extend_from_slice(&[1, 2]);
         s.pos = 2;
-        s.kv_cache_mut().set_pos(2);
+        s.kv_cache_mut().layer_mut(0).push(&synth_row(0.0));
         s.invalidate();
-        assert_eq!(s.kv_cache().ctx_size(), cap_before);
+        assert_eq!(s.kv_cache().cap_raw(), cap_before);
         assert_eq!(s.kv_cache().n_layer(), engine.config.n_layer as usize);
-    }
-
-    #[cfg_attr(
-        miri,
-        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
-    )]
-    #[test]
-    fn rewind_truncates_tokens_and_kv_watermark() {
-        let engine = open_engine();
-        let mut s = Session::new(engine.clone(), 8).unwrap();
-        s.tokens.extend_from_slice(&[10, 20, 30, 40, 50]);
-        s.pos = 5;
-        s.kv_cache_mut().set_pos(5);
-
-        s.rewind(2);
-
-        assert_eq!(s.pos(), 2);
-        assert_eq!(s.tokens(), &[10, 20]);
-        assert_eq!(s.kv_cache().len(), 2);
-    }
-
-    #[cfg_attr(
-        miri,
-        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
-    )]
-    #[test]
-    fn rewind_to_zero_matches_invalidate_for_position_state() {
-        // Both end up at pos=0 / empty tokens / kv watermark 0, and both
-        // zero the logits to prevent stale predictions from being observed.
-        let engine = open_engine();
-        let mut s = Session::new(engine.clone(), 8).unwrap();
-        s.tokens.extend_from_slice(&[1, 2, 3]);
-        s.pos = 3;
-        s.kv_cache_mut().set_pos(3);
-        for v in s.logits.iter_mut() {
-            *v = 5.0;
-        }
-
-        s.rewind(0);
-
-        assert_eq!(s.pos(), 0);
-        assert!(s.tokens().is_empty());
-        assert_eq!(s.kv_cache().len(), 0);
-        assert!(s.logits.iter().all(|&v| v == 0.0));
-    }
-
-    #[cfg_attr(
-        miri,
-        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
-    )]
-    #[test]
-    fn rewind_past_end_clamps_to_current_length() {
-        // Matches `ds4_session_rewind`: `pos > checkpoint.len -> pos = checkpoint.len`.
-        let engine = open_engine();
-        let mut s = Session::new(engine.clone(), 8).unwrap();
-        s.tokens.extend_from_slice(&[1, 2, 3]);
-        s.pos = 3;
-        s.kv_cache_mut().set_pos(3);
-
-        s.rewind(99);
-
-        assert_eq!(s.pos(), 3);
-        assert_eq!(s.tokens(), &[1, 2, 3]);
-        assert_eq!(s.kv_cache().len(), 3);
     }
 
     #[cfg_attr(
@@ -578,13 +569,16 @@ mod tests {
         let mut s = Session::new(engine.clone(), 8).unwrap();
         s.tokens.extend_from_slice(&[7, 8]);
         s.pos = 2;
-        s.kv_cache_mut().set_pos(2);
+        for _ in 0..2 {
+            s.kv_cache_mut().layer_mut(0).push(&synth_row(0.0));
+        }
 
-        s.rewind(2);
+        s.rewind(2).unwrap();
 
         assert_eq!(s.pos(), 2);
         assert_eq!(s.tokens(), &[7, 8]);
-        assert_eq!(s.kv_cache().len(), 2);
+        // No-op: ring untouched.
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 2);
     }
 
     #[cfg_attr(
@@ -592,30 +586,68 @@ mod tests {
         ignore = "uses mmap + real filesystem, unsupported under miri isolation"
     )]
     #[test]
-    fn rewind_then_grow_back_overwrites_stale_kv() {
-        // After a rewind, the KV buffer past the new watermark is stale but
-        // still allocated. Subsequent writes should land at the new offset
-        // without surfacing the old data.
-        use crate::model::kv_cache::KV_LATENT_DIM;
+    fn rewind_past_end_clamps_to_current_length() {
         let engine = open_engine();
         let mut s = Session::new(engine.clone(), 8).unwrap();
-        let stale = vec![9.0f32; KV_LATENT_DIM];
-        let fresh = vec![1.0f32; KV_LATENT_DIM];
-
         s.tokens.extend_from_slice(&[1, 2, 3]);
         s.pos = 3;
-        for p in 0..3 {
-            s.kv_cache_mut().write_latent(0, p, &stale).unwrap();
+        for _ in 0..3 {
+            s.kv_cache_mut().layer_mut(0).push(&synth_row(0.0));
         }
-        s.kv_cache_mut().set_pos(3);
 
-        s.rewind(1);
-        s.tokens.push(99);
-        s.pos = 2;
-        s.kv_cache_mut().write_latent(0, 1, &fresh).unwrap();
-        s.kv_cache_mut().set_pos(2);
+        s.rewind(99).unwrap();
 
-        assert_eq!(s.kv_cache().read_latent(0, 0), stale.as_slice());
-        assert_eq!(s.kv_cache().read_latent(0, 1), fresh.as_slice());
+        assert_eq!(s.pos(), 3);
+        assert_eq!(s.tokens(), &[1, 2, 3]);
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 3);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_to_zero_acts_like_invalidate() {
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[1, 2, 3]);
+        s.pos = 3;
+        for _ in 0..3 {
+            s.kv_cache_mut().layer_mut(0).push(&synth_row(0.0));
+        }
+        for v in s.logits.iter_mut() {
+            *v = 5.0;
+        }
+
+        s.rewind(0).unwrap();
+
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 0);
+        assert!(s.logits.iter().all(|&v| v == 0.0));
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    #[test]
+    fn rewind_partial_replays_through_forward_and_surfaces_error() {
+        // The minimal GGUF lacks forward weights, so any replay step fails
+        // inside `eval_token`. The contract is "leave session in a clean-but-
+        // empty state": tokens cleared, pos=0, ring empty, error returned.
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+        s.tokens.extend_from_slice(&[10, 20, 30, 40, 50]);
+        s.pos = 5;
+        for _ in 0..5 {
+            s.kv_cache_mut().layer_mut(0).push(&synth_row(0.0));
+        }
+
+        let err = s.rewind(2).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 0);
     }
 }
