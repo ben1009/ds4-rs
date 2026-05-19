@@ -58,19 +58,22 @@ impl Session {
             );
         }
 
+        // One KV snapshot for the entire prefill. It covers both per-token
+        // mid-forward errors *and* multi-token rollback: an error at any
+        // token rewinds the ring to its pre-prefill state, which is also
+        // the only valid restore point (later snapshots would already
+        // include rows that need to be undone).
         let start_len = self.tokens.len();
         let start_pos = self.pos;
         let logits_snapshot = self.logits.clone();
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         self.tokens.reserve(tokens.len());
-        for &token in tokens.iter().take(tokens.len()) {
-            if let Err(err) = self.eval_token(token) {
-                // `eval_token` already restores the KV ring per call (see
-                // its rollback path), so we only need to undo our own
-                // bookkeeping: drop any tokens we pushed and put back the
-                // logits we'd have returned without this prefill call.
+        for &token in tokens {
+            if let Err(err) = self.eval_token_inner(token, false) {
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
                 self.logits = logits_snapshot;
+                self.kv_cache.restore(&self.kv_snapshot);
                 return Err(err);
             }
         }
@@ -79,6 +82,16 @@ impl Session {
 
     /// Evaluate one decode token. Returns logits for the next token.
     pub fn eval_token(&mut self, token: u32) -> Result<&[f32]> {
+        self.eval_token_inner(token, true)
+    }
+
+    /// Inner decode step. When `take_snapshot` is true, the KV ring is
+    /// snapshotted on entry and restored on error — that's the public
+    /// `eval_token` contract. When false, the caller (only `prefill`) has
+    /// already taken a snapshot covering this entire batch and restores
+    /// itself; we skip the per-token copy to avoid the O(N * cap_raw *
+    /// HEAD_DIM) traffic on long prompts.
+    fn eval_token_inner(&mut self, token: u32, take_snapshot: bool) -> Result<&[f32]> {
         if self.tokens.len() >= self.ctx_size as usize {
             bail!(
                 "eval_token context overflow: pos {} >= ctx_size {}",
@@ -87,14 +100,15 @@ impl Session {
             );
         }
 
-        // forward_decode pushes one row into each layer's KV ring as it walks
-        // the layer stack (see model::forward), so a fallible op past the
-        // first push leaves earlier layers with a ghost row that doesn't
-        // correspond to any committed token. The ring's append-and-shift
-        // means a later successful eval can't compensate. Refresh the
-        // reusable rollback buffer before running forward and restore from
-        // it on any error path.
-        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+        // forward_decode pushes one row into each layer's KV ring as it
+        // walks the layer stack (see model::forward), so a fallible op
+        // past the first push leaves earlier layers with a ghost row
+        // that doesn't correspond to any committed token. The ring's
+        // append-and-shift means a later successful eval can't
+        // compensate.
+        if take_snapshot {
+            self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+        }
         self.tokens.push(token);
         self.pos = (self.tokens.len() - 1) as u32;
 
@@ -107,7 +121,9 @@ impl Session {
             Err(err) => {
                 self.tokens.pop();
                 self.pos = self.tokens.len() as u32;
-                self.kv_cache.restore(&self.kv_snapshot);
+                if take_snapshot {
+                    self.kv_cache.restore(&self.kv_snapshot);
+                }
                 return Err(err);
             }
         }

@@ -62,7 +62,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     //
     // `heads` is hoisted out of the per-layer call so the decode hot path
     // doesn't allocate `n_head * head_dim` floats per layer per token.
-    let q_dim = config.n_head as usize * config.head_dim as usize;
+    let q_dim = (config.n_head as usize)
+        .checked_mul(config.head_dim as usize)
+        .ok_or_else(|| anyhow::anyhow!("Q dimension overflow"))?;
     let mut heads_scratch = vec![0.0f32; q_dim];
     for il in 0..config.n_layer {
         let layer = LayerWeights::from_map(model, il)?;
@@ -179,7 +181,7 @@ fn layer_attention_decode(
     let n_head_dim = config.head_dim as usize;
     let _n_rot = 64usize;
     let q_dim = n_head * n_head_dim;
-    debug_assert_eq!(heads.len(), q_dim);
+    assert_eq!(heads.len(), q_dim);
 
     // HC pre: project control, Sinkhorn split, weighted sum.
     let mut attn_cur = vec![0.0f32; n_embd];
