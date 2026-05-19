@@ -134,46 +134,84 @@ impl KvCache {
     }
 
     /// Capture the full ring state for every layer so a failed multi-step
-    /// operation (e.g. mid-prefill error) can restore it.
+    /// operation (e.g. mid-forward error) can restore it.
     ///
     /// Snapshotting `n_raw` alone is not enough: once the ring wraps,
     /// pushes overwrite the buffer in place, so the only way to undo a
-    /// partial run is to keep the bytes around. Allocates `n_layer *
-    /// cap_raw * HEAD_DIM` floats — only meant for rollback paths.
+    /// partial run is to keep the bytes around.
+    ///
+    /// Use [`KvCache::snapshot_into`] in hot paths so the destination buffer
+    /// is reused across calls — that's a `cap_raw * HEAD_DIM * n_layer * 4`
+    /// bytes save per token (~11 MiB at the 128/512/43 default).
     pub fn snapshot(&self) -> KvCacheSnapshot {
-        KvCacheSnapshot {
-            layers: self
-                .layers
-                .iter()
-                .map(|l| (l.raw_kv.clone(), l.n_raw))
-                .collect(),
+        let mut snap = KvCacheSnapshot::with_shape(self);
+        self.snapshot_into(&mut snap);
+        snap
+    }
+
+    /// Snapshot the cache into a pre-allocated destination, reusing its
+    /// buffers. The destination must have been built with
+    /// [`KvCacheSnapshot::with_shape`] for a cache of the same shape; an
+    /// out-of-shape destination panics.
+    pub fn snapshot_into(&self, snap: &mut KvCacheSnapshot) {
+        assert_eq!(
+            snap.layers.len(),
+            self.layers.len(),
+            "KvCache::snapshot_into: layer count mismatch"
+        );
+        for (dst, src) in snap.layers.iter_mut().zip(self.layers.iter()) {
+            assert_eq!(
+                dst.0.len(),
+                src.raw_kv.len(),
+                "KvCache::snapshot_into: buffer size mismatch"
+            );
+            dst.0.copy_from_slice(&src.raw_kv);
+            dst.1 = src.n_raw;
         }
     }
 
-    /// Restore a snapshot taken earlier with [`KvCache::snapshot`].
-    /// Panics if the snapshot's shape doesn't match the cache.
-    pub fn restore(&mut self, snap: KvCacheSnapshot) {
+    /// Restore an in-place snapshot. Buffers are copied back into the cache;
+    /// the snapshot is left intact for reuse.
+    pub fn restore(&mut self, snap: &KvCacheSnapshot) {
         assert_eq!(
             snap.layers.len(),
             self.layers.len(),
             "KvCache::restore: layer count mismatch"
         );
-        for (l, (raw, n_raw)) in self.layers.iter_mut().zip(snap.layers) {
+        for (l, (raw, n_raw)) in self.layers.iter_mut().zip(snap.layers.iter()) {
             assert_eq!(
                 raw.len(),
                 l.raw_kv.len(),
                 "KvCache::restore: buffer size mismatch"
             );
-            l.raw_kv = raw;
-            l.n_raw = n_raw;
+            l.raw_kv.copy_from_slice(raw);
+            l.n_raw = *n_raw;
         }
     }
 }
 
-/// Owned snapshot of every layer's ring buffer + watermark, taken via
-/// [`KvCache::snapshot`] and consumed by [`KvCache::restore`].
+/// Reusable rollback snapshot of every layer's ring buffer + watermark.
+///
+/// Build once via [`KvCacheSnapshot::with_shape`] and reuse across calls
+/// with [`KvCache::snapshot_into`] / [`KvCache::restore`] to avoid the
+/// per-token allocation that `KvCache::snapshot` would otherwise pay.
 pub struct KvCacheSnapshot {
     layers: Vec<(Vec<f32>, usize)>,
+}
+
+impl KvCacheSnapshot {
+    /// Allocate a snapshot sized to `cache`. Initial contents undefined; a
+    /// fresh snapshot must be filled with [`KvCache::snapshot_into`] before
+    /// being used as a restore source.
+    pub fn with_shape(cache: &KvCache) -> Self {
+        Self {
+            layers: cache
+                .layers
+                .iter()
+                .map(|l| (vec![0.0f32; l.raw_kv.len()], 0usize))
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -355,7 +393,7 @@ mod tests {
         cache.layer_mut(1).push(&row(300.0));
         assert_ne!(cache.layer(0).rows(), saved_l0.as_slice());
 
-        cache.restore(snap);
+        cache.restore(&snap);
         assert_eq!(cache.layer(0).n_raw(), 4);
         assert_eq!(cache.layer(1).n_raw(), 1);
         assert_eq!(cache.layer(0).rows(), saved_l0.as_slice());
@@ -368,7 +406,7 @@ mod tests {
         let snap = cache.snapshot();
         cache.layer_mut(0).push(&row(1.0));
         cache.layer_mut(1).push(&row(2.0));
-        cache.restore(snap);
+        cache.restore(&snap);
         assert_eq!(cache.layer(0).n_raw(), 0);
         assert_eq!(cache.layer(1).n_raw(), 0);
     }
