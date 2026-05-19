@@ -213,9 +213,9 @@ mod tests {
         u32le(&mut buf, 3);
         u64le(&mut buf, 0);
 
-        // We have 7 metadata entries.
+        // We have 8 metadata entries.
         let tokens: Vec<String> = crate::tokenizer::synthetic_byte_tokens();
-        u64le(&mut buf, 7);
+        u64le(&mut buf, 8);
 
         kv_u32(&mut buf, "deepseek4.vocab_size", 256);
         kv_u32(&mut buf, "deepseek4.embedding_length", 16);
@@ -223,6 +223,7 @@ mod tests {
         kv_u32(&mut buf, "deepseek4.attention.head_count_kv", 4);
         kv_u32(&mut buf, "deepseek4.block_count", 2);
         kv_u32(&mut buf, "deepseek4.expert_feed_forward_length", 32);
+        kv_u32(&mut buf, "deepseek4.attention.q_lora_rank", 8);
         kv_arr_string(&mut buf, "tokenizer.ggml.tokens", &tokens);
 
         std::fs::File::create(path)
