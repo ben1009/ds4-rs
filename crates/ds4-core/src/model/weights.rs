@@ -30,8 +30,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::Q8_0)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::Q8_0 {
             bytes,
             out_features,
@@ -46,8 +45,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::F16)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::F16 {
             bytes,
             out_features,
@@ -62,8 +60,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::Q2_K)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::Q2_K {
             bytes,
             out_features,
@@ -78,8 +75,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::IQ2_XXS)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::IQ2_XXS {
             bytes,
             out_features,
@@ -92,8 +88,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::Q4_K)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::Q4_K {
             bytes,
             out_features,
@@ -106,8 +101,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::IQ4_XS)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::IQ4_XS {
             bytes,
             out_features,
@@ -120,8 +114,7 @@ impl WeightMap {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         check_dtype(info, name, GgmlType::IQ4_NL)?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         Ok(WeightView::IQ4_NL {
             bytes,
             out_features,
@@ -139,8 +132,7 @@ impl WeightMap {
     pub fn quant_weight(&self, name: &str) -> Result<WeightView<'_>> {
         let info = self.tensor_info(name).with_context(|| name.to_string())?;
         let bytes = self.tensor_bytes(name)?;
-        let out_features = info.dims[0] as usize;
-        let in_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+        let (in_features, out_features) = dims_in_out(info);
         match info.dtype {
             GgmlType::Q8_0 => Ok(WeightView::Q8_0 {
                 bytes,
@@ -259,6 +251,28 @@ fn check_dtype(info: &TensorInfo, name: &str, expected: GgmlType) -> Result<()> 
     Ok(())
 }
 
+/// Extract `(in_features, out_features)` from a 2-D weight tensor's dims.
+///
+/// GGML/GGUF stores 2-D weights as `(ne0, ne1)` where `ne0` is the
+/// innermost / contiguous dim. For matmul weights, `ne0 = K = in_features`
+/// (the reduction axis) and `ne1 = N = out_features`, matching
+/// `ggml_new_tensor_2d(ctx, type, K, N)` in the C reference.
+///
+/// The per-dtype dot kernels in [`crate::ops::matmul`] walk weight bytes
+/// as `out_features` outer rows of `in_features` inner elements, so this
+/// loader passes the GGUF dims through unchanged on the inner axis and
+/// the outer axis becomes `out_features`.
+///
+/// 1-D tensors (biases, vector weights) report their single dim as
+/// `in_features` with `out_features = 1`, matching the prior loader
+/// behaviour for the rare call sites that pass a 1-D tensor as a
+/// `WeightView`.
+fn dims_in_out(info: &TensorInfo) -> (usize, usize) {
+    let in_features = info.dims[0] as usize;
+    let out_features = info.dims.get(1).copied().unwrap_or(1) as usize;
+    (in_features, out_features)
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -288,6 +302,42 @@ mod tests {
         assert!(msg.contains("blk.0.foo"));
         assert!(msg.contains("Q8_0"));
         assert!(msg.contains("F16"));
+    }
+
+    #[test]
+    fn dims_in_out_2d_uses_ne0_as_in_features() {
+        // GGUF stores 2-D weights as (ne0=K, ne1=N), where K = in_features
+        // is the reduction axis (innermost / contiguous on disk) and N =
+        // out_features is the row axis. The dot kernels in
+        // `crate::ops::matmul` read bytes as `out_features` outer rows of
+        // `in_features` inner elements, so this helper must map ne0→in
+        // and ne1→out.
+        let info = TensorInfo {
+            name: "blk.0.attn_q_a.weight".to_string(),
+            dtype: GgmlType::Q8_0,
+            dims: vec![4096, 1024],
+            offset: 0,
+        };
+        let (in_features, out_features) = dims_in_out(&info);
+        assert_eq!(in_features, 4096);
+        assert_eq!(out_features, 1024);
+    }
+
+    #[test]
+    fn dims_in_out_1d_treats_dim_as_in_features() {
+        // 1-D vectors (biases, single-row weights) report ne0 as
+        // in_features with out_features = 1, matching the prior
+        // convention for the rare call sites that pass a 1-D tensor as
+        // a `WeightView`.
+        let info = TensorInfo {
+            name: "x".to_string(),
+            dtype: GgmlType::F32,
+            dims: vec![512],
+            offset: 0,
+        };
+        let (in_features, out_features) = dims_in_out(&info);
+        assert_eq!(in_features, 512);
+        assert_eq!(out_features, 1);
     }
 
     fn write_minimal_gguf(path: &std::path::Path) {
