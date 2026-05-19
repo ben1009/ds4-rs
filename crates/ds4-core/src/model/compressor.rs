@@ -270,7 +270,7 @@ mod tests {
     fn pool_all_neg_inf_score_is_zero() {
         // Default state has score = NEG_INF everywhere → pool returns 0
         // for every output dim regardless of state_kv.
-        let mut state = CompressorState::new(128, 1024);
+        let mut state = CompressorState::new(128, 1024).unwrap();
         for v in state.state_kv.iter_mut() {
             *v = 7.0;
         }
@@ -285,7 +285,7 @@ mod tests {
     fn pool_ratio_128_single_active_row_returns_kv_value() {
         // One non-NEG_INF score per dim → softmax weight is 1.0, output
         // equals state_kv at that row.
-        let mut state = CompressorState::new(128, 1024);
+        let mut state = CompressorState::new(128, 1024).unwrap();
         let width = state.width();
         // Activate row 7 with score 0.0; the rest stay at NEG_INF.
         for j in 0..HEAD_DIM {
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn pool_ratio_128_two_active_rows_softmax_average() {
         // Two equal scores → output is mean of the two kv values.
-        let mut state = CompressorState::new(128, 1024);
+        let mut state = CompressorState::new(128, 1024).unwrap();
         let width = state.width();
         for j in 0..HEAD_DIM {
             state.state_score[width + j] = 0.5;
@@ -325,7 +325,7 @@ mod tests {
     fn pool_ratio_4_primary_lane_only() {
         // ratio=4: scores in primary lane only — output equals the softmax
         // of state_kv across rows [0..ratio).
-        let mut state = CompressorState::new(4, 64);
+        let mut state = CompressorState::new(4, 64).unwrap();
         let width = state.width();
         let ratio = 4usize;
         // Set scores 0.0 across ratio rows in primary lane (cols 0..head_dim).
@@ -356,7 +356,7 @@ mod tests {
         // ratio=4: scores only in the compressed lane (cols head_dim..width)
         // of rows [ratio..2*ratio). The pool reads kv from the compressed
         // lane of those rows — verify with a hand-computed softmax.
-        let mut state = CompressorState::new(4, 64);
+        let mut state = CompressorState::new(4, 64).unwrap();
         let width = state.width();
         let ratio = 4usize;
         for r in 0..ratio {
@@ -384,7 +384,7 @@ mod tests {
     fn pool_ratio_4_dominant_score_picks_one_entry() {
         // One huge primary-lane score on row 2, dim 0: softmax → 1.0 weight
         // there; output[0] should equal state_kv at that slot.
-        let mut state = CompressorState::new(4, 64);
+        let mut state = CompressorState::new(4, 64).unwrap();
         let width = state.width();
         let ratio = 4usize;
         // Seed everything else with NEG_INF (default) and put a single big
@@ -453,7 +453,7 @@ mod tests {
             norm: &norm,
         };
 
-        let mut state = CompressorState::new(ratio, 64);
+        let mut state = CompressorState::new(ratio, 64).unwrap();
         let x = vec![0.5f32; n_embd];
         let mut out = [0.0f32; HEAD_DIM];
         let freqs = long_freqs();
@@ -482,7 +482,7 @@ mod tests {
             norm: &norm,
         };
 
-        let mut state = CompressorState::new(ratio, 64);
+        let mut state = CompressorState::new(ratio, 64).unwrap();
         let x = vec![0.0f32; n_embd];
         let mut out = [0.0f32; HEAD_DIM];
         let freqs = long_freqs();
@@ -525,7 +525,7 @@ mod tests {
             ape: zero_f16(&ape_b, width, ratio as usize),
             norm: &norm,
         };
-        let mut state = CompressorState::new(ratio, 64);
+        let mut state = CompressorState::new(ratio, 64).unwrap();
 
         // Mark rows [ratio..2*ratio) of state_kv with a recognisable seed
         // before the emit. Pos 0..2 just write to rows [0..3); the emit at
@@ -597,7 +597,7 @@ mod tests {
             norm: &norm,
         };
 
-        let mut state = CompressorState::new(ratio, 1024);
+        let mut state = CompressorState::new(ratio, 1024).unwrap();
         let x = vec![0.0f32; n_embd];
         let mut out = [0.0f32; HEAD_DIM];
         let freqs = long_freqs();

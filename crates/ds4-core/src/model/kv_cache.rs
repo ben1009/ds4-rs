@@ -65,23 +65,39 @@ impl CompressorState {
     /// Build a fresh state for one layer. `ratio == 0` is rejected; the
     /// caller owns the dense vs. compressed branch and must not invoke this
     /// for dense layers.
-    pub fn new(ratio: u32, ctx_size: usize) -> Self {
+    ///
+    /// Returns `Err` if any of the buffer-size products overflow `usize`,
+    /// so `KvCache::new` can propagate the failure instead of panicking
+    /// inside `vec!` on a pathological `ctx_size`.
+    pub fn new(ratio: u32, ctx_size: usize) -> Result<Self> {
         debug_assert!(ratio != 0, "CompressorState::new called with ratio = 0");
-        let coff = if ratio == 4 { 2 } else { 1 };
-        let width = coff * HEAD_DIM;
-        let rows = coff * ratio as usize;
+        let coff = if ratio == 4 { 2 } else { 1usize };
+        let width = coff
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: width overflow"))?;
+        let rows = coff
+            .checked_mul(ratio as usize)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: row count overflow"))?;
+        let state_len = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: state buffer length overflow"))?;
         // ds4.c: `comp_cap = ctx_size / ratio + 2`. The +2 absorbs the
         // partial-window edge cases (a long-running session can outrun the
         // simple ctx/ratio bound by one or two emitted rows).
-        let comp_cap = ctx_size / ratio as usize + 2;
-        Self {
+        let comp_cap = (ctx_size / ratio as usize)
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: comp_cap overflow"))?;
+        let comp_kv_len = comp_cap
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: comp_kv length overflow"))?;
+        Ok(Self {
             ratio,
             comp_cap,
-            state_kv: vec![0.0f32; rows * width],
-            state_score: vec![NEG_INF; rows * width],
-            comp_kv: vec![0.0f32; comp_cap * HEAD_DIM],
+            state_kv: vec![0.0f32; state_len],
+            state_score: vec![NEG_INF; state_len],
+            comp_kv: vec![0.0f32; comp_kv_len],
             n_comp: 0,
-        }
+        })
     }
 
     pub fn coff(&self) -> usize {
@@ -226,12 +242,12 @@ impl KvCache {
             .map(|il| {
                 let ratio = layer_compress_ratio(il as u32);
                 if ratio == 0 {
-                    None
+                    Ok(None)
                 } else {
-                    Some(CompressorState::new(ratio, ctx_size))
+                    CompressorState::new(ratio, ctx_size).map(Some)
                 }
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers: (0..n_layer).map(|_| RawLayerCache::new(cap_raw)).collect(),
             compressors,
@@ -648,7 +664,7 @@ mod tests {
 
     #[test]
     fn compressor_state_ratio_4_shapes() {
-        let s = CompressorState::new(4, 1024);
+        let s = CompressorState::new(4, 1024).unwrap();
         assert_eq!(s.ratio, 4);
         assert_eq!(s.coff(), 2);
         assert_eq!(s.width(), 2 * HEAD_DIM);
@@ -667,7 +683,7 @@ mod tests {
 
     #[test]
     fn compressor_state_ratio_128_shapes() {
-        let s = CompressorState::new(128, 8192);
+        let s = CompressorState::new(128, 8192).unwrap();
         assert_eq!(s.coff(), 1);
         assert_eq!(s.width(), HEAD_DIM);
         assert_eq!(s.state_kv.len(), 128 * HEAD_DIM);
@@ -678,7 +694,7 @@ mod tests {
 
     #[test]
     fn compressor_state_clear_resets_score_and_n_comp() {
-        let mut s = CompressorState::new(4, 64);
+        let mut s = CompressorState::new(4, 64).unwrap();
         for v in s.state_kv.iter_mut() {
             *v = 1.0;
         }
@@ -697,7 +713,7 @@ mod tests {
 
     #[test]
     fn compressor_state_push_comp_grows_n_comp() {
-        let mut s = CompressorState::new(128, 1024);
+        let mut s = CompressorState::new(128, 1024).unwrap();
         let row_a: Vec<f32> = (0..HEAD_DIM).map(|i| i as f32).collect();
         s.push_comp(&row_a).unwrap();
         assert_eq!(s.n_comp, 1);
@@ -708,7 +724,7 @@ mod tests {
     #[test]
     fn compressor_state_push_comp_capacity_overflow_errors() {
         // ctx_size = 4 → comp_cap = 4/4 + 2 = 3. Push 3 rows fine, 4th errors.
-        let mut s = CompressorState::new(4, 4);
+        let mut s = CompressorState::new(4, 4).unwrap();
         assert_eq!(s.comp_cap, 3);
         for i in 0..3 {
             s.push_comp(&[i as f32; HEAD_DIM]).unwrap();
@@ -721,7 +737,7 @@ mod tests {
 
     #[test]
     fn compressor_state_push_comp_wrong_width_errors() {
-        let mut s = CompressorState::new(128, 256);
+        let mut s = CompressorState::new(128, 256).unwrap();
         let err = s.push_comp(&[0.0; HEAD_DIM - 1]).unwrap_err();
         assert!(err.to_string().contains("HEAD_DIM"), "got: {err}");
     }
