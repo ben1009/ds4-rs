@@ -59,6 +59,11 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     // --- Per-layer loop ----------------------------------------------------
     // Layers are built once at engine open. For Phase 1 we rebuild them
     // on every call; this is fine for a reference implementation.
+    //
+    // `heads` is hoisted out of the per-layer call so the decode hot path
+    // doesn't allocate `n_head * head_dim` floats per layer per token.
+    let q_dim = config.n_head as usize * config.head_dim as usize;
+    let mut heads_scratch = vec![0.0f32; q_dim];
     for il in 0..config.n_layer {
         let layer = LayerWeights::from_map(model, il)?;
         let mut attn_out = vec![0.0f32; n_embd];
@@ -68,6 +73,7 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
             &layer,
             &residual_hc,
             session.kv_cache_mut(),
+            &mut heads_scratch,
             il as usize,
             pos,
         )?;
@@ -155,12 +161,14 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
 // Attention (decode)
 // =========================================================================
 
+#[allow(clippy::too_many_arguments)]
 fn layer_attention_decode(
     out: &mut [f32],
     engine: &Engine,
     layer: &LayerWeights<'_>,
     residual_hc: &[f32],
     kv_cache: &mut KvCache,
+    heads: &mut [f32],
     il: usize,
     pos: usize,
 ) -> Result<(Vec<f32>, Vec<f32>)> {
@@ -171,6 +179,7 @@ fn layer_attention_decode(
     let n_head_dim = config.head_dim as usize;
     let _n_rot = 64usize;
     let q_dim = n_head * n_head_dim;
+    debug_assert_eq!(heads.len(), q_dim);
 
     // HC pre: project control, Sinkhorn split, weighted sum.
     let mut attn_cur = vec![0.0f32; n_embd];
@@ -225,9 +234,8 @@ fn layer_attention_decode(
 
     kv_cache.layer_mut(il).push(&kv_normed);
 
-    // Attention over cached KV rows.
-    let mut heads = vec![0.0f32; q_dim];
-    attention_rows(&mut heads, layer, &q, kv_cache, il, n_head, n_head_dim)?;
+    // Attention over cached KV rows. Caller-provided scratch.
+    attention_rows(heads, layer, &q, kv_cache, il, n_head, n_head_dim)?;
 
     // Inverse RoPE per head on attention output before grouped projection.
     for h in 0..n_head {
@@ -236,7 +244,7 @@ fn layer_attention_decode(
     }
 
     // Grouped output projection.
-    grouped_out_decode(&engine.weights, layer, &heads, out, n_head, n_head_dim)?;
+    grouped_out_decode(&engine.weights, layer, heads, out, n_head, n_head_dim)?;
 
     Ok((post, comb))
 }

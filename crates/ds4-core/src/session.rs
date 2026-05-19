@@ -2,7 +2,11 @@ use std::sync::Arc;
 
 use anyhow::{Result, bail};
 
-use crate::{engine::Engine, model, model::kv_cache::KvCache};
+use crate::{
+    engine::Engine,
+    model,
+    model::kv_cache::{KvCache, KvCacheSnapshot},
+};
 
 /// An inference session holding mutable state.
 pub struct Session {
@@ -12,6 +16,10 @@ pub struct Session {
     ctx_size: u32,
     logits: Vec<f32>,
     kv_cache: KvCache,
+    /// Reusable rollback buffer. Sized once at session creation; refilled
+    /// by `kv_cache.snapshot_into` on each `eval_token` so a mid-forward
+    /// failure can roll the ring back without paying a per-token alloc.
+    kv_snapshot: KvCacheSnapshot,
 }
 
 impl Session {
@@ -19,13 +27,16 @@ impl Session {
         tracing::info!("Creating session with ctx_size={ctx_size}");
         let n_vocab = engine.config.n_vocab as usize;
         let n_layer = engine.config.n_layer as usize;
+        let kv_cache = KvCache::new(n_layer, ctx_size as usize)?;
+        let kv_snapshot = KvCacheSnapshot::with_shape(&kv_cache);
         Ok(Self {
             engine,
             tokens: Vec::new(),
             pos: 0,
             ctx_size,
             logits: vec![0.0; n_vocab],
-            kv_cache: KvCache::new(n_layer, ctx_size as usize)?,
+            kv_cache,
+            kv_snapshot,
         })
     }
 
@@ -80,9 +91,10 @@ impl Session {
         // the layer stack (see model::forward), so a fallible op past the
         // first push leaves earlier layers with a ghost row that doesn't
         // correspond to any committed token. The ring's append-and-shift
-        // means a later successful eval can't compensate. Snapshot before
-        // running forward and restore on any error path.
-        let kv_snapshot = self.kv_cache.snapshot();
+        // means a later successful eval can't compensate. Refresh the
+        // reusable rollback buffer before running forward and restore from
+        // it on any error path.
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         self.tokens.push(token);
         self.pos = (self.tokens.len() - 1) as u32;
 
@@ -95,7 +107,7 @@ impl Session {
             Err(err) => {
                 self.tokens.pop();
                 self.pos = self.tokens.len() as u32;
-                self.kv_cache.restore(kv_snapshot);
+                self.kv_cache.restore(&self.kv_snapshot);
                 return Err(err);
             }
         }
