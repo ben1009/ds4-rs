@@ -132,6 +132,48 @@ impl KvCache {
             l.clear();
         }
     }
+
+    /// Capture the full ring state for every layer so a failed multi-step
+    /// operation (e.g. mid-prefill error) can restore it.
+    ///
+    /// Snapshotting `n_raw` alone is not enough: once the ring wraps,
+    /// pushes overwrite the buffer in place, so the only way to undo a
+    /// partial run is to keep the bytes around. Allocates `n_layer *
+    /// cap_raw * HEAD_DIM` floats — only meant for rollback paths.
+    pub fn snapshot(&self) -> KvCacheSnapshot {
+        KvCacheSnapshot {
+            layers: self
+                .layers
+                .iter()
+                .map(|l| (l.raw_kv.clone(), l.n_raw))
+                .collect(),
+        }
+    }
+
+    /// Restore a snapshot taken earlier with [`KvCache::snapshot`].
+    /// Panics if the snapshot's shape doesn't match the cache.
+    pub fn restore(&mut self, snap: KvCacheSnapshot) {
+        assert_eq!(
+            snap.layers.len(),
+            self.layers.len(),
+            "KvCache::restore: layer count mismatch"
+        );
+        for (l, (raw, n_raw)) in self.layers.iter_mut().zip(snap.layers) {
+            assert_eq!(
+                raw.len(),
+                l.raw_kv.len(),
+                "KvCache::restore: buffer size mismatch"
+            );
+            l.raw_kv = raw;
+            l.n_raw = n_raw;
+        }
+    }
+}
+
+/// Owned snapshot of every layer's ring buffer + watermark, taken via
+/// [`KvCache::snapshot`] and consumed by [`KvCache::restore`].
+pub struct KvCacheSnapshot {
+    layers: Vec<(Vec<f32>, usize)>,
 }
 
 #[cfg(test)]
@@ -289,5 +331,45 @@ mod tests {
     #[test]
     fn split_constants_match_head_dim() {
         assert_eq!(KV_LATENT_DIM + K_PE_DIM, HEAD_DIM);
+    }
+
+    #[test]
+    fn snapshot_restore_round_trips_after_eviction() {
+        // Push past cap so the ring evicts oldest rows. Snapshot mid-stream,
+        // push more (overwriting cached bytes), then restore. The restored
+        // contents must match the snapshot byte-for-byte — this is the
+        // property `Session::prefill` rollback depends on.
+        let mut cache = KvCache::new(2, 4).unwrap();
+        for i in 0..6 {
+            cache.layer_mut(0).push(&row(i as f32));
+        }
+        cache.layer_mut(1).push(&row(100.0));
+        let snap = cache.snapshot();
+        let saved_l0: Vec<f32> = cache.layer(0).rows().to_vec();
+        let saved_l1: Vec<f32> = cache.layer(1).rows().to_vec();
+
+        for i in 0..3 {
+            cache.layer_mut(0).push(&row(50.0 + i as f32));
+        }
+        cache.layer_mut(1).push(&row(200.0));
+        cache.layer_mut(1).push(&row(300.0));
+        assert_ne!(cache.layer(0).rows(), saved_l0.as_slice());
+
+        cache.restore(snap);
+        assert_eq!(cache.layer(0).n_raw(), 4);
+        assert_eq!(cache.layer(1).n_raw(), 1);
+        assert_eq!(cache.layer(0).rows(), saved_l0.as_slice());
+        assert_eq!(cache.layer(1).rows(), saved_l1.as_slice());
+    }
+
+    #[test]
+    fn snapshot_of_fresh_cache_restores_empty() {
+        let mut cache = KvCache::new(2, 4).unwrap();
+        let snap = cache.snapshot();
+        cache.layer_mut(0).push(&row(1.0));
+        cache.layer_mut(1).push(&row(2.0));
+        cache.restore(snap);
+        assert_eq!(cache.layer(0).n_raw(), 0);
+        assert_eq!(cache.layer(1).n_raw(), 0);
     }
 }

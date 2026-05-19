@@ -49,16 +49,20 @@ impl Session {
 
         let start_len = self.tokens.len();
         let start_pos = self.pos;
+        let kv_snapshot = self.kv_cache.snapshot();
+        let logits_snapshot = self.logits.clone();
         self.tokens.reserve(tokens.len());
         for &token in tokens.iter().take(tokens.len()) {
             if let Err(err) = self.eval_token(token) {
                 // Forward already rolled back its own per-token state. The
-                // ring is append-and-shift, so a partial prefill leaves rows
-                // we can't undo individually — clear all and let the caller
-                // retry from a clean slate.
+                // ring is append-and-shift, so an earlier successful push in
+                // this prefill may have already evicted pre-existing rows —
+                // restoring from the pre-prefill snapshot is the only way to
+                // leave the session in its original state.
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
-                self.kv_cache.clear_all();
+                self.kv_cache.restore(kv_snapshot);
+                self.logits = logits_snapshot;
                 return Err(err);
             }
         }
@@ -360,6 +364,34 @@ mod tests {
         assert!(err.to_string().contains("context overflow"));
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_prefill_failure_restores_pre_existing_kv_state() {
+        // The minimal-GGUF Engine has no `token_embd.weight`, so any
+        // prefill / eval errors out before pushing into the ring. Pre-seed
+        // the cache with synthetic rows, kick off a prefill, and verify the
+        // seeded rows are still there after the rollback.
+        use crate::model::kv_cache::HEAD_DIM;
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 16).unwrap();
+
+        let seed: Vec<f32> = (0..HEAD_DIM).map(|i| 7.0 + i as f32 * 0.001).collect();
+        s.kv_cache_mut().layer_mut(0).push(&seed);
+        s.kv_cache_mut().layer_mut(1).push(&seed);
+
+        let err = s.prefill(&[1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        assert_eq!(s.kv_cache().layer(0).n_raw(), 1);
+        assert_eq!(s.kv_cache().layer(1).n_raw(), 1);
+        assert_eq!(s.kv_cache().layer(0).rows(), seed.as_slice());
+        assert_eq!(s.kv_cache().layer(1).rows(), seed.as_slice());
     }
 
     #[test]

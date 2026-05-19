@@ -209,10 +209,10 @@ fn layer_attention_decode(
     // into the per-layer raw ring buffer; the ring enforces the SWA window
     // itself (oldest-evicting on overflow).
     use crate::model::kv_cache::{HEAD_DIM, KV_LATENT_DIM};
-    let mut kv_raw = vec![0.0f32; HEAD_DIM];
+    let mut kv_raw = [0.0f32; HEAD_DIM];
     matmul_row(layer.attn_kv, &attn_norm, &mut kv_raw);
 
-    let mut kv_normed = vec![0.0f32; HEAD_DIM];
+    let mut kv_normed = [0.0f32; HEAD_DIM];
     rms_norm(&kv_raw, layer.attn_kv_a_norm, 1e-6, &mut kv_normed);
 
     apply_rope(&mut kv_normed[KV_LATENT_DIM..], pos, &engine.rope_freqs);
@@ -392,7 +392,7 @@ fn attention_rows_inner(
     kv_window: &[f32],
     n_head: usize,
 ) {
-    use crate::model::kv_cache::HEAD_DIM;
+    use crate::model::kv_cache::{HEAD_DIM, SWA};
 
     let head_dim = HEAD_DIM;
     let kq_scale = 1.0 / (head_dim as f32).sqrt();
@@ -401,8 +401,13 @@ fn attention_rows_inner(
     assert_eq!(sinks.len(), n_head);
     assert!(kv_window.len().is_multiple_of(head_dim));
     let window_len = kv_window.len() / head_dim;
+    assert!(
+        window_len <= SWA,
+        "attention_rows_inner: window_len {window_len} > SWA {SWA}"
+    );
 
-    let mut scores = vec![0.0f32; window_len];
+    let mut scores_buf = [0.0f32; SWA];
+    let scores = &mut scores_buf[..window_len];
 
     for h in 0..n_head {
         let qh = &q[h * head_dim..(h + 1) * head_dim];
