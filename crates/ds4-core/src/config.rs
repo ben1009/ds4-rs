@@ -2,6 +2,24 @@ use anyhow::Result;
 
 use crate::gguf::Value;
 
+/// Mirrors `ds4_layer_compress_ratio` in antirez/ds4 ds4.c (lines 410-415):
+///   * layers `0..2` are dense (ratio = 0)
+///   * even layers `>= 2` use ratio 4 (also carry an indexer; PR 3)
+///   * odd layers `>= 2` use ratio 128
+pub fn layer_compress_ratio(il: u32) -> u32 {
+    if il < 2 {
+        0
+    } else if il & 1 == 0 {
+        4
+    } else {
+        128
+    }
+}
+
+/// GGUF metadata key holding the per-layer compress ratio array. Mirrors
+/// `validate_compress_ratio_metadata` in antirez/ds4 ds4.c (lines 2474-2505).
+pub const COMPRESS_RATIOS_KEY: &str = "deepseek4.attention.compress_ratios";
+
 /// DeepSeek V4 Flash model configuration extracted from GGUF metadata.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -57,6 +75,31 @@ impl ModelConfig {
         let head_dim = get_u32("deepseek4.attention.key_length")
             .or_else(|_| get_u32("deepseek4.attention.head_dim"))
             .unwrap_or(n_embd / n_head);
+
+        // Validate `deepseek4.attention.compress_ratios` against the
+        // hard-coded `ds4_layer_compress_ratio` schedule when present. The
+        // key is optional for back-compat with the synthetic minimal-GGUF
+        // tests, matching `validate_compress_ratio_metadata` in ds4.c.
+        if let Some(value) = metadata.get(COMPRESS_RATIOS_KEY) {
+            let arr = value.to_array().ok_or_else(|| {
+                anyhow::anyhow!("{COMPRESS_RATIOS_KEY}: expected array, got {value:?}")
+            })?;
+            if arr.len() < n_layer as usize {
+                anyhow::bail!(
+                    "{COMPRESS_RATIOS_KEY}: array length {} < n_layer {n_layer}",
+                    arr.len(),
+                );
+            }
+            for (il, entry) in arr.iter().take(n_layer as usize).enumerate() {
+                let got = entry.to_u32().ok_or_else(|| {
+                    anyhow::anyhow!("{COMPRESS_RATIOS_KEY}[{il}]: expected u32, got {entry:?}")
+                })?;
+                let want = layer_compress_ratio(il as u32);
+                if got != want {
+                    anyhow::bail!("{COMPRESS_RATIOS_KEY}[{il}]: GGUF says {got}, expected {want}",);
+                }
+            }
+        }
 
         Ok(Self {
             n_vocab,
@@ -283,5 +326,91 @@ mod tests {
                 "expected error to mention {k}, got: {err}"
             );
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // layer_compress_ratio + compress_ratios metadata validation
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn layer_compress_ratio_truth_table() {
+        // n_layer for DS4 Flash = 43, so layer indices run 0..=42.
+        assert_eq!(layer_compress_ratio(0), 0);
+        assert_eq!(layer_compress_ratio(1), 0);
+        assert_eq!(layer_compress_ratio(2), 4);
+        assert_eq!(layer_compress_ratio(3), 128);
+        assert_eq!(layer_compress_ratio(4), 4);
+        assert_eq!(layer_compress_ratio(5), 128);
+        assert_eq!(layer_compress_ratio(41), 128);
+        assert_eq!(layer_compress_ratio(42), 4);
+    }
+
+    fn ratios_for(n_layer: u32) -> Vec<Value> {
+        (0..n_layer)
+            .map(|il| Value::U32(layer_compress_ratio(il)))
+            .collect()
+    }
+
+    #[test]
+    fn compress_ratios_matching_array_passes() {
+        let mut m = base_metadata();
+        // base_metadata uses n_layer = 32, but the schedule is fully
+        // determined by the layer index, so any prefix length >= n_layer
+        // works.
+        m.insert(
+            COMPRESS_RATIOS_KEY.to_string(),
+            Value::Array(ratios_for(32)),
+        );
+        ModelConfig::from_metadata(&m).expect("matching array should pass");
+    }
+
+    #[test]
+    fn compress_ratios_missing_is_allowed() {
+        // No COMPRESS_RATIOS_KEY in base_metadata — should still parse.
+        ModelConfig::from_metadata(&base_metadata()).expect("missing array OK for back-compat");
+    }
+
+    #[test]
+    fn compress_ratios_mismatch_errors() {
+        let mut m = base_metadata();
+        let mut arr = ratios_for(32);
+        // Flip layer 4 from 4 -> 128 to force a mismatch against the schedule.
+        arr[4] = Value::U32(128);
+        m.insert(COMPRESS_RATIOS_KEY.to_string(), Value::Array(arr));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("compress_ratios") && msg.contains("[4]"),
+            "expected compress_ratios[4] error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn compress_ratios_too_short_errors() {
+        let mut m = base_metadata();
+        m.insert(COMPRESS_RATIOS_KEY.to_string(), Value::Array(ratios_for(8)));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(
+            err.to_string().contains("array length"),
+            "expected array length error, got: {err}",
+        );
+    }
+
+    #[test]
+    fn compress_ratios_wrong_value_type_errors() {
+        let mut m = base_metadata();
+        let mut arr = ratios_for(32);
+        arr[3] = Value::String("nope".to_string());
+        m.insert(COMPRESS_RATIOS_KEY.to_string(), Value::Array(arr));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(err.to_string().contains("[3]"), "got: {err}");
+    }
+
+    #[test]
+    fn compress_ratios_non_array_errors() {
+        let mut m = base_metadata();
+        m.insert(COMPRESS_RATIOS_KEY.to_string(), Value::U32(4));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(err.to_string().contains("expected array"), "got: {err}");
     }
 }

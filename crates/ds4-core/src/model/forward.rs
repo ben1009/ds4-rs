@@ -12,7 +12,7 @@ use crate::{
     config::ModelConfig,
     engine::Engine,
     gguf::GgmlType,
-    model::{WeightMap, kv_cache::KvCache, layer::LayerWeights},
+    model::{WeightMap, compressor::compressor_decode_one, kv_cache::KvCache, layer::LayerWeights},
     ops::{
         hc::{hc_control_split, hc_from_plain_embedding, hc_post, hc_weighted_sum},
         matmul::{expert_subview, matmul_row},
@@ -243,6 +243,30 @@ fn layer_attention_decode(
     }
 
     kv_cache.layer_mut(il).push(&kv_normed);
+
+    // Streaming compressor (attention path). Layers with `ratio == 0` (the
+    // dense first two) skip this entirely; the rest project the post-RMSNorm
+    // activation through `attn_compressor_*` and, on each ratio-boundary
+    // token, push one pooled, RoPE'd, RMSNorm'd row into the per-layer
+    // compressed-KV ring. The compressed rows are not yet consumed by
+    // attention — that wiring lands in PR 4.
+    if let Some(comp_w) = layer.compressor.as_ref() {
+        let mut out_comp = [0.0f32; HEAD_DIM];
+        if let Some(state) = kv_cache.compressor_mut(il) {
+            let emitted = compressor_decode_one(
+                &mut out_comp,
+                comp_w,
+                state,
+                &attn_norm,
+                &engine.rope_freqs_long,
+                pos as u32,
+                il as u32,
+            )?;
+            if emitted {
+                state.push_comp(&out_comp)?;
+            }
+        }
+    }
 
     // Attention over cached KV rows. Caller-provided scratch.
     attention_rows(heads, layer, &q, kv_cache, il, n_head, n_head_dim)?;

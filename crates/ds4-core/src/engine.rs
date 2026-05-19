@@ -7,6 +7,14 @@ use crate::{config::ModelConfig, model::WeightMap, ops::rope::RopeFreqs, tokeniz
 /// Hardcoded RoPE frequency base, matches `DS4_ROPE_FREQ_BASE` in antirez/ds4.
 /// Cross-checked against the GGUF `*.rope.freq_base` metadata at load time.
 const ROPE_FREQ_BASE: f32 = 10000.0;
+/// Long-context RoPE frequency base used by the streaming compressor's
+/// emitted-row rotation. Mirrors `DS4_ROPE_LONG_FREQ_BASE` in ds4.c — the
+/// compressor sees position indices on the order of `pos / ratio`, so the
+/// rotation runs at a different base from the per-token attention RoPE.
+const ROPE_LONG_FREQ_BASE: f32 = 160_000.0;
+/// Long-context YaRN scale factor (compressor RoPE only). Matches the
+/// `freq_scale = 1/16` in the C reference.
+const ROPE_LONG_SCALE_FACTOR: f32 = 16.0;
 
 /// The inference engine. Holds loaded model weights and tokenizer.
 /// Immutable after creation — safe to share across threads via Arc.
@@ -16,6 +24,10 @@ pub struct Engine {
     pub config: ModelConfig,
     /// Precomputed RoPE frequency cache (avoids re-computing sin/cos per layer).
     pub rope_freqs: RopeFreqs,
+    /// Long-context RoPE frequency cache used by the streaming compressor.
+    /// `freq_base = 160_000`, `scale_factor = 16`. Built once at engine open
+    /// alongside [`Engine::rope_freqs`].
+    pub rope_freqs_long: RopeFreqs,
 }
 
 impl Engine {
@@ -51,6 +63,23 @@ impl Engine {
             }),
         });
 
+        // Long-context RoPE for the streaming compressor (attn_compressor_*).
+        // The base is `160_000` and the scale matches the dense path's
+        // `1/16` so that, beyond the YaRN ramp, dimensions interpolate the
+        // same way. The C reference passes the same YaRN params for both
+        // freq caches; only the base differs.
+        let rope_freqs_long = RopeFreqs::new(&crate::ops::rope::RopeParams {
+            n_rot: 64,
+            base: ROPE_LONG_FREQ_BASE,
+            yarn: Some(crate::ops::rope::YarnParams {
+                scale_factor: ROPE_LONG_SCALE_FACTOR,
+                beta_fast: 32.0,
+                beta_slow: 1.0,
+                orig_ctx: 65536.0,
+                attn_factor: None,
+            }),
+        });
+
         tracing::info!(
             "Engine ready: {} layers, {} vocab, ctx {}",
             config.n_layer,
@@ -63,6 +92,7 @@ impl Engine {
             tokenizer,
             config,
             rope_freqs,
+            rope_freqs_long,
         }))
     }
 }

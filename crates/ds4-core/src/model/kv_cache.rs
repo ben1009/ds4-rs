@@ -13,8 +13,15 @@
 //!
 //! Per-token footprint (f32): 512 floats = 2 KiB.
 //! For cap_raw=128 and 43 layers: ~11 MiB.
+//!
+//! Per-layer streaming compressor state lives here too (see
+//! [`CompressorState`]). Layers with `ratio == 0` (the dense first two)
+//! carry no state. PR 4 will read these emitted rows; for now they're
+//! produced but not consumed.
 
 use anyhow::{Result, bail};
+
+use crate::config::layer_compress_ratio;
 
 /// Width of one cached KV row. Matches `DS4_N_HEAD_DIM` in ds4.c.
 pub const HEAD_DIM: usize = 512;
@@ -24,6 +31,123 @@ pub const SWA: usize = 128;
 pub const KV_LATENT_DIM: usize = 448;
 /// Width of the decoupled RoPE key tail within a `HEAD_DIM` row.
 pub const K_PE_DIM: usize = 64;
+
+/// Sentinel "no logit" score used by the streaming compressor's softmax.
+/// Matches `DS4_NEG_INF` in ds4.c (`-1e30`); the pool helper compares
+/// against `NEG_INF * 0.5` to detect an all-empty column.
+pub const NEG_INF: f32 = -1.0e30;
+
+/// Per-layer state for the streaming compressor (attention path).
+///
+/// Mirrors the `attn_state_kv / attn_state_score / attn_comp_kv / n_comp`
+/// quartet inside `ds4_layer_cache` in antirez/ds4 ds4.c (lines 6154-6470).
+/// Layers with `ratio == 0` (the dense first two layers in DS4 Flash) have
+/// no compressor; `KvCache::compressor(il)` returns `None` for them.
+///
+/// Layout summary (`ratio != 0`):
+/// * `coff = 2 if ratio == 4 else 1` — extra "compressed lane" only the ratio-4 path uses, doubling
+///   the per-row state width.
+/// * `width = coff * HEAD_DIM` — per-row width of `state_kv`/`state_score`.
+/// * `state_kv`/`state_score` are `[coff*ratio, width]` row-major. Score is initialised to
+///   `NEG_INF` so the softmax in `compressor_pool` ignores slots until they receive a real score.
+/// * `comp_kv` is the emitted ring of `[comp_cap, HEAD_DIM]` compressed rows; `n_comp` is the
+///   watermark.
+pub struct CompressorState {
+    pub ratio: u32,
+    pub comp_cap: usize,
+    pub state_kv: Vec<f32>,
+    pub state_score: Vec<f32>,
+    pub comp_kv: Vec<f32>,
+    pub n_comp: usize,
+}
+
+impl CompressorState {
+    /// Build a fresh state for one layer. `ratio == 0` is rejected; the
+    /// caller owns the dense vs. compressed branch and must not invoke this
+    /// for dense layers.
+    ///
+    /// Returns `Err` if any of the buffer-size products overflow `usize`,
+    /// so `KvCache::new` can propagate the failure instead of panicking
+    /// inside `vec!` on a pathological `ctx_size`.
+    pub fn new(ratio: u32, ctx_size: usize) -> Result<Self> {
+        assert!(ratio != 0, "CompressorState::new called with ratio = 0");
+        let coff = if ratio == 4 { 2 } else { 1usize };
+        let width = coff
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: width overflow"))?;
+        let rows = coff
+            .checked_mul(ratio as usize)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: row count overflow"))?;
+        let state_len = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: state buffer length overflow"))?;
+        // ds4.c: `comp_cap = ctx_size / ratio + 2`. The +2 absorbs the
+        // partial-window edge cases (a long-running session can outrun the
+        // simple ctx/ratio bound by one or two emitted rows).
+        let comp_cap = (ctx_size / ratio as usize)
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: comp_cap overflow"))?;
+        let comp_kv_len = comp_cap
+            .checked_mul(HEAD_DIM)
+            .ok_or_else(|| anyhow::anyhow!("CompressorState: comp_kv length overflow"))?;
+        Ok(Self {
+            ratio,
+            comp_cap,
+            state_kv: vec![0.0f32; state_len],
+            state_score: vec![NEG_INF; state_len],
+            comp_kv: vec![0.0f32; comp_kv_len],
+            n_comp: 0,
+        })
+    }
+
+    pub fn coff(&self) -> usize {
+        if self.ratio == 4 { 2 } else { 1 }
+    }
+
+    /// Width of one row in `state_kv`/`state_score` (`coff * HEAD_DIM`).
+    pub fn width(&self) -> usize {
+        self.coff() * HEAD_DIM
+    }
+
+    /// Reset to the freshly-built shape: zero KV, scores back to `NEG_INF`,
+    /// `n_comp = 0`. Mirrors what `ds4_session_invalidate` does to the
+    /// per-layer compressor fields.
+    pub fn clear(&mut self) {
+        self.state_kv.fill(0.0);
+        self.state_score.fill(NEG_INF);
+        // Leave `comp_kv` allocation alone; n_comp = 0 makes its contents
+        // unreachable. (The C reference doesn't zero comp_kv on invalidate
+        // either.)
+        self.n_comp = 0;
+    }
+
+    /// Append one `HEAD_DIM`-wide compressed row to the emitted ring.
+    /// Errors if the cap would be exceeded — ds4.c calls `ds4_die` here, but
+    /// we surface it as an error so the forward pass can roll back.
+    pub fn push_comp(&mut self, row: &[f32]) -> Result<()> {
+        if row.len() != HEAD_DIM {
+            bail!(
+                "CompressorState::push_comp: row width {} != HEAD_DIM {HEAD_DIM}",
+                row.len(),
+            );
+        }
+        if self.n_comp >= self.comp_cap {
+            bail!(
+                "CompressorState::push_comp: capacity {} exceeded",
+                self.comp_cap,
+            );
+        }
+        let off = self.n_comp * HEAD_DIM;
+        self.comp_kv[off..off + HEAD_DIM].copy_from_slice(row);
+        self.n_comp += 1;
+        Ok(())
+    }
+
+    /// Slice of the `n_comp` emitted rows: `[n_comp, HEAD_DIM]` row-major.
+    pub fn comp_rows(&self) -> &[f32] {
+        &self.comp_kv[..self.n_comp * HEAD_DIM]
+    }
+}
 
 /// One layer's raw ring buffer. `[cap_raw, HEAD_DIM]` row-major with a
 /// watermark `n_raw <= cap_raw`. On overflow the oldest row is evicted by
@@ -84,14 +208,23 @@ impl RawLayerCache {
     }
 }
 
-/// Multi-layer KV cache: one `RawLayerCache` per transformer layer.
+/// Multi-layer KV cache: one `RawLayerCache` per transformer layer plus a
+/// matching slot of optional `CompressorState`. Dense layers (`ratio == 0`)
+/// store `None` rather than an empty `CompressorState` to make the
+/// "this layer skips the compressor" case visible at the type level.
 pub struct KvCache {
     layers: Vec<RawLayerCache>,
+    compressors: Vec<Option<CompressorState>>,
 }
 
 impl KvCache {
     /// `ctx_size` mirrors `ds4_default_raw_cap` in ds4.c:
     /// `cap_raw = min(SWA, ctx_size).max(1)`.
+    ///
+    /// Per-layer compressor state is sized from `layer_compress_ratio(il)`:
+    /// the dense layers (`il < 2`) get `None`, the rest carry a
+    /// [`CompressorState`] sized with the full unclamped `ctx_size` (the
+    /// compressor's emitted ring is independent of the SWA-clamped raw ring).
     pub fn new(n_layer: usize, ctx_size: usize) -> Result<Self> {
         let cap_raw = SWA.min(ctx_size).max(1);
         let total = n_layer
@@ -105,8 +238,19 @@ impl KvCache {
             "KvCache: {n_layer} layers × cap_raw {cap_raw} × HEAD_DIM {HEAD_DIM} = {} MiB",
             total * 4 / 1024 / 1024
         );
+        let compressors = (0..n_layer)
+            .map(|il| {
+                let ratio = layer_compress_ratio(il as u32);
+                if ratio == 0 {
+                    Ok(None)
+                } else {
+                    CompressorState::new(ratio, ctx_size).map(Some)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers: (0..n_layer).map(|_| RawLayerCache::new(cap_raw)).collect(),
+            compressors,
         })
     }
 
@@ -118,6 +262,17 @@ impl KvCache {
         &mut self.layers[il]
     }
 
+    /// Borrow the streaming compressor for layer `il`. Dense layers return
+    /// `None`. Mirrors the `ratio != 0` gating in ds4.c.
+    pub fn compressor(&self, il: usize) -> Option<&CompressorState> {
+        self.compressors[il].as_ref()
+    }
+
+    /// Mutable counterpart of [`KvCache::compressor`].
+    pub fn compressor_mut(&mut self, il: usize) -> Option<&mut CompressorState> {
+        self.compressors[il].as_mut()
+    }
+
     pub fn n_layer(&self) -> usize {
         self.layers.len()
     }
@@ -126,23 +281,30 @@ impl KvCache {
         self.layers.first().map_or(0, |l| l.cap_raw)
     }
 
-    /// Clear every layer's ring (n_raw = 0 each). Preserves allocations.
+    /// Clear every layer's ring and compressor state. Preserves allocations.
     pub fn clear_all(&mut self) {
         for l in self.layers.iter_mut() {
             l.clear();
         }
+        for c in self.compressors.iter_mut().flatten() {
+            c.clear();
+        }
     }
 
     /// Capture the full ring state for every layer so a failed multi-step
-    /// operation (e.g. mid-forward error) can restore it.
+    /// operation (e.g. mid-prefill error) can restore it.
     ///
     /// Snapshotting `n_raw` alone is not enough: once the ring wraps,
     /// pushes overwrite the buffer in place, so the only way to undo a
-    /// partial run is to keep the bytes around.
+    /// partial run is to keep the bytes around. The compressor state is
+    /// snapshotted with the same byte-for-byte semantics — `state_kv` and
+    /// `state_score` rows can be overwritten in place by `compressor_decode_one`,
+    /// and `comp_kv` slots can be reused if `n_comp` rolls back.
     ///
     /// Use [`KvCache::snapshot_into`] in hot paths so the destination buffer
     /// is reused across calls — that's a `cap_raw * HEAD_DIM * n_layer * 4`
-    /// bytes save per token (~11 MiB at the 128/512/43 default).
+    /// bytes save per token (~11 MiB at the 128/512/43 default), plus the
+    /// per-layer compressor state.
     pub fn snapshot(&self) -> KvCacheSnapshot {
         let mut snap = KvCacheSnapshot::with_shape(self);
         self.snapshot_into(&mut snap);
@@ -159,6 +321,11 @@ impl KvCache {
             self.layers.len(),
             "KvCache::snapshot_into: layer count mismatch"
         );
+        assert_eq!(
+            snap.compressors.len(),
+            self.compressors.len(),
+            "KvCache::snapshot_into: compressor count mismatch"
+        );
         for (dst, src) in snap.layers.iter_mut().zip(self.layers.iter()) {
             assert_eq!(
                 dst.0.len(),
@@ -167,6 +334,33 @@ impl KvCache {
             );
             dst.0.copy_from_slice(&src.raw_kv);
             dst.1 = src.n_raw;
+        }
+        for (dst, src) in snap.compressors.iter_mut().zip(self.compressors.iter()) {
+            match (dst.as_mut(), src.as_ref()) {
+                (Some(snap_state), Some(state)) => {
+                    assert_eq!(
+                        snap_state.state_kv.len(),
+                        state.state_kv.len(),
+                        "KvCache::snapshot_into: compressor state_kv size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.state_score.len(),
+                        state.state_score.len(),
+                        "KvCache::snapshot_into: compressor state_score size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.comp_kv.len(),
+                        state.comp_kv.len(),
+                        "KvCache::snapshot_into: comp_kv size mismatch"
+                    );
+                    snap_state.state_kv.copy_from_slice(&state.state_kv);
+                    snap_state.state_score.copy_from_slice(&state.state_score);
+                    snap_state.comp_kv.copy_from_slice(&state.comp_kv);
+                    snap_state.n_comp = state.n_comp;
+                }
+                (None, None) => {}
+                _ => panic!("KvCache::snapshot_into: compressor presence mismatch"),
+            }
         }
     }
 
@@ -178,6 +372,11 @@ impl KvCache {
             self.layers.len(),
             "KvCache::restore: layer count mismatch"
         );
+        assert_eq!(
+            snap.compressors.len(),
+            self.compressors.len(),
+            "KvCache::restore: compressor count mismatch"
+        );
         for (l, (raw, n_raw)) in self.layers.iter_mut().zip(snap.layers.iter()) {
             assert_eq!(
                 raw.len(),
@@ -187,16 +386,45 @@ impl KvCache {
             l.raw_kv.copy_from_slice(raw);
             l.n_raw = *n_raw;
         }
+        for (slot, snap_slot) in self.compressors.iter_mut().zip(snap.compressors.iter()) {
+            match (slot.as_mut(), snap_slot.as_ref()) {
+                (Some(state), Some(snap_state)) => {
+                    assert_eq!(
+                        snap_state.state_kv.len(),
+                        state.state_kv.len(),
+                        "KvCache::restore: compressor state_kv size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.state_score.len(),
+                        state.state_score.len(),
+                        "KvCache::restore: compressor state_score size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.comp_kv.len(),
+                        state.comp_kv.len(),
+                        "KvCache::restore: comp_kv size mismatch"
+                    );
+                    state.state_kv.copy_from_slice(&snap_state.state_kv);
+                    state.state_score.copy_from_slice(&snap_state.state_score);
+                    state.comp_kv.copy_from_slice(&snap_state.comp_kv);
+                    state.n_comp = snap_state.n_comp;
+                }
+                (None, None) => {}
+                _ => panic!("KvCache::restore: compressor presence mismatch"),
+            }
+        }
     }
 }
 
-/// Reusable rollback snapshot of every layer's ring buffer + watermark.
+/// Reusable rollback snapshot of every layer's ring buffer + watermark plus
+/// per-layer compressor state.
 ///
 /// Build once via [`KvCacheSnapshot::with_shape`] and reuse across calls
 /// with [`KvCache::snapshot_into`] / [`KvCache::restore`] to avoid the
 /// per-token allocation that `KvCache::snapshot` would otherwise pay.
 pub struct KvCacheSnapshot {
     layers: Vec<(Vec<f32>, usize)>,
+    compressors: Vec<Option<CompressorSnapshot>>,
 }
 
 impl KvCacheSnapshot {
@@ -210,8 +438,27 @@ impl KvCacheSnapshot {
                 .iter()
                 .map(|l| (vec![0.0f32; l.raw_kv.len()], 0usize))
                 .collect(),
+            compressors: cache
+                .compressors
+                .iter()
+                .map(|c| {
+                    c.as_ref().map(|s| CompressorSnapshot {
+                        state_kv: vec![0.0f32; s.state_kv.len()],
+                        state_score: vec![NEG_INF; s.state_score.len()],
+                        comp_kv: vec![0.0f32; s.comp_kv.len()],
+                        n_comp: 0,
+                    })
+                })
+                .collect(),
         }
     }
+}
+
+struct CompressorSnapshot {
+    state_kv: Vec<f32>,
+    state_score: Vec<f32>,
+    comp_kv: Vec<f32>,
+    n_comp: usize,
 }
 
 #[cfg(test)]
@@ -409,5 +656,155 @@ mod tests {
         cache.restore(&snap);
         assert_eq!(cache.layer(0).n_raw(), 0);
         assert_eq!(cache.layer(1).n_raw(), 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // CompressorState
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn compressor_state_ratio_4_shapes() {
+        let s = CompressorState::new(4, 1024).unwrap();
+        assert_eq!(s.ratio, 4);
+        assert_eq!(s.coff(), 2);
+        assert_eq!(s.width(), 2 * HEAD_DIM);
+        // rows = coff * ratio = 2 * 4 = 8.
+        assert_eq!(s.state_kv.len(), 8 * 2 * HEAD_DIM);
+        assert_eq!(s.state_score.len(), 8 * 2 * HEAD_DIM);
+        // comp_cap = ctx / ratio + 2 = 1024 / 4 + 2 = 258.
+        assert_eq!(s.comp_cap, 258);
+        assert_eq!(s.comp_kv.len(), 258 * HEAD_DIM);
+        assert_eq!(s.n_comp, 0);
+        // state_score must be initialised to NEG_INF, not zero — the pool
+        // softmax keys off this.
+        assert!(s.state_score.iter().all(|&v| v == NEG_INF));
+        assert!(s.state_kv.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn compressor_state_ratio_128_shapes() {
+        let s = CompressorState::new(128, 8192).unwrap();
+        assert_eq!(s.coff(), 1);
+        assert_eq!(s.width(), HEAD_DIM);
+        assert_eq!(s.state_kv.len(), 128 * HEAD_DIM);
+        assert_eq!(s.state_score.len(), 128 * HEAD_DIM);
+        // comp_cap = 8192 / 128 + 2 = 66.
+        assert_eq!(s.comp_cap, 66);
+    }
+
+    #[test]
+    fn compressor_state_clear_resets_score_and_n_comp() {
+        let mut s = CompressorState::new(4, 64).unwrap();
+        for v in s.state_kv.iter_mut() {
+            *v = 1.0;
+        }
+        for v in s.state_score.iter_mut() {
+            *v = 0.5;
+        }
+        s.push_comp(&[2.0; HEAD_DIM]).unwrap();
+        s.push_comp(&[3.0; HEAD_DIM]).unwrap();
+        assert_eq!(s.n_comp, 2);
+
+        s.clear();
+        assert_eq!(s.n_comp, 0);
+        assert!(s.state_kv.iter().all(|&v| v == 0.0));
+        assert!(s.state_score.iter().all(|&v| v == NEG_INF));
+    }
+
+    #[test]
+    fn compressor_state_push_comp_grows_n_comp() {
+        let mut s = CompressorState::new(128, 1024).unwrap();
+        let row_a: Vec<f32> = (0..HEAD_DIM).map(|i| i as f32).collect();
+        s.push_comp(&row_a).unwrap();
+        assert_eq!(s.n_comp, 1);
+        assert_eq!(s.comp_rows().len(), HEAD_DIM);
+        assert_eq!(&s.comp_rows()[..HEAD_DIM], row_a.as_slice());
+    }
+
+    #[test]
+    fn compressor_state_push_comp_capacity_overflow_errors() {
+        // ctx_size = 4 → comp_cap = 4/4 + 2 = 3. Push 3 rows fine, 4th errors.
+        let mut s = CompressorState::new(4, 4).unwrap();
+        assert_eq!(s.comp_cap, 3);
+        for i in 0..3 {
+            s.push_comp(&[i as f32; HEAD_DIM]).unwrap();
+        }
+        let err = s.push_comp(&[99.0; HEAD_DIM]).unwrap_err();
+        assert!(err.to_string().contains("capacity"), "got: {err}");
+        // n_comp must not have advanced past the cap.
+        assert_eq!(s.n_comp, 3);
+    }
+
+    #[test]
+    fn compressor_state_push_comp_wrong_width_errors() {
+        let mut s = CompressorState::new(128, 256).unwrap();
+        let err = s.push_comp(&[0.0; HEAD_DIM - 1]).unwrap_err();
+        assert!(err.to_string().contains("HEAD_DIM"), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // KvCache compressor wiring
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn kvcache_compressor_some_for_compressed_layers() {
+        // 6 layers: 0,1 dense; 2 ratio=4; 3 ratio=128; 4 ratio=4; 5 ratio=128.
+        let cache = KvCache::new(6, 4096).unwrap();
+        assert!(cache.compressor(0).is_none());
+        assert!(cache.compressor(1).is_none());
+        let l2 = cache.compressor(2).unwrap();
+        assert_eq!(l2.ratio, 4);
+        let l3 = cache.compressor(3).unwrap();
+        assert_eq!(l3.ratio, 128);
+        assert_eq!(cache.compressor(4).unwrap().ratio, 4);
+        assert_eq!(cache.compressor(5).unwrap().ratio, 128);
+    }
+
+    #[test]
+    fn kvcache_clear_all_resets_compressor() {
+        let mut cache = KvCache::new(4, 64).unwrap();
+        let s = cache.compressor_mut(2).unwrap();
+        s.push_comp(&[1.0; HEAD_DIM]).unwrap();
+        for v in s.state_score.iter_mut() {
+            *v = 0.5;
+        }
+        cache.clear_all();
+        let s = cache.compressor(2).unwrap();
+        assert_eq!(s.n_comp, 0);
+        assert!(s.state_score.iter().all(|&v| v == NEG_INF));
+    }
+
+    #[test]
+    fn kvcache_snapshot_restore_round_trips_compressor() {
+        let mut cache = KvCache::new(4, 64).unwrap();
+        // Seed compressor on layer 2 (ratio 4).
+        let s = cache.compressor_mut(2).unwrap();
+        for (i, v) in s.state_kv.iter_mut().enumerate() {
+            *v = i as f32 * 0.1;
+        }
+        for (i, v) in s.state_score.iter_mut().enumerate() {
+            *v = (i as f32) * 0.01 - 1.0;
+        }
+        s.push_comp(&[7.0; HEAD_DIM]).unwrap();
+        s.push_comp(&[9.0; HEAD_DIM]).unwrap();
+
+        let saved_kv = s.state_kv.clone();
+        let saved_score = s.state_score.clone();
+        let saved_comp = s.comp_rows().to_vec();
+        let saved_n = s.n_comp;
+
+        let snap = cache.snapshot();
+        // Stomp the compressor state.
+        let s = cache.compressor_mut(2).unwrap();
+        s.state_kv.fill(0.0);
+        s.state_score.fill(NEG_INF);
+        s.n_comp = 0;
+
+        cache.restore(&snap);
+        let s = cache.compressor(2).unwrap();
+        assert_eq!(s.n_comp, saved_n);
+        assert_eq!(s.state_kv, saved_kv);
+        assert_eq!(s.state_score, saved_score);
+        assert_eq!(s.comp_rows(), saved_comp.as_slice());
     }
 }
