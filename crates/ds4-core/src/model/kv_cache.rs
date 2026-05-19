@@ -1,213 +1,136 @@
-//! MLA latent KV cache.
+//! Per-layer raw KV ring buffer.
 //!
-//! See rfcs/0002-forward-pass.md §3.5 and antirez/ds4 ds4.c. The KV down-
-//! projection produces a single 512-dim row per token (DS4_N_HEAD_DIM),
-//! split for storage into:
-//!   * 448-dim kv_latent (the "nope" part — no positional encoding)
-//!   * 64-dim  k_pe      (the decoupled RoPE key)
+//! Mirrors `ds4_layer_cache.raw_kv` plus `kv_cache_push_raw` in antirez/ds4
+//! ds4.c (lines 6154-6470). Each layer keeps a fixed-capacity ring of the
+//! most recent tokens' merged 512-dim KV rows: append on each step, evict
+//! the oldest row once full (memmove down by one).
 //!
-//! DS4 MLA has no separate per-head K/V up-projection weight — the same
-//! 512-dim row is used unchanged as both K (for scoring) and V (for the
-//! weighted sum) across all 64 query heads. The split is purely a cache-
-//! layout choice (latent half is identity, k_pe half receives RoPE).
+//! Storage is one merged `HEAD_DIM = 512` row per token — the previous
+//! `latent (448) + k_pe (64)` split has been collapsed to match the C
+//! reference. The split sizes are retained as `pub const` so callers can
+//! still slice the freshly-projected row before pushing it (RoPE only
+//! rotates the last 64 dims).
 //!
-//! Per-token footprint (f32): 448 + 64 = 512 floats = 2 KiB.
-//! For ctx=4096 and 43 layers: ~352 MiB.
-//!
-//! The cache is pre-allocated to `[n_layer, ctx_size, dim]` at session creation
-//! and written via O(1) slice mutations. No reallocation during generation.
+//! Per-token footprint (f32): 512 floats = 2 KiB.
+//! For cap_raw=128 and 43 layers: ~11 MiB.
 
 use anyhow::{Result, bail};
 
-/// Width of the non-positional ("nope") latent slice cached per token.
+/// Width of one cached KV row. Matches `DS4_N_HEAD_DIM` in ds4.c.
+pub const HEAD_DIM: usize = 512;
+/// Sliding-window cap. Matches `DS4_N_SWA` in ds4.c.
+pub const SWA: usize = 128;
+/// Width of the non-positional ("nope") slice within a `HEAD_DIM` row.
 pub const KV_LATENT_DIM: usize = 448;
-/// Width of the decoupled RoPE key cached per token.
+/// Width of the decoupled RoPE key tail within a `HEAD_DIM` row.
 pub const K_PE_DIM: usize = 64;
 
-/// In-memory MLA KV cache.
-pub struct KvCache {
-    /// Flat buffer: `[n_layer, ctx_size, KV_LATENT_DIM]` in row-major order.
-    latent: Vec<f32>,
-    /// Flat buffer: `[n_layer, ctx_size, K_PE_DIM]` in row-major order.
-    k_pe: Vec<f32>,
-    /// Number of layers.
-    n_layer: usize,
-    /// Maximum context length (allocated capacity).
-    ctx_size: usize,
-    /// Watermark: number of tokens currently stored.
-    pos: usize,
+/// One layer's raw ring buffer. `[cap_raw, HEAD_DIM]` row-major with a
+/// watermark `n_raw <= cap_raw`. On overflow the oldest row is evicted by
+/// memmove (matches `kv_cache_push_raw` in ds4.c).
+pub struct RawLayerCache {
+    raw_kv: Vec<f32>,
+    n_raw: usize,
+    cap_raw: usize,
 }
 
-/// Compute `(layer * ctx_size + pos) * dim` with overflow checks.
-fn checked_offset(layer: usize, ctx_size: usize, pos: usize, dim: usize) -> Result<usize> {
-    layer
-        .checked_mul(ctx_size)
-        .and_then(|v| v.checked_add(pos))
-        .and_then(|v| v.checked_mul(dim))
-        .ok_or_else(|| anyhow::anyhow!("KvCache: offset overflow"))
+impl RawLayerCache {
+    pub fn new(cap_raw: usize) -> Self {
+        Self {
+            raw_kv: vec![0.0f32; cap_raw * HEAD_DIM],
+            n_raw: 0,
+            cap_raw,
+        }
+    }
+
+    /// Append a `HEAD_DIM`-wide row. When full, drops the oldest row and
+    /// writes the new one at slot `cap_raw - 1`. Panics if `kv.len() != HEAD_DIM`.
+    pub fn push(&mut self, kv: &[f32]) {
+        assert_eq!(
+            kv.len(),
+            HEAD_DIM,
+            "RawLayerCache::push: row width must be HEAD_DIM"
+        );
+        let slot = if self.n_raw < self.cap_raw {
+            let s = self.n_raw;
+            self.n_raw += 1;
+            s
+        } else {
+            // memmove rows [1..cap_raw] down to [0..cap_raw-1]; new row at the tail.
+            self.raw_kv
+                .copy_within(HEAD_DIM..self.cap_raw * HEAD_DIM, 0);
+            self.cap_raw - 1
+        };
+        let off = slot * HEAD_DIM;
+        self.raw_kv[off..off + HEAD_DIM].copy_from_slice(kv);
+    }
+
+    /// Drop all rows. Buffer capacity preserved.
+    pub fn clear(&mut self) {
+        self.n_raw = 0;
+    }
+
+    pub fn n_raw(&self) -> usize {
+        self.n_raw
+    }
+
+    pub fn cap_raw(&self) -> usize {
+        self.cap_raw
+    }
+
+    /// Slice of the `n_raw` active rows: `[n_raw, HEAD_DIM]` row-major.
+    pub fn rows(&self) -> &[f32] {
+        &self.raw_kv[..self.n_raw * HEAD_DIM]
+    }
+}
+
+/// Multi-layer KV cache: one `RawLayerCache` per transformer layer.
+pub struct KvCache {
+    layers: Vec<RawLayerCache>,
 }
 
 impl KvCache {
-    /// Pre-allocate the cache to full `[n_layer, ctx_size, dim]`.
+    /// `ctx_size` mirrors `ds4_default_raw_cap` in ds4.c:
+    /// `cap_raw = min(SWA, ctx_size).max(1)`.
     pub fn new(n_layer: usize, ctx_size: usize) -> Result<Self> {
-        let latent_len = n_layer
-            .checked_mul(ctx_size)
-            .and_then(|v| v.checked_mul(KV_LATENT_DIM))
-            .ok_or_else(|| anyhow::anyhow!("KvCache: latent buffer length overflow"))?;
-        let k_pe_len = n_layer
-            .checked_mul(ctx_size)
-            .and_then(|v| v.checked_mul(K_PE_DIM))
-            .ok_or_else(|| anyhow::anyhow!("KvCache: k_pe buffer length overflow"))?;
+        let cap_raw = SWA.min(ctx_size).max(1);
+        let total = n_layer
+            .checked_mul(cap_raw)
+            .and_then(|v| v.checked_mul(HEAD_DIM))
+            .ok_or_else(|| anyhow::anyhow!("KvCache: buffer length overflow"))?;
+        if total > isize::MAX as usize {
+            bail!("KvCache: buffer too large");
+        }
         tracing::info!(
-            "KvCache: {n_layer} layers × {ctx_size} ctx = {} MiB",
-            (latent_len + k_pe_len) * 4 / 1024 / 1024
+            "KvCache: {n_layer} layers × cap_raw {cap_raw} × HEAD_DIM {HEAD_DIM} = {} MiB",
+            total * 4 / 1024 / 1024
         );
         Ok(Self {
-            latent: vec![0.0f32; latent_len],
-            k_pe: vec![0.0f32; k_pe_len],
-            n_layer,
-            ctx_size,
-            pos: 0,
+            layers: (0..n_layer).map(|_| RawLayerCache::new(cap_raw)).collect(),
         })
     }
 
-    /// Current number of cached tokens.
-    pub fn len(&self) -> usize {
-        self.pos
+    pub fn layer(&self, il: usize) -> &RawLayerCache {
+        &self.layers[il]
     }
 
-    /// Whether the cache is empty.
-    pub fn is_empty(&self) -> bool {
-        self.pos == 0
+    pub fn layer_mut(&mut self, il: usize) -> &mut RawLayerCache {
+        &mut self.layers[il]
     }
 
-    /// Maximum capacity in tokens.
-    pub fn ctx_size(&self) -> usize {
-        self.ctx_size
-    }
-
-    /// Number of layers.
     pub fn n_layer(&self) -> usize {
-        self.n_layer
+        self.layers.len()
     }
 
-    /// Write the kv_latent (`KV_LATENT_DIM`) slice for `(layer, pos)`.
-    pub fn write_latent(&mut self, layer: usize, pos: usize, data: &[f32]) -> Result<()> {
-        if data.len() != KV_LATENT_DIM {
-            bail!(
-                "write_latent: expected {KV_LATENT_DIM} dims, got {}",
-                data.len()
-            );
+    pub fn cap_raw(&self) -> usize {
+        self.layers.first().map_or(0, |l| l.cap_raw)
+    }
+
+    /// Clear every layer's ring (n_raw = 0 each). Preserves allocations.
+    pub fn clear_all(&mut self) {
+        for l in self.layers.iter_mut() {
+            l.clear();
         }
-        if layer >= self.n_layer {
-            bail!("write_latent: layer {layer} >= {}", self.n_layer);
-        }
-        if pos >= self.ctx_size {
-            bail!(
-                "write_latent: context overflow — pos {pos} >= ctx_size {}",
-                self.ctx_size
-            );
-        }
-        let off = checked_offset(layer, self.ctx_size, pos, KV_LATENT_DIM)?;
-        self.latent[off..off + KV_LATENT_DIM].copy_from_slice(data);
-        Ok(())
-    }
-
-    /// Write the decoupled RoPE key (`K_PE_DIM`) for `(layer, pos)`.
-    pub fn write_k_pe(&mut self, layer: usize, pos: usize, data: &[f32]) -> Result<()> {
-        if data.len() != K_PE_DIM {
-            bail!("write_k_pe: expected {K_PE_DIM} dims, got {}", data.len());
-        }
-        if layer >= self.n_layer {
-            bail!("write_k_pe: layer {layer} >= {}", self.n_layer);
-        }
-        if pos >= self.ctx_size {
-            bail!(
-                "write_k_pe: context overflow — pos {pos} >= ctx_size {}",
-                self.ctx_size
-            );
-        }
-        let off = checked_offset(layer, self.ctx_size, pos, K_PE_DIM)?;
-        self.k_pe[off..off + K_PE_DIM].copy_from_slice(data);
-        Ok(())
-    }
-
-    /// Read the kv_latent slice for `(layer, pos)`. Read paths trust the watermark.
-    pub fn read_latent(&self, layer: usize, pos: usize) -> &[f32] {
-        assert!(
-            layer < self.n_layer,
-            "read_latent: layer {layer} >= {}",
-            self.n_layer
-        );
-        assert!(
-            pos < self.ctx_size,
-            "read_latent: pos {pos} >= {}",
-            self.ctx_size
-        );
-        let off = checked_offset(layer, self.ctx_size, pos, KV_LATENT_DIM)
-            .expect("KvCache: latent offset overflow (bounds already checked)");
-        &self.latent[off..off + KV_LATENT_DIM]
-    }
-
-    /// Read the decoupled RoPE key for `(layer, pos)`.
-    pub fn read_k_pe(&self, layer: usize, pos: usize) -> &[f32] {
-        assert!(
-            layer < self.n_layer,
-            "read_k_pe: layer {layer} >= {}",
-            self.n_layer
-        );
-        assert!(
-            pos < self.ctx_size,
-            "read_k_pe: pos {pos} >= {}",
-            self.ctx_size
-        );
-        let off = checked_offset(layer, self.ctx_size, pos, K_PE_DIM)
-            .expect("KvCache: k_pe offset overflow (bounds already checked)");
-        &self.k_pe[off..off + K_PE_DIM]
-    }
-
-    /// Return a slice of all latent vectors for `layer` up to `len` tokens.
-    pub fn latent_layer_prefix(&self, layer: usize, len: usize) -> &[f32] {
-        assert!(layer < self.n_layer);
-        assert!(len <= self.ctx_size);
-        let off = layer
-            .checked_mul(self.ctx_size)
-            .and_then(|v| v.checked_mul(KV_LATENT_DIM))
-            .expect("KvCache: latent prefix offset overflow");
-        let span = len
-            .checked_mul(KV_LATENT_DIM)
-            .expect("KvCache: latent prefix length overflow");
-        let end = off
-            .checked_add(span)
-            .expect("KvCache: latent prefix end overflow");
-        &self.latent[off..end]
-    }
-
-    /// Return a slice of all k_pe vectors for `layer` up to `len` tokens.
-    pub fn k_pe_layer_prefix(&self, layer: usize, len: usize) -> &[f32] {
-        assert!(layer < self.n_layer);
-        assert!(len <= self.ctx_size);
-        let off = layer
-            .checked_mul(self.ctx_size)
-            .and_then(|v| v.checked_mul(K_PE_DIM))
-            .expect("KvCache: k_pe prefix offset overflow");
-        let span = len
-            .checked_mul(K_PE_DIM)
-            .expect("KvCache: k_pe prefix length overflow");
-        let end = off
-            .checked_add(span)
-            .expect("KvCache: k_pe prefix end overflow");
-        &self.k_pe[off..end]
-    }
-
-    /// Advance the position watermark.
-    pub fn set_pos(&mut self, new_pos: usize) {
-        assert!(
-            new_pos <= self.ctx_size,
-            "set_pos: {new_pos} > ctx_size {}",
-            self.ctx_size
-        );
-        self.pos = new_pos;
     }
 }
 
@@ -215,200 +138,156 @@ impl KvCache {
 mod tests {
     use super::*;
 
-    #[test]
-    fn new_zeros_and_shape() {
-        let cache = KvCache::new(2, 8).unwrap();
-        assert_eq!(cache.len(), 0);
-        assert_eq!(cache.n_layer(), 2);
-        assert_eq!(cache.ctx_size(), 8);
-        assert!(cache.is_empty());
+    fn row(seed: f32) -> Vec<f32> {
+        (0..HEAD_DIM).map(|i| seed + i as f32 * 0.001).collect()
     }
 
     #[test]
-    fn write_and_read_latent() {
-        let mut cache = KvCache::new(2, 8).unwrap();
-        let data: Vec<f32> = (0..KV_LATENT_DIM).map(|i| i as f32).collect();
-        cache.write_latent(1, 3, &data).unwrap();
-        let read = cache.read_latent(1, 3);
-        assert_eq!(read, data.as_slice());
-        // Other positions should still be zero.
-        assert!(cache.read_latent(0, 3).iter().all(|&v| v == 0.0));
-        assert!(cache.read_latent(1, 2).iter().all(|&v| v == 0.0));
-    }
-
-    #[test]
-    fn write_and_read_k_pe() {
-        let mut cache = KvCache::new(2, 8).unwrap();
-        let data: Vec<f32> = (0..K_PE_DIM).map(|i| i as f32 * 0.1).collect();
-        cache.write_k_pe(0, 7, &data).unwrap();
-        let read = cache.read_k_pe(0, 7);
-        assert_eq!(read, data.as_slice());
-    }
-
-    #[test]
-    fn layer_prefix_slices() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        for pos in 0..4 {
-            let d: Vec<f32> = (0..KV_LATENT_DIM)
-                .map(|i| (pos * 1000 + i) as f32)
-                .collect();
-            cache.write_latent(0, pos, &d).unwrap();
+    fn fresh_cache_is_empty() {
+        let cache = KvCache::new(3, 64).unwrap();
+        assert_eq!(cache.n_layer(), 3);
+        assert_eq!(cache.cap_raw(), 64);
+        for il in 0..3 {
+            assert_eq!(cache.layer(il).n_raw(), 0);
+            assert_eq!(cache.layer(il).cap_raw(), 64);
+            assert!(cache.layer(il).rows().is_empty());
         }
-        let prefix = cache.latent_layer_prefix(0, 3);
-        assert_eq!(prefix.len(), 3 * KV_LATENT_DIM);
-        // First element of position 2's vector.
-        assert_eq!(prefix[2 * KV_LATENT_DIM], 2000.0);
     }
 
     #[test]
-    fn rejects_wrong_latent_size() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        let err = cache.write_latent(0, 0, &[1.0; 100]).unwrap_err();
-        assert!(err.to_string().contains("expected"));
+    fn cap_clamps_to_swa() {
+        let cache = KvCache::new(1, 1024).unwrap();
+        assert_eq!(cache.cap_raw(), SWA);
     }
 
     #[test]
-    fn rejects_pos_overflow() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        let data = vec![0.0f32; KV_LATENT_DIM];
-        let err = cache.write_latent(0, 4, &data).unwrap_err();
-        assert!(err.to_string().contains("context overflow"));
+    fn cap_clamps_to_ctx_when_below_swa() {
+        let cache = KvCache::new(1, 32).unwrap();
+        assert_eq!(cache.cap_raw(), 32);
     }
 
     #[test]
-    fn set_pos_watermark() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        cache.set_pos(3);
-        assert_eq!(cache.len(), 3);
+    fn cap_zero_ctx_floors_to_one() {
+        let cache = KvCache::new(1, 0).unwrap();
+        assert_eq!(cache.cap_raw(), 1);
     }
 
     #[test]
-    fn write_at_capacity_boundary_ok() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        let lat = vec![1.0f32; KV_LATENT_DIM];
-        let pe = vec![2.0f32; K_PE_DIM];
-        cache.write_latent(0, 3, &lat).unwrap();
-        cache.write_k_pe(0, 3, &pe).unwrap();
-        assert_eq!(cache.read_latent(0, 3), lat.as_slice());
-        assert_eq!(cache.read_k_pe(0, 3), pe.as_slice());
-    }
-
-    #[test]
-    fn write_layer_overflow_errors() {
-        let mut cache = KvCache::new(2, 4).unwrap();
-        let data = vec![0.0f32; KV_LATENT_DIM];
-        let err = cache.write_latent(2, 0, &data).unwrap_err();
-        assert!(err.to_string().contains("layer 2"));
-    }
-
-    #[test]
-    fn rejects_wrong_k_pe_size() {
-        let mut cache = KvCache::new(1, 2).unwrap();
-        let err = cache.write_k_pe(0, 0, &[0.0; 1]).unwrap_err();
-        assert!(err.to_string().contains("expected"));
-    }
-
-    #[test]
-    fn k_pe_pos_overflow_errors() {
-        let mut cache = KvCache::new(1, 2).unwrap();
-        let data = vec![0.0f32; K_PE_DIM];
-        let err = cache.write_k_pe(0, 2, &data).unwrap_err();
-        assert!(err.to_string().contains("context overflow"));
-    }
-
-    #[test]
-    fn k_pe_layer_overflow_errors() {
-        let mut cache = KvCache::new(1, 2).unwrap();
-        let data = vec![0.0f32; K_PE_DIM];
-        let err = cache.write_k_pe(1, 0, &data).unwrap_err();
-        assert!(err.to_string().contains("layer 1"));
-    }
-
-    #[test]
-    fn multi_layer_isolation_latent() {
-        let mut cache = KvCache::new(3, 4).unwrap();
-        let a = vec![1.0f32; KV_LATENT_DIM];
-        let b = vec![2.0f32; KV_LATENT_DIM];
-        cache.write_latent(0, 1, &a).unwrap();
-        cache.write_latent(2, 1, &b).unwrap();
-        assert!(cache.read_latent(0, 1).iter().all(|&v| v == 1.0));
-        assert!(cache.read_latent(1, 1).iter().all(|&v| v == 0.0));
-        assert!(cache.read_latent(2, 1).iter().all(|&v| v == 2.0));
-    }
-
-    #[test]
-    fn multi_layer_isolation_k_pe() {
-        let mut cache = KvCache::new(3, 4).unwrap();
-        let a = vec![5.0f32; K_PE_DIM];
-        cache.write_k_pe(1, 2, &a).unwrap();
-        assert!(cache.read_k_pe(0, 2).iter().all(|&v| v == 0.0));
-        assert!(cache.read_k_pe(1, 2).iter().all(|&v| v == 5.0));
-        assert!(cache.read_k_pe(2, 2).iter().all(|&v| v == 0.0));
-    }
-
-    #[test]
-    fn k_pe_layer_prefix_per_layer() {
-        let mut cache = KvCache::new(2, 3).unwrap();
-        for layer in 0..2 {
-            for pos in 0..3 {
-                let v: Vec<f32> = (0..K_PE_DIM)
-                    .map(|i| (layer * 100 + pos * 10 + i) as f32)
-                    .collect();
-                cache.write_k_pe(layer, pos, &v).unwrap();
-            }
+    fn push_under_cap_fills_in_order() {
+        let mut layer = RawLayerCache::new(4);
+        for i in 0..3 {
+            layer.push(&row(i as f32));
         }
-        let prefix0 = cache.k_pe_layer_prefix(0, 3);
-        let prefix1 = cache.k_pe_layer_prefix(1, 3);
-        assert_eq!(prefix0.len(), 3 * K_PE_DIM);
-        assert_eq!(prefix1.len(), 3 * K_PE_DIM);
-        assert_eq!(prefix0[0], 0.0);
-        assert_eq!(prefix1[0], 100.0);
-        assert_eq!(prefix1[K_PE_DIM], 110.0);
+        assert_eq!(layer.n_raw(), 3);
+        let rows = layer.rows();
+        assert_eq!(rows.len(), 3 * HEAD_DIM);
+        for i in 0..3 {
+            let r = &rows[i * HEAD_DIM..(i + 1) * HEAD_DIM];
+            assert_eq!(r, row(i as f32).as_slice());
+        }
     }
 
     #[test]
-    fn empty_prefix_when_len_zero() {
-        let cache = KvCache::new(2, 4).unwrap();
-        assert_eq!(cache.latent_layer_prefix(0, 0).len(), 0);
-        assert_eq!(cache.k_pe_layer_prefix(0, 0).len(), 0);
+    fn push_at_cap_evicts_oldest() {
+        let mut layer = RawLayerCache::new(3);
+        for i in 0..3 {
+            layer.push(&row(i as f32));
+        }
+        // Now full: rows = [0, 1, 2]. Push row 3 -> rows shift to [1, 2, 3].
+        layer.push(&row(3.0));
+        assert_eq!(layer.n_raw(), 3);
+        let rows = layer.rows();
+        assert_eq!(&rows[0..HEAD_DIM], row(1.0).as_slice());
+        assert_eq!(&rows[HEAD_DIM..2 * HEAD_DIM], row(2.0).as_slice());
+        assert_eq!(&rows[2 * HEAD_DIM..3 * HEAD_DIM], row(3.0).as_slice());
     }
 
     #[test]
-    fn set_pos_to_ctx_size_ok() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        cache.set_pos(4);
-        assert_eq!(cache.len(), 4);
-        assert!(!cache.is_empty());
+    fn push_repeatedly_past_cap_keeps_only_latest_window() {
+        let mut layer = RawLayerCache::new(2);
+        for i in 0..6 {
+            layer.push(&row(i as f32));
+        }
+        let rows = layer.rows();
+        assert_eq!(layer.n_raw(), 2);
+        assert_eq!(&rows[0..HEAD_DIM], row(4.0).as_slice());
+        assert_eq!(&rows[HEAD_DIM..2 * HEAD_DIM], row(5.0).as_slice());
     }
 
     #[test]
-    #[should_panic]
-    fn set_pos_above_ctx_size_panics() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        cache.set_pos(5);
+    fn cap_one_keeps_only_last_row() {
+        let mut layer = RawLayerCache::new(1);
+        layer.push(&row(0.0));
+        layer.push(&row(1.0));
+        layer.push(&row(2.0));
+        assert_eq!(layer.n_raw(), 1);
+        assert_eq!(layer.rows(), row(2.0).as_slice());
     }
 
     #[test]
-    #[should_panic]
-    fn read_latent_layer_oob_panics() {
-        let cache = KvCache::new(1, 2).unwrap();
-        let _ = cache.read_latent(1, 0);
+    fn multi_layer_isolation() {
+        let mut cache = KvCache::new(3, 8).unwrap();
+        cache.layer_mut(0).push(&row(10.0));
+        cache.layer_mut(2).push(&row(20.0));
+        cache.layer_mut(2).push(&row(30.0));
+        assert_eq!(cache.layer(0).n_raw(), 1);
+        assert_eq!(cache.layer(1).n_raw(), 0);
+        assert_eq!(cache.layer(2).n_raw(), 2);
+        assert_eq!(&cache.layer(0).rows()[..HEAD_DIM], row(10.0).as_slice());
+        assert_eq!(&cache.layer(2).rows()[..HEAD_DIM], row(20.0).as_slice());
+        assert_eq!(
+            &cache.layer(2).rows()[HEAD_DIM..2 * HEAD_DIM],
+            row(30.0).as_slice()
+        );
     }
 
     #[test]
-    #[should_panic]
-    fn read_k_pe_pos_oob_panics() {
-        let cache = KvCache::new(1, 2).unwrap();
-        let _ = cache.read_k_pe(0, 2);
+    fn clear_resets_n_raw_without_realloc() {
+        let mut layer = RawLayerCache::new(4);
+        for i in 0..4 {
+            layer.push(&row(i as f32));
+        }
+        let cap_before = layer.raw_kv.capacity();
+        layer.clear();
+        assert_eq!(layer.n_raw(), 0);
+        assert_eq!(layer.cap_raw(), 4);
+        assert!(layer.rows().is_empty());
+        // Buffer not freed.
+        assert_eq!(layer.raw_kv.capacity(), cap_before);
     }
 
     #[test]
-    fn round_trip_overwrite() {
-        let mut cache = KvCache::new(1, 4).unwrap();
-        let a = vec![1.0f32; KV_LATENT_DIM];
-        let b = vec![7.0f32; KV_LATENT_DIM];
-        cache.write_latent(0, 0, &a).unwrap();
-        cache.write_latent(0, 0, &b).unwrap();
-        assert_eq!(cache.read_latent(0, 0), b.as_slice());
+    fn clear_all_zeros_each_layer() {
+        let mut cache = KvCache::new(2, 8).unwrap();
+        cache.layer_mut(0).push(&row(1.0));
+        cache.layer_mut(1).push(&row(2.0));
+        cache.layer_mut(1).push(&row(3.0));
+        cache.clear_all();
+        assert_eq!(cache.layer(0).n_raw(), 0);
+        assert_eq!(cache.layer(1).n_raw(), 0);
+    }
+
+    #[test]
+    fn push_after_clear_starts_at_slot_zero() {
+        let mut layer = RawLayerCache::new(3);
+        for i in 0..3 {
+            layer.push(&row(i as f32));
+        }
+        layer.clear();
+        layer.push(&row(99.0));
+        assert_eq!(layer.n_raw(), 1);
+        assert_eq!(layer.rows(), row(99.0).as_slice());
+    }
+
+    #[test]
+    #[should_panic(expected = "row width must be HEAD_DIM")]
+    fn push_wrong_width_panics() {
+        let mut layer = RawLayerCache::new(2);
+        layer.push(&[0.0f32; HEAD_DIM - 1]);
+    }
+
+    #[test]
+    fn split_constants_match_head_dim() {
+        assert_eq!(KV_LATENT_DIM + K_PE_DIM, HEAD_DIM);
     }
 }

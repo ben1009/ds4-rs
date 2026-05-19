@@ -225,8 +225,11 @@ fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()
             }
             Command::Rewind(n) => {
                 let before = session.pos();
-                session.rewind(n);
-                writeln!(out, "rewound from pos {} to pos {}", before, session.pos())?;
+                if let Err(err) = session.rewind(n) {
+                    writeln!(out, "error rewinding: {err}")?;
+                } else {
+                    writeln!(out, "rewound from pos {} to pos {}", before, session.pos())?;
+                }
             }
             Command::Unknown(msg) => {
                 writeln!(out, "error: {msg} — try /help")?;
