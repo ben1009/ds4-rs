@@ -49,19 +49,16 @@ impl Session {
 
         let start_len = self.tokens.len();
         let start_pos = self.pos;
-        let kv_snapshot = self.kv_cache.snapshot();
         let logits_snapshot = self.logits.clone();
         self.tokens.reserve(tokens.len());
         for &token in tokens.iter().take(tokens.len()) {
             if let Err(err) = self.eval_token(token) {
-                // Forward already rolled back its own per-token state. The
-                // ring is append-and-shift, so an earlier successful push in
-                // this prefill may have already evicted pre-existing rows —
-                // restoring from the pre-prefill snapshot is the only way to
-                // leave the session in its original state.
+                // `eval_token` already restores the KV ring per call (see
+                // its rollback path), so we only need to undo our own
+                // bookkeeping: drop any tokens we pushed and put back the
+                // logits we'd have returned without this prefill call.
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
-                self.kv_cache.restore(kv_snapshot);
                 self.logits = logits_snapshot;
                 return Err(err);
             }
@@ -79,6 +76,13 @@ impl Session {
             );
         }
 
+        // forward_decode pushes one row into each layer's KV ring as it walks
+        // the layer stack (see model::forward), so a fallible op past the
+        // first push leaves earlier layers with a ghost row that doesn't
+        // correspond to any committed token. The ring's append-and-shift
+        // means a later successful eval can't compensate. Snapshot before
+        // running forward and restore on any error path.
+        let kv_snapshot = self.kv_cache.snapshot();
         self.tokens.push(token);
         self.pos = (self.tokens.len() - 1) as u32;
 
@@ -89,11 +93,9 @@ impl Session {
                 self.pos = self.tokens.len() as u32;
             }
             Err(err) => {
-                // forward_decode errors before pushing into the ring (the
-                // push is the very last KV-mutating step), so the ring is
-                // unchanged. Drop the speculative token and reset pos.
                 self.tokens.pop();
                 self.pos = self.tokens.len() as u32;
+                self.kv_cache.restore(kv_snapshot);
                 return Err(err);
             }
         }
@@ -364,6 +366,36 @@ mod tests {
         assert!(err.to_string().contains("context overflow"));
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
+    }
+
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "uses mmap + real filesystem, unsupported under miri isolation"
+    )]
+    fn session_eval_token_failure_restores_seeded_kv_state() {
+        // forward_decode pushes per-layer as it walks the layer stack, so a
+        // mid-forward error leaves earlier layers with a ghost row unless
+        // eval_token snapshots and restores. The minimal-GGUF Engine errors
+        // at token_embd before any push, so this is a sanity check rather
+        // than a true mid-forward reproducer — but it pins the contract.
+        use crate::model::kv_cache::HEAD_DIM;
+        let engine = open_engine();
+        let mut s = Session::new(engine.clone(), 8).unwrap();
+
+        let seed: Vec<f32> = (0..HEAD_DIM).map(|i| 3.0 + i as f32 * 0.001).collect();
+        for il in 0..engine.config.n_layer as usize {
+            s.kv_cache_mut().layer_mut(il).push(&seed);
+        }
+
+        let err = s.eval_token(5).unwrap_err();
+        assert!(err.to_string().contains("token_embd.weight"));
+        assert_eq!(s.pos(), 0);
+        assert!(s.tokens().is_empty());
+        for il in 0..engine.config.n_layer as usize {
+            assert_eq!(s.kv_cache().layer(il).n_raw(), 1);
+            assert_eq!(s.kv_cache().layer(il).rows(), seed.as_slice());
+        }
     }
 
     #[test]
