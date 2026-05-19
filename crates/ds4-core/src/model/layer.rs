@@ -184,7 +184,7 @@ mod tests {
         u32le(&mut buf, crate::gguf::GGUF_MAGIC);
         u32le(&mut buf, 3);
         u64le(&mut buf, 0);
-        let tokens: Vec<String> = (0u8..=255).map(|b| format!("<0x{b:02X}>")).collect();
+        let tokens: Vec<String> = crate::tokenizer::synthetic_byte_tokens();
         u64le(&mut buf, 7);
         kv_u32(&mut buf, "deepseek4.vocab_size", 256);
         kv_u32(&mut buf, "deepseek4.embedding_length", 16);
