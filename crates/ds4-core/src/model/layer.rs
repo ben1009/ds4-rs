@@ -6,7 +6,29 @@
 
 use anyhow::Result;
 
-use crate::{model::WeightMap, ops::matmul::WeightView};
+use crate::{
+    config::layer_compress_ratio,
+    model::{WeightMap, kv_cache::HEAD_DIM},
+    ops::matmul::WeightView,
+};
+
+/// Streaming-compressor weights for one layer, only present when
+/// `layer_compress_ratio(il) != 0`. Mirrors the four `attn_compressor_*`
+/// tensors in antirez/ds4 ds4.c (lines 2370-2405, 2675-2680).
+#[derive(Clone, Copy, Debug)]
+pub struct CompressorLayerWeights<'a> {
+    /// `[N_EMBD, width]` F16. Multiplied against the post-RMSNorm activation
+    /// to produce the per-token KV state row.
+    pub kv: WeightView<'a>,
+    /// `[N_EMBD, width]` F16. Same shape as `kv`; gives the score row.
+    pub gate: WeightView<'a>,
+    /// Positional bias added to the gate output, shape `[width, ratio]`.
+    /// Loaded as an F16 view; the kernel dequants on access.
+    pub ape: WeightView<'a>,
+    /// `[HEAD_DIM]` F32. RMSNorm weight applied after pooling and before
+    /// the long-context RoPE rotation.
+    pub norm: &'a [f32],
+}
 
 /// Borrowed views for one transformer layer.
 ///
@@ -55,6 +77,13 @@ pub struct LayerWeights<'a> {
     /// Per-expert bias added to router probs only for top-k *selection*.
     /// The unbiased probs are still used for the per-expert weight.
     pub ffn_exp_probs_b: Option<&'a [f32]>,
+
+    // --- Streaming compressor (layers with ratio != 0) --------------------
+    /// `Some` for layers `2..n_layer` with `layer_compress_ratio(il) != 0`.
+    /// Dense layers (`il < 2`) hold `None`. PR 4 will plumb these into the
+    /// mixed attention path; for this PR they're only consumed by the
+    /// streaming compressor's emit step.
+    pub compressor: Option<CompressorLayerWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -112,6 +141,52 @@ impl<'a> LayerWeights<'a> {
         // The norm sits on the LoRA-rank side, not n_embd.
         let attn_q_a = q8_0("attn_q_a.weight")?;
 
+        // Streaming compressor (only for layers with ratio != 0). Shapes
+        // match the C reference (ds4.c:2370-2405):
+        //   * kv   F16 [N_EMBD, width]
+        //   * gate F16 [N_EMBD, width]
+        //   * ape  F16 [width, ratio]
+        //   * norm F32 [HEAD_DIM]
+        // where width = coff * HEAD_DIM, coff = (ratio == 4) ? 2 : 1.
+        let ratio = layer_compress_ratio(il);
+        let compressor = if ratio == 0 {
+            None
+        } else {
+            let coff = if ratio == 4 { 2 } else { 1 };
+            let width = coff * HEAD_DIM;
+            let kv = f16("attn_compressor_kv.weight")?;
+            if kv.in_features() != n_embd || kv.out_features() != width {
+                anyhow::bail!(
+                    "{prefix}attn_compressor_kv.weight: expected [{n_embd}, {width}], got [{}, {}]",
+                    kv.in_features(),
+                    kv.out_features(),
+                );
+            }
+            let gate = f16("attn_compressor_gate.weight")?;
+            if gate.in_features() != n_embd || gate.out_features() != width {
+                anyhow::bail!(
+                    "{prefix}attn_compressor_gate.weight: expected [{n_embd}, {width}], got [{}, {}]",
+                    gate.in_features(),
+                    gate.out_features(),
+                );
+            }
+            let ape = f16("attn_compressor_ape.weight")?;
+            if ape.in_features() != width || ape.out_features() != ratio as usize {
+                anyhow::bail!(
+                    "{prefix}attn_compressor_ape.weight: expected [{width}, {ratio}], got [{}, {}]",
+                    ape.in_features(),
+                    ape.out_features(),
+                );
+            }
+            let norm = f32_1d("attn_compressor_norm.weight", HEAD_DIM)?;
+            Some(CompressorLayerWeights {
+                kv,
+                gate,
+                ape,
+                norm,
+            })
+        };
+
         Ok(Self {
             attn_norm: f32_1d("attn_norm.weight", n_embd)?,
             attn_q_a,
@@ -150,6 +225,7 @@ impl<'a> LayerWeights<'a> {
 
             ffn_gate_tid2eid,
             ffn_exp_probs_b,
+            compressor,
         })
     }
 }

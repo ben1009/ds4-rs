@@ -16,6 +16,7 @@ use crate::{
     gguf::{GgufMmap, TensorInfo},
 };
 
+pub mod compressor;
 pub mod forward;
 pub mod kv_cache;
 pub mod layer;
