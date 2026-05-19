@@ -789,9 +789,15 @@ fn run_routed_expert(
 ///
 /// NaN safety: the comparison is `values[i] > best_v` with `best_v` seeded at
 /// `f32::NEG_INFINITY`. `NaN > x` is always false in IEEE-754, so any NaN
-/// inputs are skipped on every slot rather than poisoning the result. The
-/// final `best_i != usize::MAX` check then catches an all-NaN window with a
-/// clear panic message in both debug and release builds.
+/// inputs are skipped on every slot rather than poisoning the result. When
+/// every remaining value is NaN or -inf — which happens running this engine
+/// against a model file whose F16 weights contain NaN bit-patterns (e.g. the
+/// shipped DS4-Flash q2-imatrix GGUF) — we fall back to the lowest still-
+/// unselected index. That mirrors the C reference's behaviour: there
+/// `best_i` is left at its sentinel when no value compares greater, and
+/// downstream Q8_K activation pre-quant casts NaN-per-row to integer 0
+/// regardless, so picking sequential indices in this degenerate case keeps
+/// the forward path running with no further damage.
 fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
     debug_assert!(k <= values.len());
     debug_assert_eq!(out.len(), k);
@@ -807,10 +813,14 @@ fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
                 best_i = i;
             }
         }
-        assert!(
-            best_i != usize::MAX,
-            "topk_indices_desc: no candidate at slot {slot} (all remaining values are NaN or -inf)",
-        );
+        if best_i == usize::MAX {
+            // All remaining values are NaN / -inf. Fall back to the lowest
+            // unselected index so we keep emitting distinct slots and the
+            // forward pass can continue.
+            best_i = (0..values.len())
+                .find(|i| !out[..slot].contains(i))
+                .expect("topk_indices_desc: k > values.len() should be impossible");
+        }
         out[slot] = best_i;
     }
 }
@@ -995,6 +1005,28 @@ mod tests {
         let mut out = [0usize; 1];
         topk_indices_desc(&v, 1, &mut out);
         assert_eq!(out, [1], "topk should pick the non-NaN value");
+    }
+
+    #[test]
+    fn topk_all_nan_falls_back_to_lowest_indices() {
+        // Models whose F16 weights contain NaN bit-patterns (e.g. the
+        // shipped DS4-Flash q2-imatrix GGUF) can produce all-NaN router
+        // probability vectors. In that degenerate case the C reference
+        // leaves `best_i` at its sentinel and downstream Q8_K activation
+        // pre-quant kills the NaN regardless. Mirror that behaviour by
+        // falling back to sequential lowest-index selection.
+        let v = [f32::NAN; 8];
+        let mut out = [0usize; 4];
+        topk_indices_desc(&v, 4, &mut out);
+        assert_eq!(out, [0, 1, 2, 3], "all-NaN should pick sequential indices");
+    }
+
+    #[test]
+    fn topk_all_neg_inf_falls_back_to_lowest_indices() {
+        let v = [f32::NEG_INFINITY; 5];
+        let mut out = [0usize; 3];
+        topk_indices_desc(&v, 3, &mut out);
+        assert_eq!(out, [0, 1, 2]);
     }
 
     #[test]
