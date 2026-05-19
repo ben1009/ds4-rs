@@ -15,6 +15,9 @@ pub struct ModelConfig {
     pub n_expert_used: u32,
     pub n_hc: u32,
     pub head_dim: u32,
+    /// Q LoRA rank — sizes the `attn_q_a` down-projection output and
+    /// `attn_q_a_norm` (`deepseek4.attention.q_lora_rank`).
+    pub q_lora_rank: u32,
     pub rope_theta: f32,
     pub ctx_size: u32,
 }
@@ -46,6 +49,7 @@ impl ModelConfig {
         let n_kv_head = get_u32("deepseek4.attention.head_count_kv")?;
         let n_layer = get_u32("deepseek4.block_count")?;
         let n_ff = get_u32("deepseek4.expert_feed_forward_length")?;
+        let q_lora_rank = get_u32("deepseek4.attention.q_lora_rank")?;
 
         let head_dim = get_u32("deepseek4.attention.key_length")
             .or_else(|_| get_u32("deepseek4.attention.head_dim"))
@@ -62,6 +66,7 @@ impl ModelConfig {
             n_expert_used: get_u32("deepseek4.expert_used_count").unwrap_or(0),
             n_hc: get_u32("deepseek4.hyper_connection.count").unwrap_or(4),
             head_dim,
+            q_lora_rank,
             rope_theta: get_f32("deepseek4.rope.freq_base").unwrap_or(10000.0),
             ctx_size: get_u32("deepseek4.context_length").unwrap_or(32768),
         })
@@ -88,6 +93,10 @@ mod tests {
             "deepseek4.expert_feed_forward_length".to_string(),
             Value::U32(14336),
         );
+        m.insert(
+            "deepseek4.attention.q_lora_rank".to_string(),
+            Value::U32(1024),
+        );
         m
     }
 
@@ -100,6 +109,7 @@ mod tests {
         assert_eq!(cfg.n_kv_head, 8);
         assert_eq!(cfg.n_layer, 32);
         assert_eq!(cfg.n_ff, 14336);
+        assert_eq!(cfg.q_lora_rank, 1024);
     }
 
     #[test]
@@ -248,6 +258,7 @@ mod tests {
             "deepseek4.attention.head_count_kv",
             "deepseek4.block_count",
             "deepseek4.expert_feed_forward_length",
+            "deepseek4.attention.q_lora_rank",
         ];
         for k in keys {
             let mut m = base_metadata();

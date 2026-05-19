@@ -66,6 +66,7 @@ impl<'a> LayerWeights<'a> {
         let n_embd = map.config.n_embd as usize;
         let n_head = map.config.n_head as usize;
         let n_hc = map.config.n_hc as usize;
+        let q_lora_rank = map.config.q_lora_rank as usize;
         let _n_ff = map.config.n_ff as usize;
         let _n_expert = map.config.n_expert as usize;
 
@@ -107,14 +108,14 @@ impl<'a> LayerWeights<'a> {
             None
         };
 
-        // Bind attn_q_a first so we can size attn_q_a_norm from its out_features.
+        // attn_q_a is a Q8_0 down-projection from n_embd → q_lora_rank.
+        // The norm sits on the LoRA-rank side, not n_embd.
         let attn_q_a = q8_0("attn_q_a.weight")?;
-        let q_a_rank = attn_q_a.out_features();
 
         Ok(Self {
             attn_norm: f32_1d("attn_norm.weight", n_embd)?,
             attn_q_a,
-            attn_q_a_norm: f32_1d("attn_q_a_norm.weight", q_a_rank)?,
+            attn_q_a_norm: f32_1d("attn_q_a_norm.weight", q_lora_rank)?,
             attn_q_b: q8_0("attn_q_b.weight")?,
             attn_kv: q8_0("attn_kv.weight")?,
             // attn_kv_a_norm spans the full N_HEAD_DIM (= KV_LATENT_DIM + K_PE_DIM = 512)
@@ -185,13 +186,14 @@ mod tests {
         u32le(&mut buf, 3);
         u64le(&mut buf, 0);
         let tokens: Vec<String> = crate::tokenizer::synthetic_byte_tokens();
-        u64le(&mut buf, 7);
+        u64le(&mut buf, 8);
         kv_u32(&mut buf, "deepseek4.vocab_size", 256);
         kv_u32(&mut buf, "deepseek4.embedding_length", 16);
         kv_u32(&mut buf, "deepseek4.attention.head_count", 4);
         kv_u32(&mut buf, "deepseek4.attention.head_count_kv", 4);
         kv_u32(&mut buf, "deepseek4.block_count", 2);
         kv_u32(&mut buf, "deepseek4.expert_feed_forward_length", 32);
+        kv_u32(&mut buf, "deepseek4.attention.q_lora_rank", 8);
         kv_arr_string(&mut buf, "tokenizer.ggml.tokens", &tokens);
         std::fs::File::create(path)
             .unwrap()
