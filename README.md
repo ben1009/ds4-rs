@@ -5,7 +5,14 @@
 
 A Rust port of [antirez/ds4](https://github.com/antirez/ds4): a single-model inference engine for **DeepSeek V4 Flash**.
 
-> **Status:** Phase 1 forward pass is numerically complete and pending validation against a real DS4 GGUF (gated behind `DS4_TEST_MODEL`). Interactive REPL and session lifecycle (`rewind`, `invalidate`) are wired up. See [`todo.md`](todo.md) for the current backlog.
+> **Status:** Phase 1 forward pass is numerically complete; the
+> `DS4_TEST_MODEL` smoke run now completes end-to-end against a real
+> DS4 GGUF (prefill plus decode steps) without panicking. Full
+> numerical validation still needs a healthy GGUF — the q2-imatrix
+> DS4-Flash file in hand has corrupted F16 weights and produces the
+> same gibberish on the antirez/ds4 C reference. Interactive REPL and
+> session lifecycle (`rewind`, `invalidate`) are wired up. See
+> [`todo.md`](todo.md) for the current backlog.
 
 ## Goals
 

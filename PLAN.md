@@ -8,18 +8,28 @@ Port [antirez/ds4](https://github.com/antirez/ds4) from C/Objective-C/Metal to R
 
 **Goal:** Load model weights, run forward pass, generate tokens greedily via `ds4 -p "hello"`.
 
-**Status:** Forward pass numerically complete; pending smoke validation
-against a real GGUF. GGUF / config / tokenizer plumbing, all Phase 1
-quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL), core op
-helpers (RMSNorm, partial RoPE + YaRN, softmax, SwiGLU, HC Sinkhorn), the
-MLA latent KV cache, the full attention path (single 512-dim cached row
-used as both K and V — no separate per-head up-projection), the routed
-MoE assembly (hash routing for layers 0–2 / biased top-k for layers 3+),
-and the learned output HC reduction have landed. `Session::prefill` and
-`Session::eval_token` reach the full forward graph; the CLI `ds4 -p
-"..." -n ...` exercises tokenizer → prefill → eval → argmax → decode
-end-to-end. `crates/ds4-core/tests/forward_smoke.rs` (gated behind
-`DS4_TEST_MODEL`) validates forward-pass health against a real model.
+**Status:** Forward pass numerically complete; the `DS4_TEST_MODEL`
+smoke run now completes end-to-end against a real DS4 GGUF (prefill
+plus decode steps) without panicking. Numerical validation still
+needs a healthy GGUF — the q2-imatrix DS4-Flash file currently in
+hand has corrupted F16 weights, and the antirez/ds4 C reference
+produces the same gibberish on it. Landed: GGUF / config / tokenizer
+plumbing (`deepseek4.*` metadata keys, JoyAI BPE tokenizer with the
+GPT-2 byte map, `q_lora_rank` read from metadata), the GGUF loader
+fix that maps `(ne0, ne1)` to `(in_features, out_features)` for all
+weight views, all Phase 1 quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS,
+Q4_K, IQ4_XS, IQ4_NL), core op helpers (RMSNorm, partial RoPE + YaRN,
+softmax, SwiGLU, HC Sinkhorn), the MLA latent KV cache, the full
+attention path (single 512-dim cached row used as both K and V — no
+separate per-head up-projection), the routed MoE assembly (hash
+routing for layers 0–2 / biased top-k for layers 3+), the learned
+output HC reduction, per-group slicing of `attn_output_a` in
+`grouped_out_decode`, and a topk fallback for all-NaN router probs.
+`Session::prefill` and `Session::eval_token` reach the full forward
+graph; the CLI `ds4 -p "..." -n ...` exercises tokenizer → prefill →
+eval → argmax → decode end-to-end. `crates/ds4-core/tests/forward_smoke.rs`
+(gated behind `DS4_TEST_MODEL`) drives the same path against a real
+model.
 
 ### Step 1 — Workspace scaffold
 
