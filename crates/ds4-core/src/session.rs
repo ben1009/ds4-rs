@@ -20,6 +20,11 @@ pub struct Session {
     /// by `kv_cache.snapshot_into` on each `eval_token` so a mid-forward
     /// failure can roll the ring back without paying a per-token alloc.
     kv_snapshot: KvCacheSnapshot,
+    /// Reusable scratch for the per-layer attention `heads` buffer
+    /// (`n_head * head_dim` floats). Sized once at session creation; the
+    /// forward pass takes ownership for the duration of one decode step
+    /// via `mem::take` and puts it back, avoiding a per-token alloc.
+    pub(crate) heads_scratch: Vec<f32>,
 }
 
 impl Session {
@@ -27,6 +32,9 @@ impl Session {
         tracing::info!("Creating session with ctx_size={ctx_size}");
         let n_vocab = engine.config.n_vocab as usize;
         let n_layer = engine.config.n_layer as usize;
+        let q_dim = (engine.config.n_head as usize)
+            .checked_mul(engine.config.head_dim as usize)
+            .ok_or_else(|| anyhow::anyhow!("Session: Q dimension overflow"))?;
         let kv_cache = KvCache::new(n_layer, ctx_size as usize)?;
         let kv_snapshot = KvCacheSnapshot::with_shape(&kv_cache);
         Ok(Self {
@@ -37,6 +45,7 @@ impl Session {
             logits: vec![0.0; n_vocab],
             kv_cache,
             kv_snapshot,
+            heads_scratch: vec![0.0f32; q_dim],
         })
     }
 

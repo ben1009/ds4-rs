@@ -60,66 +60,74 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     // Layers are built once at engine open. For Phase 1 we rebuild them
     // on every call; this is fine for a reference implementation.
     //
-    // `heads` is hoisted out of the per-layer call so the decode hot path
-    // doesn't allocate `n_head * head_dim` floats per layer per token.
-    let q_dim = (config.n_head as usize)
-        .checked_mul(config.head_dim as usize)
-        .ok_or_else(|| anyhow::anyhow!("Q dimension overflow"))?;
-    let mut heads_scratch = vec![0.0f32; q_dim];
-    for il in 0..config.n_layer {
-        let layer = LayerWeights::from_map(model, il)?;
-        let mut attn_out = vec![0.0f32; n_embd];
-        let (attn_post, attn_comb) = layer_attention_decode(
-            &mut attn_out,
-            engine,
-            &layer,
-            &residual_hc,
-            session.kv_cache_mut(),
-            &mut heads_scratch,
-            il as usize,
-            pos,
-        )?;
+    // `heads_scratch` lives on the Session so the decode hot path doesn't
+    // allocate `n_head * head_dim` floats per layer per token. We `mem::take`
+    // it out for the duration of this forward pass (giving us a `&mut [f32]`
+    // we can pass alongside a separate `&mut KvCache` borrow of the same
+    // session), then put it back in a scope guard so an early `?` doesn't
+    // leak the empty Vec.
+    let mut heads_scratch = std::mem::take(&mut session.heads_scratch);
+    let q_dim = heads_scratch.len();
+    let result = (|| -> Result<Vec<f32>> {
+        for il in 0..config.n_layer {
+            let layer = LayerWeights::from_map(model, il)?;
+            let mut attn_out = vec![0.0f32; n_embd];
+            let (attn_post, attn_comb) = layer_attention_decode(
+                &mut attn_out,
+                engine,
+                &layer,
+                &residual_hc,
+                session.kv_cache_mut(),
+                &mut heads_scratch,
+                il as usize,
+                pos,
+            )?;
 
-        // HC post for attention.
-        let mut after_attn_hc = vec![0.0f32; hc_dim];
-        hc_post(
-            &mut after_attn_hc,
-            &attn_out,
-            &residual_hc,
-            &attn_post,
-            &attn_comb,
-            n_embd,
-            n_hc,
-        );
+            // HC post for attention.
+            let mut after_attn_hc = vec![0.0f32; hc_dim];
+            hc_post(
+                &mut after_attn_hc,
+                &attn_out,
+                &residual_hc,
+                &attn_post,
+                &attn_comb,
+                n_embd,
+                n_hc,
+            );
 
-        // FFN sublayer.
-        let mut ffn_out = vec![0.0f32; n_embd];
-        let (ffn_post, ffn_comb) = layer_ffn_decode(
-            &mut ffn_out,
-            config,
-            &layer,
-            &after_attn_hc,
-            il as usize,
-            token,
-        )?;
+            // FFN sublayer.
+            let mut ffn_out = vec![0.0f32; n_embd];
+            let (ffn_post, ffn_comb) = layer_ffn_decode(
+                &mut ffn_out,
+                config,
+                &layer,
+                &after_attn_hc,
+                il as usize,
+                token,
+            )?;
 
-        // HC post for FFN.
-        hc_post(
-            &mut residual_hc,
-            &ffn_out,
-            &after_attn_hc,
-            &ffn_post,
-            &ffn_comb,
-            n_embd,
-            n_hc,
-        );
-    }
+            // HC post for FFN.
+            hc_post(
+                &mut residual_hc,
+                &ffn_out,
+                &after_attn_hc,
+                &ffn_post,
+                &ffn_comb,
+                n_embd,
+                n_hc,
+            );
+        }
 
-    // --- Output head -------------------------------------------------------
-    let mut logits = vec![0.0f32; config.n_vocab as usize];
-    output_head(model, config, &residual_hc, &mut logits)?;
+        // --- Output head ---------------------------------------------------
+        let mut logits = vec![0.0f32; config.n_vocab as usize];
+        output_head(model, config, &residual_hc, &mut logits)?;
+        Ok(logits)
+    })();
 
-    Ok(logits)
+    // Restore the scratch buffer no matter what — capacity preserved.
+    debug_assert_eq!(heads_scratch.len(), q_dim);
+    session.heads_scratch = heads_scratch;
+    result
 }
 
 // =========================================================================
