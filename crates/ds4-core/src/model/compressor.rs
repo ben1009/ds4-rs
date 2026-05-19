@@ -57,8 +57,8 @@ pub fn compressor_decode_one(
     _il: u32,
 ) -> Result<bool> {
     let ratio = state.ratio as usize;
-    debug_assert!(ratio != 0, "compressor_decode_one called on dense layer");
-    debug_assert_eq!(out_comp.len(), HEAD_DIM);
+    assert!(ratio != 0, "compressor_decode_one called on dense layer");
+    assert_eq!(out_comp.len(), HEAD_DIM);
     let width = state.width();
 
     // Project to KV / score rows.
@@ -130,7 +130,7 @@ pub fn compressor_decode_one(
 /// When the column max is at or below `NEG_INF * 0.5`, the output is exactly
 /// zero (no real scores in that column).
 pub fn compressor_pool(out: &mut [f32], state: &CompressorState) {
-    debug_assert_eq!(out.len(), HEAD_DIM);
+    assert_eq!(out.len(), HEAD_DIM);
     let width = state.width();
     let ratio = state.ratio as usize;
     let neg_inf_thresh = NEG_INF * 0.5;
@@ -206,16 +206,16 @@ fn add_ape_bias(
     ratio: usize,
 ) {
     use crate::ops::matmul::WeightView;
-    debug_assert!(pos_mod < ratio);
-    debug_assert_eq!(sc_row.len(), width);
+    assert!(pos_mod < ratio);
+    assert_eq!(sc_row.len(), width);
     match ape {
         WeightView::F16 {
             bytes,
             in_features,
             out_features,
         } => {
-            debug_assert_eq!(in_features, width);
-            debug_assert_eq!(out_features, ratio);
+            assert_eq!(in_features, width);
+            assert_eq!(out_features, ratio);
             // F16: 2 bytes per element. Row `pos_mod` of `width` values.
             let row_off = pos_mod * width * 2;
             let row_bytes = &bytes[row_off..row_off + width * 2];

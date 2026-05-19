@@ -70,7 +70,7 @@ impl CompressorState {
     /// so `KvCache::new` can propagate the failure instead of panicking
     /// inside `vec!` on a pathological `ctx_size`.
     pub fn new(ratio: u32, ctx_size: usize) -> Result<Self> {
-        debug_assert!(ratio != 0, "CompressorState::new called with ratio = 0");
+        assert!(ratio != 0, "CompressorState::new called with ratio = 0");
         let coff = if ratio == 4 { 2 } else { 1usize };
         let width = coff
             .checked_mul(HEAD_DIM)
