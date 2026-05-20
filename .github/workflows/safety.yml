@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [ops, quant, model-forward, model-rest, base]
+        module: [ops, quant, model-forward, model-kv, model-other, base]
         include:
           - module: ops
             filter: "ops::"
@@ -60,8 +60,10 @@ jobs:
             filter: "quant::"
           - module: model-forward
             filter: "model::forward::"
-          - module: model-rest
-            filter: "model:: --skip model::forward::"
+          - module: model-kv
+            filter: "model::kv_cache::"
+          - module: model-other
+            filter: "model::weights:: model::indexer:: model::compressor:: model::layer::"
           - module: base
             filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
