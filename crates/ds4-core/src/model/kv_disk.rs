@@ -396,6 +396,121 @@ pub fn load_session(path: &Path, engine: &Arc<Engine>) -> Result<Session> {
     Ok(session)
 }
 
+// ── Prefix matching ─────────────────────────────────────────────────────────
+
+/// Lightweight scan: read just the token IDs from a KVC file.
+///
+/// Returns `(token_ids, context_size)` without loading KV state.
+/// Used by [`find_prefix_match`] to compare token sequences cheaply.
+pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("KVC: cannot open {}", path.display()))?;
+    let mut r = BufReader::new(file);
+
+    let header = read_header(&mut r)?;
+    if header.magic != *KVC_MAGIC {
+        bail!("KVC: bad magic: {:?}", header.magic);
+    }
+    if header.version != KVC_VERSION {
+        bail!("KVC: unsupported version {}", header.version);
+    }
+
+    // Skip text section
+    let text_len = read_u32(&mut r)? as u64;
+    skip_bytes(&mut r, text_len)?;
+
+    // DSV4 sub-header: 13 x u32
+    let dsv4_magic = read_u32(&mut r)?;
+    if dsv4_magic != DSV4_MAGIC {
+        bail!("KVC/DSV4: bad magic: 0x{dsv4_magic:08X}");
+    }
+    let _dsv4_version = read_u32(&mut r)?;
+    let _ctx_size = read_u32(&mut r)?;
+    let _prefill_cap = read_u32(&mut r)?;
+    let _raw_cap = read_u32(&mut r)?;
+    let _raw_window = read_u32(&mut r)?;
+    let _comp_cap = read_u32(&mut r)?;
+    let token_count = read_u32(&mut r)?;
+    // Skip remaining sub-header fields: layer_count, head_dim, indexer_head_dim, vocab_size,
+    // raw_live
+    for _ in 0..5 {
+        read_u32(&mut r)?;
+    }
+
+    // Read token IDs
+    let mut tokens = Vec::with_capacity(token_count as usize);
+    for _ in 0..token_count {
+        tokens.push(read_u32(&mut r)?);
+    }
+
+    Ok((tokens, header.context_size))
+}
+
+/// Scan `cache_dir` for KVC files and find the one whose token IDs
+/// form the longest prefix of `query_tokens`.
+///
+/// Returns `Some((path, common_len))` for the best match, or `None`
+/// if no file's tokens are a strict prefix of `query_tokens`.
+/// Errors on individual files are logged and skipped.
+pub fn find_prefix_match(
+    cache_dir: &Path,
+    query_tokens: &[u32],
+) -> Option<(std::path::PathBuf, usize)> {
+    use crate::session::common_prefix_len;
+
+    let entries = match std::fs::read_dir(cache_dir) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    let mut best: Option<(std::path::PathBuf, usize)> = None;
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "kvc") {
+            continue;
+        }
+        let cached_tokens = match read_token_ids(&path) {
+            Ok((tokens, _)) => tokens,
+            Err(e) => {
+                tracing::debug!("KVC: skipping {}: {e}", path.display());
+                continue;
+            }
+        };
+        let common = common_prefix_len(&cached_tokens, query_tokens);
+        if common > 0 && common < query_tokens.len()
+            && best.as_ref().is_none_or(|(_, prev)| common > *prev) {
+                best = Some((path, common));
+            }
+    }
+
+    best
+}
+
+/// Load the best prefix-matching KVC session from `cache_dir` for
+/// `query_tokens`. Returns `Some((session, suffix_tokens))` if a
+/// match was found, or `None` if no cached session shares a prefix.
+pub fn load_prefix_match(
+    cache_dir: &Path,
+    query_tokens: &[u32],
+    engine: &Arc<Engine>,
+) -> Result<Option<(Session, Vec<u32>)>> {
+    let (path, common_len) = match find_prefix_match(cache_dir, query_tokens) {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+
+    tracing::info!(
+        "KVC prefix match: {} ({} common tokens)",
+        path.display(),
+        common_len
+    );
+
+    let session = load_session(&path, engine)?;
+    let suffix = query_tokens[common_len..].to_vec();
+    Ok(Some((session, suffix)))
+}
+
 fn read_dsv4_payload(
     r: &mut impl Read,
     engine: &Arc<Engine>,
@@ -743,5 +858,114 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&kvc_path);
+    }
+
+    // ── read_token_ids ────────────────────────────────────────────────────
+
+    #[test]
+    fn read_token_ids_round_trip() {
+        let (engine, _path) = open_engine();
+        let mut session = Session::new(engine.clone(), 2048).unwrap();
+        session
+            .restore_from_tokens(vec![10, 20, 30, 40, 50])
+            .unwrap();
+
+        let kvc_path =
+            std::env::temp_dir().join(format!("ds4-kvc-token-ids-{}.kvc", std::process::id()));
+        save_session(&kvc_path, &session, SaveReason::Manual).unwrap();
+
+        let (tokens, ctx_size) = read_token_ids(&kvc_path).unwrap();
+        assert_eq!(tokens, vec![10, 20, 30, 40, 50]);
+        assert_eq!(ctx_size, 2048);
+
+        let _ = std::fs::remove_file(&kvc_path);
+    }
+
+    #[test]
+    fn read_token_ids_rejects_bad_magic() {
+        let path =
+            std::env::temp_dir().join(format!("ds4-kvc-bad-magic-ids-{}.kvc", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            let mut header = [0u8; 48];
+            header[..3].copy_from_slice(b"XXX");
+            f.write_all(&header).unwrap();
+        }
+        assert!(read_token_ids(&path).is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ── find_prefix_match ─────────────────────────────────────────────────
+
+    #[test]
+    fn find_prefix_match_finds_longest() {
+        let (engine, _path) = open_engine();
+        let dir = std::env::temp_dir().join(format!("ds4-kvc-prefix-dir-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s1 = Session::new(engine.clone(), 2048).unwrap();
+        s1.restore_from_tokens(vec![1, 2, 3]).unwrap();
+        save_session(&dir.join("a.kvc"), &s1, SaveReason::Manual).unwrap();
+
+        let mut s2 = Session::new(engine.clone(), 2048).unwrap();
+        s2.restore_from_tokens(vec![1, 2, 3, 4, 5]).unwrap();
+        save_session(&dir.join("b.kvc"), &s2, SaveReason::Manual).unwrap();
+
+        let result = find_prefix_match(&dir, &[1, 2, 3, 4, 5, 6, 7]);
+        let (path, common) = result.unwrap();
+        assert_eq!(common, 5);
+        assert_eq!(path.file_name().unwrap(), "b.kvc");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_prefix_match_skips_non_prefix() {
+        let (engine, _path) = open_engine();
+        let dir =
+            std::env::temp_dir().join(format!("ds4-kvc-prefix-no-match-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Session::new(engine.clone(), 2048).unwrap();
+        s.restore_from_tokens(vec![10, 20, 30]).unwrap();
+        save_session(&dir.join("a.kvc"), &s, SaveReason::Manual).unwrap();
+
+        let result = find_prefix_match(&dir, &[1, 2, 3]);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_prefix_match_empty_dir() {
+        let dir = std::env::temp_dir().join(format!("ds4-kvc-prefix-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = find_prefix_match(&dir, &[1, 2, 3]);
+        assert!(result.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── load_prefix_match ─────────────────────────────────────────────────
+
+    #[test]
+    fn load_prefix_match_returns_suffix() {
+        let (engine, _path) = open_engine();
+        let dir = std::env::temp_dir().join(format!("ds4-kvc-load-prefix-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut s = Session::new(engine.clone(), 2048).unwrap();
+        s.restore_from_tokens(vec![10, 20, 30, 40]).unwrap();
+        save_session(&dir.join("cached.kvc"), &s, SaveReason::Manual).unwrap();
+
+        let query = vec![10, 20, 30, 40, 50, 60];
+        let result = load_prefix_match(&dir, &query, &engine).unwrap();
+        let (session, suffix) = result.unwrap();
+
+        assert_eq!(session.tokens(), &[10, 20, 30, 40]);
+        assert_eq!(suffix, vec![50, 60]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -250,6 +250,15 @@ impl Session {
     }
 }
 
+/// Return the number of leading tokens that match between `a` and `b`.
+///
+/// Compares element-by-element and returns the count of equal leading
+/// tokens. The caller is responsible for ensuring both sequences were
+/// encoded consistently (e.g., both with or both without BOS).
+pub fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
+}
+
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -704,5 +713,34 @@ mod tests {
         assert_eq!(s.pos(), 0);
         assert!(s.tokens().is_empty());
         assert_eq!(s.kv_cache().layer(0).n_raw(), 0);
+    }
+
+    // ── common_prefix_len ─────────────────────────────────────────────────
+
+    #[test]
+    fn common_prefix_len_identical() {
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3]), 3);
+    }
+
+    #[test]
+    fn common_prefix_len_partial() {
+        assert_eq!(common_prefix_len(&[1, 2, 3, 4, 5], &[1, 2, 3, 7, 8]), 3);
+    }
+
+    #[test]
+    fn common_prefix_len_no_match() {
+        assert_eq!(common_prefix_len(&[1, 2], &[3, 4]), 0);
+    }
+
+    #[test]
+    fn common_prefix_len_empty() {
+        assert_eq!(common_prefix_len(&[], &[1, 2]), 0);
+        assert_eq!(common_prefix_len(&[1, 2], &[]), 0);
+        assert_eq!(common_prefix_len(&[], &[]), 0);
+    }
+
+    #[test]
+    fn common_prefix_len_one_longer() {
+        assert_eq!(common_prefix_len(&[1, 2, 3], &[1, 2, 3, 4, 5]), 3);
     }
 }
