@@ -1423,7 +1423,8 @@ mod tests {
 
     /// Build a minimal `LayerWeights` for testing mixed attention.
     /// Only `attn_sinks`, `compressor`, and `indexer` are meaningful;
-    /// all other fields are dummies.
+    /// all other fields are dummies. Caller owns the `dummy_bytes` and
+    /// `dummy_f32` buffers so no leak is needed.
     fn dummy_f16(bytes: &[u8], in_f: usize, out_f: usize) -> WeightView<'_> {
         WeightView::F16 {
             bytes,
@@ -1436,11 +1437,9 @@ mod tests {
         sinks: &'a [f32],
         compressor: Option<CompressorLayerWeights<'a>>,
         indexer: Option<IndexerLayerWeights<'a>>,
+        dummy_bytes: &'a [u8],
+        dummy_f32: &'a [f32],
     ) -> LayerWeights<'a> {
-        // All dummy weight views need non-zero byte slices.
-        // Use a static empty vec reference trick via leak (tests are short-lived).
-        let dummy_bytes: &'a [u8] = &*Box::leak(vec![0u8; 16].into_boxed_slice());
-        let dummy_f32: &'a [f32] = &*Box::leak(vec![0.0f32; 4].into_boxed_slice());
         let dv = dummy_f16(dummy_bytes, 1, 1);
         LayerWeights {
             attn_norm: dummy_f32,
@@ -1516,7 +1515,10 @@ mod tests {
             compressor_ape: dummy_f16(&idx_bytes, 1, 1),
             compressor_norm: &idx_norm,
         };
-        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), Some(idx_w));
+        let dummy_bytes = vec![0u8; 16];
+        let dummy_f32 = vec![0.0f32; 4];
+        let layer =
+            dummy_layer_for_mixed(&sinks, Some(comp_w), Some(idx_w), &dummy_bytes, &dummy_f32);
 
         let mut out_mixed = vec![0.0f32; n_head * HEAD_DIM];
         attention_rows_mixed(
@@ -1582,7 +1584,9 @@ mod tests {
             ape: dummy_f16(&comp_bytes, 1, 1),
             norm: &norm,
         };
-        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), None);
+        let dummy_bytes = vec![0u8; 16];
+        let dummy_f32 = vec![0.0f32; 4];
+        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), None, &dummy_bytes, &dummy_f32);
 
         let q_lora_norm = vec![];
         let attn_norm = vec![];
@@ -1656,7 +1660,10 @@ mod tests {
         };
 
         // No indexer → all compressed rows allowed.
-        let layer_no_idx = dummy_layer_for_mixed(&sinks, Some(comp_w), None);
+        let dummy_bytes = vec![0u8; 16];
+        let dummy_f32 = vec![0.0f32; 4];
+        let layer_no_idx =
+            dummy_layer_for_mixed(&sinks, Some(comp_w), None, &dummy_bytes, &dummy_f32);
         let q_lora_norm = vec![];
         let attn_norm = vec![];
 
@@ -1709,7 +1716,9 @@ mod tests {
             ape: dummy_f16(&comp_bytes, 1, 1),
             norm: &norm,
         };
-        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), None);
+        let dummy_bytes = vec![0u8; 16];
+        let dummy_f32 = vec![0.0f32; 4];
+        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), None, &dummy_bytes, &dummy_f32);
 
         let mut out = vec![0.0f32; n_head * HEAD_DIM];
         attention_rows_mixed(&mut out, &layer, &q, &[], &[], &cache, 2, n_head, HEAD_DIM).unwrap();
