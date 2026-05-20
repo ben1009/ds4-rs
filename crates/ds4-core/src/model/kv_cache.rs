@@ -16,8 +16,8 @@
 //!
 //! Per-layer streaming compressor state lives here too (see
 //! [`CompressorState`]). Layers with `ratio == 0` (the dense first two)
-//! carry no state. PR 4 will read these emitted rows; for now they're
-//! produced but not consumed.
+//! carry no state. Ratio-4 layers read these emitted rows in the
+//! mixed-attention path.
 
 use anyhow::{Result, bail};
 
@@ -172,8 +172,8 @@ pub const IDX_DIM: usize = INDEXER_HEAD_DIM as usize;
 ///   to `NEG_INF` so the softmax in the pool helper ignores slots until they receive a real score.
 /// * `comp_kv` is the emitted ring of `[comp_cap, IDX_DIM]` rows; `n_comp` is the watermark.
 ///
-/// The emitted indexer rows are *not* yet consumed — that wiring lands when
-/// PR 4 plumbs the indexer mask into the mixed attention path.
+/// The emitted indexer rows are consumed by the mixed-attention path in
+/// ratio-4 layers.
 pub struct IndexerState {
     pub comp_cap: usize,
     pub state_kv: Vec<f32>,
