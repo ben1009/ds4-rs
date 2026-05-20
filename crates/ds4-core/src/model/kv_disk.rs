@@ -245,10 +245,12 @@ fn compute_payload_size(
     kv: &super::kv_cache::KvCache,
 ) -> Result<usize> {
     let mul = |a: usize, b: usize| {
-        a.checked_mul(b).ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
+        a.checked_mul(b)
+            .ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
     };
     let add = |a: usize, b: usize| {
-        a.checked_add(b).ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
+        a.checked_add(b)
+            .ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
     };
 
     let sub_header = 13 * 4;
@@ -277,7 +279,10 @@ fn compute_payload_size(
         }
     }
 
-    let fixed = add(add(sub_header, token_ids)?, add(logits, add(comp_row_counts, idx_row_counts)?)?)?;
+    let fixed = add(
+        add(sub_header, token_ids)?,
+        add(logits, add(comp_row_counts, idx_row_counts)?)?,
+    )?;
     add(fixed, per_layer)
 }
 
@@ -449,9 +454,7 @@ fn read_dsv4_payload(
     // Validate raw_live fits in the session's allocated ring.
     let expected_cap_raw = SWA.min(ctx_size as usize).max(1);
     if raw_live as usize > expected_cap_raw {
-        bail!(
-            "DSV4: raw_live ({raw_live}) > expected cap_raw ({expected_cap_raw})"
-        );
+        bail!("DSV4: raw_live ({raw_live}) > expected cap_raw ({expected_cap_raw})");
     }
 
     // Create session with the saved ctx_size from the header.
