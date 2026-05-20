@@ -431,6 +431,12 @@ pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
     let _raw_window = read_u32(&mut r)?;
     let _comp_cap = read_u32(&mut r)?;
     let token_count = read_u32(&mut r)?;
+    if token_count > header.context_size {
+        bail!(
+            "KVC: token_count {token_count} exceeds context_size {}",
+            header.context_size
+        );
+    }
     // Skip remaining sub-header fields: layer_count, head_dim, indexer_head_dim, vocab_size,
     // raw_live
     for _ in 0..5 {
@@ -478,10 +484,12 @@ pub fn find_prefix_match(
             }
         };
         let common = common_prefix_len(&cached_tokens, query_tokens);
-        if common > 0 && common < query_tokens.len()
-            && best.as_ref().is_none_or(|(_, prev)| common > *prev) {
-                best = Some((path, common));
-            }
+        if common > 0
+            && common < query_tokens.len()
+            && best.as_ref().is_none_or(|(_, prev)| common > *prev)
+        {
+            best = Some((path, common));
+        }
     }
 
     best

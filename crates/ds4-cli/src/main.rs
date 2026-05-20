@@ -1,4 +1,5 @@
 use std::{
+    hash::{Hash, Hasher},
     io::{BufRead, Write},
     path::PathBuf,
 };
@@ -47,6 +48,13 @@ fn write_utf8<W: Write>(
         pending.clear();
     }
     Ok(())
+}
+
+/// Derive a unique KVC filename from a token sequence.
+fn kvc_filename(tokens: &[u32]) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tokens.hash(&mut hasher);
+    format!("{:016x}.kvc", hasher.finish())
 }
 
 /// ds4-rs: DeepSeek V4 Flash inference engine for Linux
@@ -132,7 +140,7 @@ fn one_shot(
     // Auto-save for future prefix reuse
     if let Some(dir) = kv_cache_dir {
         let _ = std::fs::create_dir_all(dir);
-        let path = dir.join("session.kvc");
+        let path = dir.join(kvc_filename(session.tokens()));
         if let Err(e) = kv_disk::save_session(&path, &session, kv_disk::SaveReason::Cold) {
             tracing::warn!("Failed to save KVC: {e}");
         }
@@ -245,8 +253,12 @@ fn repl(
             writeln!(out)?;
             if let Some(dir) = kv_cache_dir {
                 let _ = std::fs::create_dir_all(dir);
-                let path = dir.join("session.kvc");
-                let _ = kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown);
+                let path = dir.join(kvc_filename(session.tokens()));
+                if let Err(e) =
+                    kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown)
+                {
+                    tracing::warn!("Failed to save KVC: {e}");
+                }
             }
             return Ok(());
         }
@@ -256,8 +268,12 @@ fn repl(
             Command::Exit => {
                 if let Some(dir) = kv_cache_dir {
                     let _ = std::fs::create_dir_all(dir);
-                    let path = dir.join("session.kvc");
-                    let _ = kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown);
+                    let path = dir.join(kvc_filename(session.tokens()));
+                    if let Err(e) =
+                        kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown)
+                    {
+                        tracing::warn!("Failed to save KVC: {e}");
+                    }
                 }
                 return Ok(());
             }
@@ -300,16 +316,16 @@ fn repl(
                     if let Some(dir) = kv_cache_dir
                         && let Ok(Some((loaded, suffix))) =
                             kv_disk::load_prefix_match(dir, &tokens, engine)
+                    {
+                        tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
+                        session = loaded;
+                        if let Err(err) =
+                            generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
                         {
-                            tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
-                            session = loaded;
-                            if let Err(err) =
-                                generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
-                            {
-                                writeln!(out, "error: {err}")?;
-                            }
-                            continue;
+                            writeln!(out, "error: {err}")?;
                         }
+                        continue;
+                    }
                 }
 
                 if let Err(err) = generate_turn(engine, &mut session, &tokens, max_tokens, &mut out)
