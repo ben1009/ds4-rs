@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use ds4_core::{engine::Engine, session::Session};
+use ds4_core::{engine::Engine, model::kv_disk, session::Session};
 
 /// Split `bytes` into (valid UTF-8 prefix length, invalid-sequence length).
 /// If invalid_len > 0, those bytes should be replaced with U+FFFD and drained
@@ -49,6 +49,34 @@ fn write_utf8<W: Write>(
     Ok(())
 }
 
+/// Derive a unique KVC filename from a token sequence.
+/// Uses FNV-1a for stability across Rust compiler versions.
+fn kvc_filename(tokens: &[u32]) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for &tok in tokens {
+        for byte in tok.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        }
+    }
+    format!("{hash:016x}.kvc")
+}
+
+/// Auto-save session to the KVC cache directory.
+fn kvc_auto_save(
+    cache_dir: Option<&std::path::Path>,
+    session: &Session,
+    reason: kv_disk::SaveReason,
+) {
+    if let Some(dir) = cache_dir {
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join(kvc_filename(session.tokens()));
+        if let Err(e) = kv_disk::save_session(&path, session, reason) {
+            tracing::warn!("Failed to save KVC: {e}");
+        }
+    }
+}
+
 /// ds4-rs: DeepSeek V4 Flash inference engine for Linux
 #[derive(Parser)]
 #[command(name = "ds4", version)]
@@ -68,6 +96,13 @@ struct Args {
     /// Context size
     #[arg(long, default_value = "2048")]
     ctx: u32,
+
+    /// Directory for on-disk KVC cache files. Enables prefix matching:
+    /// on cold start the CLI scans this directory for cached sessions
+    /// that share a token prefix with the current prompt, loads the
+    /// best match, and only prefills the suffix tokens.
+    #[arg(long)]
+    kv_cache_dir: Option<PathBuf>,
 }
 
 fn main() -> Result<()> {
@@ -82,9 +117,10 @@ fn main() -> Result<()> {
 
     let engine = Engine::open(&args.model)?;
 
+    let cache_dir = args.kv_cache_dir.as_deref();
     match args.prompt {
-        Some(prompt) => one_shot(&engine, &prompt, args.max_tokens, args.ctx)?,
-        None => repl(&engine, args.max_tokens, args.ctx)?,
+        Some(prompt) => one_shot(&engine, &prompt, args.max_tokens, args.ctx, cache_dir)?,
+        None => repl(&engine, args.max_tokens, args.ctx, cache_dir)?,
     }
 
     Ok(())
@@ -95,14 +131,36 @@ fn one_shot(
     prompt: &str,
     max_tokens: u32,
     ctx: u32,
+    kv_cache_dir: Option<&std::path::Path>,
 ) -> Result<()> {
-    let mut session = Session::new(engine.clone(), ctx)?;
     let tokens = engine.tokenizer.encode(prompt, true);
     tracing::info!("Prompt: {} tokens", tokens.len());
 
+    // Try prefix match from disk cache
+    let (mut session, suffix) = if let Some(dir) = kv_cache_dir {
+        match kv_disk::load_prefix_match(dir, &tokens, engine)? {
+            Some((session, suffix)) => {
+                tracing::info!(
+                    "Prefix match: {} cached, {} suffix to prefill",
+                    tokens.len() - suffix.len(),
+                    suffix.len(),
+                );
+                (session, suffix)
+            }
+            None => (Session::new(engine.clone(), ctx)?, tokens.clone()),
+        }
+    } else {
+        (Session::new(engine.clone(), ctx)?, tokens.clone())
+    };
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    generate_turn(engine, &mut session, &tokens, max_tokens, &mut handle)
+    generate_turn(engine, &mut session, &suffix, max_tokens, &mut handle)?;
+
+    // Auto-save for future prefix reuse
+    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
+
+    Ok(())
 }
 
 /// One parsed line of REPL input.
@@ -182,7 +240,12 @@ Commands:
   /exit             leave the REPL (alias: /quit)
 Anything else is treated as a prompt.";
 
-fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()> {
+fn repl(
+    engine: &std::sync::Arc<Engine>,
+    max_tokens: u32,
+    ctx: u32,
+    kv_cache_dir: Option<&std::path::Path>,
+) -> Result<()> {
     let mut session = Session::new(engine.clone(), ctx)?;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
@@ -201,12 +264,16 @@ fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()
         if n == 0 {
             // EOF (Ctrl-D).
             writeln!(out)?;
+            kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Shutdown);
             return Ok(());
         }
 
         match parse_command(&line) {
             Command::Empty => continue,
-            Command::Exit => return Ok(()),
+            Command::Exit => {
+                kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Shutdown);
+                return Ok(());
+            }
             Command::Help => {
                 writeln!(out, "{REPL_HELP}")?;
             }
@@ -239,6 +306,27 @@ fn repl(engine: &std::sync::Arc<Engine>, max_tokens: u32, ctx: u32) -> Result<()
                 // multi-turn input is appended without another BOS.
                 let add_bos = session.tokens().is_empty();
                 let tokens = engine.tokenizer.encode(&text, add_bos);
+
+                // Try prefix matching when session is empty (startup or after /reset)
+                if session.tokens().is_empty()
+                    && let Some(dir) = kv_cache_dir
+                {
+                    match kv_disk::load_prefix_match(dir, &tokens, engine) {
+                        Ok(Some((loaded, suffix))) => {
+                            tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
+                            session = loaded;
+                            if let Err(err) =
+                                generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
+                            {
+                                writeln!(out, "error: {err}")?;
+                            }
+                            continue;
+                        }
+                        Ok(None) => {}
+                        Err(err) => tracing::warn!("KVC: prefix match failed: {err}"),
+                    }
+                }
+
                 if let Err(err) = generate_turn(engine, &mut session, &tokens, max_tokens, &mut out)
                 {
                     writeln!(out, "error: {err}")?;
