@@ -52,7 +52,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [ops, quant, model-forward, model-kv, model-other, base]
+        module: [ops, quant, model-forward, model-kv, model-weights, model-small, base]
         include:
           - module: ops
             filter: "ops::"
@@ -62,8 +62,10 @@ jobs:
             filter: "model::forward::"
           - module: model-kv
             filter: "model::kv_cache::"
-          - module: model-other
-            filter: "model::weights:: model::indexer:: model::compressor:: model::layer::"
+          - module: model-weights
+            filter: "model::weights::"
+          - module: model-small
+            filter: "model::indexer:: model::compressor:: model::layer::"
           - module: base
             filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
@@ -85,7 +87,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: cargo miri test -p ds4-core --lib ${{ matrix.filter }}
-        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-core --lib -- ${{ matrix.filter }}
+        run: timeout 180 cargo +${{ env.NIGHTLY }} miri test -p ds4-core --lib -- ${{ matrix.filter }}
         env:
           MIRIFLAGS: ""
   miri-cli:
