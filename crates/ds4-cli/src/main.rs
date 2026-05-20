@@ -233,7 +233,6 @@ fn repl(
     kv_cache_dir: Option<&std::path::Path>,
 ) -> Result<()> {
     let mut session = Session::new(engine.clone(), ctx)?;
-    let mut first_prompt = true;
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -310,21 +309,29 @@ fn repl(
                 let add_bos = session.tokens().is_empty();
                 let tokens = engine.tokenizer.encode(&text, add_bos);
 
-                // On first prompt, try prefix matching from disk cache
-                if first_prompt {
-                    first_prompt = false;
-                    if let Some(dir) = kv_cache_dir
-                        && let Ok(Some((loaded, suffix))) =
-                            kv_disk::load_prefix_match(dir, &tokens, engine)
-                    {
-                        tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
-                        session = loaded;
-                        if let Err(err) =
-                            generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
-                        {
-                            writeln!(out, "error: {err}")?;
+                // Try prefix matching when session is empty (startup or after /reset)
+                if session.tokens().is_empty()
+                    && let Some(dir) = kv_cache_dir
+                {
+                    match kv_disk::load_prefix_match(dir, &tokens, engine) {
+                        Ok(Some((loaded, suffix))) => {
+                            tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
+                            session = loaded;
+                            if !suffix.is_empty()
+                                && let Err(err) = generate_turn(
+                                    engine,
+                                    &mut session,
+                                    &suffix,
+                                    max_tokens,
+                                    &mut out,
+                                )
+                            {
+                                writeln!(out, "error: {err}")?;
+                            }
+                            continue;
                         }
-                        continue;
+                        Ok(None) => {}
+                        Err(err) => tracing::warn!("KVC: prefix match failed: {err}"),
                     }
                 }
 
