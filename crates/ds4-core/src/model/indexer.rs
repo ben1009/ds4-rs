@@ -106,6 +106,9 @@ pub fn indexer_decode_one(
     // TODO(phase2-fp4): restore Hadamard + FP4 quantize round-trip.
 
     // Slide window: bit-for-bit copy of the C reference's two-step move.
+    //   rows [ratio..2*ratio) -> rows [0..ratio)
+    //   rows [0..ratio)       -> rows [ratio..2*ratio)
+    // (Yes, the second step re-duplicates the just-shifted rows.)
     let kv_block = ratio * width;
     state.state_kv.copy_within(kv_block..2 * kv_block, 0);
     state.state_kv.copy_within(0..kv_block, kv_block);
