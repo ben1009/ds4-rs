@@ -593,6 +593,11 @@ fn attention_rows_mixed(
     };
 
     let kq_scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let has_indexer = layer.indexer.is_some();
+
+    // Hoist score buffers outside the per-head loop to reuse allocations.
+    let mut raw_scores = vec![0.0f32; n_raw];
+    let mut comp_scores = vec![0.0f32; n_comp];
 
     for h in 0..n_head {
         let qh = &q[h * HEAD_DIM..(h + 1) * HEAD_DIM];
@@ -602,7 +607,6 @@ fn attention_rows_mixed(
         let mut max_score = layer.attn_sinks[h];
 
         // Score raw rows (always allowed).
-        let mut raw_scores = vec![0.0f32; n_raw];
         for (i, kv) in raw_rows.chunks_exact(HEAD_DIM).enumerate() {
             let dot: f32 = qh.iter().zip(kv.iter()).map(|(&q, &k)| q * k).sum();
             let score = dot * kq_scale;
@@ -615,8 +619,6 @@ fn attention_rows_mixed(
         // Score compressed rows and apply the indexer top-k mask.
         // Disallowed rows get NEG_INF so their softmax weight is ~0.
         // When there is no indexer, all compressed rows are allowed.
-        let mut comp_scores = vec![0.0f32; n_comp];
-        let has_indexer = layer.indexer.is_some();
         if n_comp > 0 {
             // Determine which indexer head maps to this query head.
             let idx_h = if n_idx_head > 0 {
