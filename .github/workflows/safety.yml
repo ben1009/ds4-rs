@@ -61,7 +61,7 @@ jobs:
           - module: model-forward
             filter: "model::forward::"
           - module: model-rest
-            filter: "--skip ops:: --skip quant:: --skip model::forward:: --skip base::"
+            filter: "model:: --skip model::forward::"
           - module: base
             filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
