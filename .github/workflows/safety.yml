@@ -64,8 +64,12 @@ jobs:
             filter: "model::kv_cache::"
           - module: model-weights
             filter: "model::weights::"
-          - module: model-small
-            filter: "model::indexer:: model::compressor:: model::layer::"
+          - module: model-indexer
+            filter: "model::indexer::"
+          - module: model-compressor
+            filter: "model::compressor::"
+          - module: model-layer
+            filter: "model::layer::"
           - module: base
             filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
