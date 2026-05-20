@@ -241,6 +241,10 @@ fn rms_scale(x: &[f32], eps: f32) -> f32 {
 }
 
 #[cfg(test)]
+// NOTE: These tests are intentionally excluded from the Miri CI matrix.
+// Each test takes ~40s under Miri because the pool/decode kernels loop
+// over 512-dim vectors and Miri interprets every memory access. There
+// is no `unsafe` in this module, so Miri adds limited value here.
 mod tests {
     use super::*;
     use crate::{
