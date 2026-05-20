@@ -1478,7 +1478,7 @@ mod tests {
         // output as the raw-only path.
         let n_head = 2usize;
         let ctx = 64usize;
-        let mut cache = KvCache::new(43, ctx).unwrap();
+        let mut cache = KvCache::new(3, ctx).unwrap();
 
         // Push one raw row into layer 2 (ratio-4 layer).
         let mut row = vec![0.0f32; HEAD_DIM];
@@ -1553,7 +1553,7 @@ mod tests {
         // contribute to the attention output alongside raw rows.
         let n_head = 1usize;
         let ctx = 64usize;
-        let mut cache = KvCache::new(43, ctx).unwrap();
+        let mut cache = KvCache::new(3, ctx).unwrap();
 
         // Push one raw row.
         let raw_row = vec![1.0f32; HEAD_DIM];
@@ -1622,7 +1622,7 @@ mod tests {
         // match raw-only attention even when compressed rows exist.
         let n_head = 1usize;
         let ctx = 64usize;
-        let mut cache = KvCache::new(43, ctx).unwrap();
+        let mut cache = KvCache::new(3, ctx).unwrap();
 
         // Push one raw row.
         let raw_row = vec![1.0f32; HEAD_DIM];
@@ -1703,7 +1703,7 @@ mod tests {
         // denominator → output should be near zero.
         let n_head = 1usize;
         let ctx = 64usize;
-        let cache = KvCache::new(43, ctx).unwrap();
+        let cache = KvCache::new(3, ctx).unwrap();
 
         let sinks = vec![-1.0f32; n_head]; // Finite sink.
         let q = vec![0.1f32; HEAD_DIM];
