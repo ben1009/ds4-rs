@@ -155,6 +155,24 @@ impl Session {
         self.logits.fill(0.0);
     }
 
+    /// Restore session tokens and position from a loaded cache.
+    ///
+    /// This is a low-level operation used by `kv_disk::load_session`. It sets
+    /// the token list and position without running the forward pass — the KV
+    /// cache is expected to already be populated from disk.
+    pub(crate) fn restore_from_tokens(&mut self, tokens: Vec<u32>) -> Result<()> {
+        if tokens.len() > self.ctx_size as usize {
+            bail!(
+                "restore_from_tokens: {} tokens exceeds ctx_size {}",
+                tokens.len(),
+                self.ctx_size
+            );
+        }
+        self.pos = tokens.len() as u32;
+        self.tokens = tokens;
+        Ok(())
+    }
+
     /// Rewind the session to position `target`, dropping any tokens past it.
     ///
     /// The raw KV ring discards rows older than `cap_raw`, so we cannot

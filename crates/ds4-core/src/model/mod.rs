@@ -20,6 +20,7 @@ pub mod compressor;
 pub mod forward;
 pub mod indexer;
 pub mod kv_cache;
+pub mod kv_disk;
 pub mod layer;
 pub mod weights;
 
