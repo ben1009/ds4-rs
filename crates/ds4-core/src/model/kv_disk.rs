@@ -452,10 +452,13 @@ fn read_token_ids_inner(
     let count = usize::try_from(token_count)
         .map_err(|_| anyhow::anyhow!("KVC: token_count {token_count} overflows usize"))?;
     let read_count = read_at_most.map_or(count, |max| count.min(max));
-    let mut tokens = Vec::with_capacity(read_count);
-    for _ in 0..read_count {
-        tokens.push(read_u32(&mut r)?);
-    }
+    // Read all token bytes in one shot, then convert to u32
+    let mut bytes = vec![0u8; read_count * 4];
+    r.read_exact(&mut bytes)?;
+    let tokens: Vec<u32> = bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
     // Skip any remaining tokens we didn't need
     if read_count < count {
         skip_bytes(&mut r, ((count - read_count) as u64) * 4)?;
@@ -513,7 +516,7 @@ pub fn find_prefix_match(
         // but there are more tokens in the file.
         if common > 0
             && common == cached_tokens.len()
-            && total <= query_tokens.len()
+            && total < query_tokens.len()
             && best.as_ref().is_none_or(|(_, prev)| common > *prev)
         {
             best = Some((path, common));
@@ -974,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn find_prefix_match_exact_match() {
+    fn find_prefix_match_skips_exact_match() {
         let (engine, _path) = open_engine();
         let dir = std::env::temp_dir().join(format!("ds4-kvc-prefix-exact-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -983,10 +986,9 @@ mod tests {
         s.restore_from_tokens(vec![1, 2, 3]).unwrap();
         save_session(&dir.join("a.kvc"), &s, SaveReason::Manual).unwrap();
 
+        // Exact match is excluded — need at least one suffix token for prefill
         let result = find_prefix_match(&dir, &[1, 2, 3]);
-        let (path, common) = result.unwrap();
-        assert_eq!(common, 3);
-        assert_eq!(path.file_name().unwrap(), "a.kvc");
+        assert!(result.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1043,7 +1045,7 @@ mod tests {
     }
 
     #[test]
-    fn load_prefix_match_exact_returns_empty_suffix() {
+    fn load_prefix_match_exact_returns_none() {
         let (engine, _path) = open_engine();
         let dir = std::env::temp_dir().join(format!("ds4-kvc-load-exact-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1052,12 +1054,10 @@ mod tests {
         s.restore_from_tokens(vec![10, 20, 30]).unwrap();
         save_session(&dir.join("cached.kvc"), &s, SaveReason::Manual).unwrap();
 
+        // Exact match excluded — need at least one suffix token
         let query = vec![10, 20, 30];
         let result = load_prefix_match(&dir, &query, &engine).unwrap();
-        let (session, suffix) = result.unwrap();
-
-        assert_eq!(session.tokens(), &[10, 20, 30]);
-        assert!(suffix.is_empty());
+        assert!(result.is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

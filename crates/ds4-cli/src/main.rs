@@ -319,12 +319,6 @@ fn repl(
                                 generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
                             {
                                 writeln!(out, "error: {err}")?;
-                            } else {
-                                kvc_auto_save(
-                                    kv_cache_dir,
-                                    &session,
-                                    kv_disk::SaveReason::Continued,
-                                );
                             }
                             continue;
                         }
