@@ -52,14 +52,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        module: [ops, quant, model, base]
+        module: [ops, quant, model-forward, model-rest, base]
         include:
           - module: ops
             filter: "ops::"
           - module: quant
             filter: "quant::"
-          - module: model
-            filter: "model::"
+          - module: model-forward
+            filter: "model::forward::"
+          - module: model-rest
+            filter: "--skip ops:: --skip quant:: --skip model::forward:: --skip base::"
           - module: base
             filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
