@@ -145,12 +145,15 @@ fn read_u64(r: &mut impl Read) -> Result<u64> {
 }
 
 fn read_f32_vec(r: &mut impl Read, n: usize) -> Result<Vec<f32>> {
-    let mut buf = vec![
-        0u8;
-        n.checked_mul(4)
-            .ok_or_else(|| anyhow::anyhow!("read_f32_vec: size overflow"))?
-    ];
+    let byte_len = n
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("read_f32_vec: size overflow"))?;
+    let mut buf = vec![0u8; byte_len];
     r.read_exact(&mut buf)?;
+    // Convert in-place: reinterpret each 4-byte LE chunk as f32.
+    // The byte vec is dropped after conversion, so peak memory is
+    // byte_len + f32_len = 2× during the conversion loop. This is a
+    // load path (disk I/O bound), so the extra allocation is acceptable.
     let mut out = Vec::with_capacity(n);
     for chunk in buf.chunks_exact(4) {
         out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
@@ -159,10 +162,9 @@ fn read_f32_vec(r: &mut impl Read, n: usize) -> Result<Vec<f32>> {
 }
 
 fn skip_bytes(r: &mut impl Read, n: u64) -> Result<()> {
-    let mut discard = Vec::new();
-    r.take(n).read_to_end(&mut discard)?;
-    if discard.len() as u64 != n {
-        bail!("KVC: unexpected EOF while skipping {n} bytes");
+    let copied = std::io::copy(&mut r.take(n), &mut std::io::sink())?;
+    if copied != n {
+        bail!("KVC: unexpected EOF while skipping {n} bytes (got {copied})");
     }
     Ok(())
 }
@@ -185,9 +187,8 @@ pub fn save_session(path: &Path, session: &Session, reason: SaveReason) -> Resul
 
     // Verify all layers have the same n_raw (the raw_live assumption).
     let raw_live = kv.layer(0).n_raw();
-    #[cfg(debug_assertions)]
     for il in 1..n_layer {
-        debug_assert_eq!(
+        assert_eq!(
             kv.layer(il).n_raw(),
             raw_live,
             "save_session: n_raw mismatch at layer {il}"
@@ -243,33 +244,41 @@ fn compute_payload_size(
     token_count: usize,
     kv: &super::kv_cache::KvCache,
 ) -> Result<usize> {
+    let mul = |a: usize, b: usize| {
+        a.checked_mul(b).ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
+    };
+    let add = |a: usize, b: usize| {
+        a.checked_add(b).ok_or_else(|| anyhow::anyhow!("compute_payload_size: overflow"))
+    };
+
     let sub_header = 13 * 4;
-    let token_ids = token_count * 4;
-    let logits = n_vocab * 4;
-    let comp_row_counts = n_layer * 4;
-    let idx_row_counts = n_layer * 4;
+    let token_ids = mul(token_count, 4)?;
+    let logits = mul(n_vocab, 4)?;
+    let comp_row_counts = mul(n_layer, 4)?;
+    let idx_row_counts = mul(n_layer, 4)?;
 
     let mut per_layer: usize = 0;
     for il in 0..n_layer {
         let n_raw = kv.layer(il).n_raw();
-        per_layer += n_raw * HEAD_DIM * 4;
+        per_layer = add(per_layer, mul(mul(n_raw, HEAD_DIM)?, 4)?)?;
 
         let ratio = layer_compress_ratio(il as u32);
         if ratio != 0 {
             let comp = kv.compressor(il).unwrap();
-            per_layer += comp.n_comp * HEAD_DIM * 4;
-            per_layer += comp.state_kv.len() * 4;
-            per_layer += comp.state_score.len() * 4;
+            per_layer = add(per_layer, mul(mul(comp.n_comp, HEAD_DIM)?, 4)?)?;
+            per_layer = add(per_layer, mul(comp.state_kv.len(), 4)?)?;
+            per_layer = add(per_layer, mul(comp.state_score.len(), 4)?)?;
         }
         if ratio == 4 {
             let idx = kv.indexer(il).unwrap();
-            per_layer += idx.n_comp * IDX_DIM * 4;
-            per_layer += idx.state_kv.len() * 4;
-            per_layer += idx.state_score.len() * 4;
+            per_layer = add(per_layer, mul(mul(idx.n_comp, IDX_DIM)?, 4)?)?;
+            per_layer = add(per_layer, mul(idx.state_kv.len(), 4)?)?;
+            per_layer = add(per_layer, mul(idx.state_score.len(), 4)?)?;
         }
     }
 
-    Ok(sub_header + token_ids + logits + comp_row_counts + idx_row_counts + per_layer)
+    let fixed = add(add(sub_header, token_ids)?, add(logits, add(comp_row_counts, idx_row_counts)?)?)?;
+    add(fixed, per_layer)
 }
 
 fn write_dsv4_payload(
@@ -403,9 +412,9 @@ fn read_dsv4_payload(
         bail!("KVC/DSV4: bad magic: 0x{dsv4_magic:08X}");
     }
     let _dsv4_version = read_u32(r)?;
-    let _ctx_size = read_u32(r)?;
+    let ctx_size = read_u32(r)?;
     let _prefill_cap = read_u32(r)?;
-    let _raw_cap = read_u32(r)?;
+    let raw_cap = read_u32(r)?;
     let _raw_window = read_u32(r)?;
     let _comp_cap = read_u32(r)?;
     let token_count = read_u32(r)?;
@@ -432,6 +441,16 @@ fn read_dsv4_payload(
         bail!(
             "DSV4: token_count mismatch: payload={token_count}, header={}",
             header.cached_token_count
+        );
+    }
+    if raw_live > raw_cap {
+        bail!("DSV4: raw_live ({raw_live}) > raw_cap ({raw_cap})");
+    }
+    // Validate raw_live fits in the session's allocated ring.
+    let expected_cap_raw = SWA.min(ctx_size as usize).max(1);
+    if raw_live as usize > expected_cap_raw {
+        bail!(
+            "DSV4: raw_live ({raw_live}) > expected cap_raw ({expected_cap_raw})"
         );
     }
 
