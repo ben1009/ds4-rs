@@ -8,9 +8,8 @@
 //! `ratio`-boundary token emits one pooled, RoPE'd, RMSNorm'd compressed-KV
 //! row that the caller pushes into [`crate::model::kv_cache::CompressorState`].
 //!
-//! The compressed rows are *not* yet consumed by attention — that wiring
-//! lands in PR 4. For now they're produced and stored; only their shape and
-//! count is asserted on by the tests.
+//! The compressed rows are consumed by the mixed-attention path for ratio-4
+//! layers.
 //!
 //! ### What this PR skips
 //!

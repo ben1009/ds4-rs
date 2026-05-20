@@ -104,9 +104,8 @@ pub struct LayerWeights<'a> {
 
     // --- Streaming compressor (layers with ratio != 0) --------------------
     /// `Some` for layers `2..n_layer` with `layer_compress_ratio(il) != 0`.
-    /// Dense layers (`il < 2`) hold `None`. PR 4 will plumb these into the
-    /// mixed attention path; for this PR they're only consumed by the
-    /// streaming compressor's emit step.
+    /// Dense layers (`il < 2`) hold `None`. Ratio-4 layers use these in the
+    /// mixed-attention path.
     pub compressor: Option<CompressorLayerWeights<'a>>,
 
     // --- Indexer (ratio-4 layers only) ------------------------------------
