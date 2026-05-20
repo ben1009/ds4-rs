@@ -144,21 +144,13 @@ fn read_u64(r: &mut impl Read) -> Result<u64> {
     Ok(u64::from_le_bytes(buf))
 }
 
-fn read_f32_vec(r: &mut impl Read, n: usize) -> Result<Vec<f32>> {
-    let byte_len = n
-        .checked_mul(4)
-        .ok_or_else(|| anyhow::anyhow!("read_f32_vec: size overflow"))?;
-    let mut buf = vec![0u8; byte_len];
-    r.read_exact(&mut buf)?;
-    // Convert in-place: reinterpret each 4-byte LE chunk as f32.
-    // The byte vec is dropped after conversion, so peak memory is
-    // byte_len + f32_len = 2× during the conversion loop. This is a
-    // load path (disk I/O bound), so the extra allocation is acceptable.
-    let mut out = Vec::with_capacity(n);
-    for chunk in buf.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+fn read_f32_slice(r: &mut impl Read, out: &mut [f32]) -> Result<()> {
+    let mut buf = [0u8; 4];
+    for val in out.iter_mut() {
+        r.read_exact(&mut buf)?;
+        *val = f32::from_le_bytes(buf);
     }
-    Ok(out)
+    Ok(())
 }
 
 fn skip_bytes(r: &mut impl Read, n: u64) -> Result<()> {
@@ -461,6 +453,14 @@ fn read_dsv4_payload(
     let ctx_size = header.context_size;
     let mut session = Session::new(engine.clone(), ctx_size)?;
 
+    // Validate token_count before allocating
+    if token_count > header.context_size {
+        bail!(
+            "DSV4: token_count {token_count} exceeds context_size {}",
+            header.context_size
+        );
+    }
+
     // Read token IDs
     let mut tokens = Vec::with_capacity(token_count as usize);
     for _ in 0..token_count {
@@ -490,45 +490,55 @@ fn read_dsv4_payload(
     for il in 0..n_layer {
         let ratio = layer_compress_ratio(il as u32);
 
-        // Raw KV rows
-        let raw_data = read_f32_vec(r, (raw_live as usize) * HEAD_DIM)?;
-        for row_idx in 0..raw_live as usize {
-            let start = row_idx * HEAD_DIM;
-            session
-                .kv_cache_mut()
-                .layer_mut(il)
-                .push(&raw_data[start..start + HEAD_DIM]);
+        // Raw KV rows — read one row at a time into a stack buffer
+        let mut row = [0.0f32; HEAD_DIM];
+        for _ in 0..raw_live as usize {
+            read_f32_slice(r, &mut row)?;
+            session.kv_cache_mut().layer_mut(il).push(&row);
         }
 
         // Compressed KV rows + state (layers 2+)
         if ratio != 0 {
             let n_comp = comp_counts[il];
-            let comp_data = read_f32_vec(r, n_comp * HEAD_DIM)?;
             let comp = session.kv_cache_mut().compressor_mut(il).unwrap();
-            let state_kv_data = read_f32_vec(r, comp.state_kv.len())?;
-            let state_score_data = read_f32_vec(r, comp.state_score.len())?;
+            if n_comp > comp.comp_cap {
+                bail!(
+                    "DSV4: n_comp {n_comp} exceeds capacity {} at layer {il}",
+                    comp.comp_cap
+                );
+            }
 
-            comp.state_kv.copy_from_slice(&state_kv_data);
-            comp.state_score.copy_from_slice(&state_score_data);
-            for row_idx in 0..n_comp {
-                let start = row_idx * HEAD_DIM;
-                comp.push_comp(&comp_data[start..start + HEAD_DIM])?;
+            // Read state directly into the compressor's buffers
+            read_f32_slice(r, &mut comp.state_kv)?;
+            read_f32_slice(r, &mut comp.state_score)?;
+
+            // Read compressed rows one at a time
+            for _ in 0..n_comp {
+                read_f32_slice(r, &mut row)?;
+                comp.push_comp(&row)?;
             }
         }
 
         // Indexer data (ratio-4 layers only)
         if ratio == 4 {
             let n_idx = idx_counts[il];
-            let idx_data = read_f32_vec(r, n_idx * IDX_DIM)?;
             let idx = session.kv_cache_mut().indexer_mut(il).unwrap();
-            let idx_state_kv = read_f32_vec(r, idx.state_kv.len())?;
-            let idx_state_score = read_f32_vec(r, idx.state_score.len())?;
+            if n_idx > idx.comp_cap {
+                bail!(
+                    "DSV4: n_idx {n_idx} exceeds capacity {} at layer {il}",
+                    idx.comp_cap
+                );
+            }
 
-            idx.state_kv.copy_from_slice(&idx_state_kv);
-            idx.state_score.copy_from_slice(&idx_state_score);
-            for row_idx in 0..n_idx {
-                let start = row_idx * IDX_DIM;
-                idx.push_comp(&idx_data[start..start + IDX_DIM])?;
+            // Read state directly into the indexer's buffers
+            read_f32_slice(r, &mut idx.state_kv)?;
+            read_f32_slice(r, &mut idx.state_score)?;
+
+            // Read indexer rows one at a time
+            let mut idx_row = [0.0f32; IDX_DIM];
+            for _ in 0..n_idx {
+                read_f32_slice(r, &mut idx_row)?;
+                idx.push_comp(&idx_row)?;
             }
         }
     }
