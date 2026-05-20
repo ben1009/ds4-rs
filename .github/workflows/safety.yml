@@ -49,6 +49,19 @@ jobs:
           RUSTFLAGS: "-Z sanitizer=leak"
   miri-core:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module: [ops, quant, model, base]
+        include:
+          - module: ops
+            filter: "ops::"
+          - module: quant
+            filter: "quant::"
+          - module: model
+            filter: "model::"
+          - module: base
+            filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
@@ -67,8 +80,8 @@ jobs:
           components: miri
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: cargo miri test -p ds4-core --lib
-        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-core --lib
+      - name: cargo miri test -p ds4-core --lib ${{ matrix.filter }}
+        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-core --lib -- ${{ matrix.filter }}
         env:
           MIRIFLAGS: ""
   miri-cli:
