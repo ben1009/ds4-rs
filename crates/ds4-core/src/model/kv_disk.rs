@@ -431,9 +431,12 @@ pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
     let _raw_window = read_u32(&mut r)?;
     let _comp_cap = read_u32(&mut r)?;
     let token_count = read_u32(&mut r)?;
-    if token_count > header.context_size {
+    // Hard cap: even if context_size in the header is corrupt, don't allocate
+    // more than ~4 MB for token IDs (1M tokens × 4 bytes).
+    const MAX_TOKEN_COUNT: u32 = 1_000_000;
+    if token_count > header.context_size || token_count > MAX_TOKEN_COUNT {
         bail!(
-            "KVC: token_count {token_count} exceeds context_size {}",
+            "KVC: token_count {token_count} exceeds context_size {} or hard limit {MAX_TOKEN_COUNT}",
             header.context_size
         );
     }
@@ -466,6 +469,11 @@ pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
 /// Returns `Some((path, common_len))` for the best match, or `None`
 /// if no file's tokens share a prefix with `query_tokens`.
 /// Errors on individual files are logged and skipped.
+///
+/// Note: this performs a linear scan of the directory, reading only
+/// the header and token IDs from each file. For large cache directories,
+/// a more efficient lookup (e.g., index file or prefix tree) could be
+/// added later.
 pub fn find_prefix_match(
     cache_dir: &Path,
     query_tokens: &[u32],

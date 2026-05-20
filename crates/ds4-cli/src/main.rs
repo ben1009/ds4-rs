@@ -57,6 +57,21 @@ fn kvc_filename(tokens: &[u32]) -> String {
     format!("{:016x}.kvc", hasher.finish())
 }
 
+/// Auto-save session to the KVC cache directory.
+fn kvc_auto_save(
+    cache_dir: Option<&std::path::Path>,
+    session: &Session,
+    reason: kv_disk::SaveReason,
+) {
+    if let Some(dir) = cache_dir {
+        let _ = std::fs::create_dir_all(dir);
+        let path = dir.join(kvc_filename(session.tokens()));
+        if let Err(e) = kv_disk::save_session(&path, session, reason) {
+            tracing::warn!("Failed to save KVC: {e}");
+        }
+    }
+}
+
 /// ds4-rs: DeepSeek V4 Flash inference engine for Linux
 #[derive(Parser)]
 #[command(name = "ds4", version)]
@@ -138,13 +153,7 @@ fn one_shot(
     generate_turn(engine, &mut session, &suffix, max_tokens, &mut handle)?;
 
     // Auto-save for future prefix reuse
-    if let Some(dir) = kv_cache_dir {
-        let _ = std::fs::create_dir_all(dir);
-        let path = dir.join(kvc_filename(session.tokens()));
-        if let Err(e) = kv_disk::save_session(&path, &session, kv_disk::SaveReason::Cold) {
-            tracing::warn!("Failed to save KVC: {e}");
-        }
-    }
+    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
 
     Ok(())
 }
@@ -250,30 +259,14 @@ fn repl(
         if n == 0 {
             // EOF (Ctrl-D).
             writeln!(out)?;
-            if let Some(dir) = kv_cache_dir {
-                let _ = std::fs::create_dir_all(dir);
-                let path = dir.join(kvc_filename(session.tokens()));
-                if let Err(e) =
-                    kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown)
-                {
-                    tracing::warn!("Failed to save KVC: {e}");
-                }
-            }
+            kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Shutdown);
             return Ok(());
         }
 
         match parse_command(&line) {
             Command::Empty => continue,
             Command::Exit => {
-                if let Some(dir) = kv_cache_dir {
-                    let _ = std::fs::create_dir_all(dir);
-                    let path = dir.join(kvc_filename(session.tokens()));
-                    if let Err(e) =
-                        kv_disk::save_session(&path, &session, kv_disk::SaveReason::Shutdown)
-                    {
-                        tracing::warn!("Failed to save KVC: {e}");
-                    }
-                }
+                kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Shutdown);
                 return Ok(());
             }
             Command::Help => {
