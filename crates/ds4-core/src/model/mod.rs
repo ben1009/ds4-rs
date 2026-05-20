@@ -18,6 +18,7 @@ use crate::{
 
 pub mod compressor;
 pub mod forward;
+pub mod indexer;
 pub mod kv_cache;
 pub mod layer;
 pub mod weights;

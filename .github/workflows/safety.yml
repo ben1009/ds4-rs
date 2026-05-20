@@ -47,10 +47,29 @@ jobs:
         run: cargo +nightly test --all-features --target x86_64-unknown-linux-gnu
         env:
           RUSTFLAGS: "-Z sanitizer=leak"
-  miri:
+  miri-core:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
+      matrix:
+        module: [ops, quant, model-forward, model-kv, model-weights, model-indexer, model-layer, base]
+        include:
+          - module: ops
+            filter: "ops::"
+          - module: quant
+            filter: "quant::"
+          - module: model-forward
+            filter: "model::forward::"
+          - module: model-kv
+            filter: "model::kv_cache::"
+          - module: model-weights
+            filter: "model::weights::"
+          - module: model-indexer
+            filter: "model::indexer::"
+          - module: model-layer
+            filter: "model::layer::"
+          - module: base
+            filter: "--skip ops:: --skip quant:: --skip model::"
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
@@ -69,8 +88,32 @@ jobs:
           components: miri
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
-      - name: cargo miri test
-        run:  cargo +${{ env.NIGHTLY }} miri test
+      - name: cargo miri test -p ds4-core --lib ${{ matrix.filter }}
+        run: timeout 180 cargo +${{ env.NIGHTLY }} miri test -p ds4-core --lib -- ${{ matrix.filter }}
+        env:
+          MIRIFLAGS: ""
+  miri-cli:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@ab7a9404c0f3da075243ca237b5fac12c98deaa5 # v2.19.3
+        with:
+          egress-policy: audit # TODO: change to 'egress-policy: block' after couple of runs
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          submodules: true
+      - run: |
+          echo "NIGHTLY=nightly-$(curl -s https://rust-lang.github.io/rustup-components-history/x86_64-unknown-linux-gnu/miri)" >> $GITHUB_ENV
+      - name: Install ${{ env.NIGHTLY }}
+        uses: dtolnay/rust-toolchain@e12eda571dc9a5ee5d58eecf4738ec291c66f295 # master
+        with:
+          toolchain: ${{ env.NIGHTLY }}
+          components: miri
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+      - name: cargo miri test -p ds4-cli
+        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-cli --bins
         env:
           MIRIFLAGS: ""
   # loom:

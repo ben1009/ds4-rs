@@ -7,7 +7,7 @@
 use anyhow::Result;
 
 use crate::{
-    config::layer_compress_ratio,
+    config::{INDEXER_HEAD, INDEXER_HEAD_DIM, layer_compress_ratio},
     model::{WeightMap, kv_cache::HEAD_DIM},
     ops::matmul::WeightView,
 };
@@ -28,6 +28,30 @@ pub struct CompressorLayerWeights<'a> {
     /// `[HEAD_DIM]` F32. RMSNorm weight applied after pooling and before
     /// the long-context RoPE rotation.
     pub norm: &'a [f32],
+}
+
+/// Indexer weights for one layer, only present when
+/// `layer_compress_ratio(il) == 4`. Mirrors the six `indexer_*` tensors in
+/// antirez/ds4 ds4.c (lines 2396-2403, 2682-2687).
+#[derive(Clone, Copy, Debug)]
+pub struct IndexerLayerWeights<'a> {
+    /// `[Q_LORA_RANK, INDEXER_HEAD * INDEXER_HEAD_DIM]` F16. Projects the
+    /// shared post-RMSNorm Q-LoRA activation into the per-head indexer Q.
+    pub attn_q_b: WeightView<'a>,
+    /// `[N_EMBD, INDEXER_HEAD]` F16. Projects the post-RMSNorm activation
+    /// into the per-head scoring weight applied to each compressed-row dot.
+    pub proj: WeightView<'a>,
+    /// `[N_EMBD, 2 * INDEXER_HEAD_DIM]` F16. Indexer compressor KV weight.
+    pub compressor_kv: WeightView<'a>,
+    /// `[N_EMBD, 2 * INDEXER_HEAD_DIM]` F16. Indexer compressor score
+    /// weight (analogue of `gate` on the attention compressor).
+    pub compressor_gate: WeightView<'a>,
+    /// `[2 * INDEXER_HEAD_DIM, ratio = 4]` F16. Indexer compressor
+    /// positional bias, indexed by `pos_mod` like the attention compressor.
+    pub compressor_ape: WeightView<'a>,
+    /// `[INDEXER_HEAD_DIM]` F32. RMSNorm weight applied to the pooled
+    /// indexer compressor row before the long-context RoPE rotation.
+    pub compressor_norm: &'a [f32],
 }
 
 /// Borrowed views for one transformer layer.
@@ -84,6 +108,11 @@ pub struct LayerWeights<'a> {
     /// mixed attention path; for this PR they're only consumed by the
     /// streaming compressor's emit step.
     pub compressor: Option<CompressorLayerWeights<'a>>,
+
+    // --- Indexer (ratio-4 layers only) ------------------------------------
+    /// `Some` for layers with `layer_compress_ratio(il) == 4`. Ratio-128
+    /// layers and the dense first two layers carry `None`.
+    pub indexer: Option<IndexerLayerWeights<'a>>,
 }
 
 impl<'a> LayerWeights<'a> {
@@ -187,6 +216,77 @@ impl<'a> LayerWeights<'a> {
             })
         };
 
+        // Indexer weights (ratio-4 layers only). Mirrors the six
+        // `indexer_*` tensors loaded in ds4.c lines 2682-2687. Layout:
+        //   * indexer.attn_q_b           F16 [Q_LORA_RANK, INDEXER_HEAD * INDEXER_HEAD_DIM]
+        //   * indexer.proj               F16 [N_EMBD, INDEXER_HEAD]
+        //   * indexer_compressor_kv      F16 [N_EMBD, 2 * INDEXER_HEAD_DIM]
+        //   * indexer_compressor_gate    F16 [N_EMBD, 2 * INDEXER_HEAD_DIM]
+        //   * indexer_compressor_ape    F16 [2 * INDEXER_HEAD_DIM, ratio = 4]
+        //   * indexer_compressor_norm    F32 [INDEXER_HEAD_DIM]
+        let indexer = if ratio == 4 {
+            let idx_dim = INDEXER_HEAD_DIM as usize;
+            let n_idx_head = INDEXER_HEAD as usize;
+            let idx_q_dim = n_idx_head * idx_dim;
+            let idx_width = 2 * idx_dim;
+
+            let attn_q_b = f16("indexer.attn_q_b.weight")?;
+            if attn_q_b.in_features() != q_lora_rank || attn_q_b.out_features() != idx_q_dim {
+                anyhow::bail!(
+                    "{prefix}indexer.attn_q_b.weight: expected [{q_lora_rank}, {idx_q_dim}], got [{}, {}]",
+                    attn_q_b.in_features(),
+                    attn_q_b.out_features(),
+                );
+            }
+            let proj = f16("indexer.proj.weight")?;
+            if proj.in_features() != n_embd || proj.out_features() != n_idx_head {
+                anyhow::bail!(
+                    "{prefix}indexer.proj.weight: expected [{n_embd}, {n_idx_head}], got [{}, {}]",
+                    proj.in_features(),
+                    proj.out_features(),
+                );
+            }
+            let compressor_kv = f16("indexer_compressor_kv.weight")?;
+            if compressor_kv.in_features() != n_embd || compressor_kv.out_features() != idx_width {
+                anyhow::bail!(
+                    "{prefix}indexer_compressor_kv.weight: expected [{n_embd}, {idx_width}], got [{}, {}]",
+                    compressor_kv.in_features(),
+                    compressor_kv.out_features(),
+                );
+            }
+            let compressor_gate = f16("indexer_compressor_gate.weight")?;
+            if compressor_gate.in_features() != n_embd
+                || compressor_gate.out_features() != idx_width
+            {
+                anyhow::bail!(
+                    "{prefix}indexer_compressor_gate.weight: expected [{n_embd}, {idx_width}], got [{}, {}]",
+                    compressor_gate.in_features(),
+                    compressor_gate.out_features(),
+                );
+            }
+            let compressor_ape = f16("indexer_compressor_ape.weight")?;
+            if compressor_ape.in_features() != idx_width
+                || compressor_ape.out_features() != ratio as usize
+            {
+                anyhow::bail!(
+                    "{prefix}indexer_compressor_ape.weight: expected [{idx_width}, {ratio}], got [{}, {}]",
+                    compressor_ape.in_features(),
+                    compressor_ape.out_features(),
+                );
+            }
+            let compressor_norm = f32_1d("indexer_compressor_norm.weight", idx_dim)?;
+            Some(IndexerLayerWeights {
+                attn_q_b,
+                proj,
+                compressor_kv,
+                compressor_gate,
+                compressor_ape,
+                compressor_norm,
+            })
+        } else {
+            None
+        };
+
         Ok(Self {
             attn_norm: f32_1d("attn_norm.weight", n_embd)?,
             attn_q_a,
@@ -226,6 +326,7 @@ impl<'a> LayerWeights<'a> {
             ffn_gate_tid2eid,
             ffn_exp_probs_b,
             compressor,
+            indexer,
         })
     }
 }
