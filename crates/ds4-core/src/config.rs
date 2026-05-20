@@ -20,6 +20,27 @@ pub fn layer_compress_ratio(il: u32) -> u32 {
 /// `validate_compress_ratio_metadata` in antirez/ds4 ds4.c (lines 2474-2505).
 pub const COMPRESS_RATIOS_KEY: &str = "deepseek4.attention.compress_ratios";
 
+/// Indexer head count. Hard-coded to 64 in the C reference
+/// (`DS4_N_INDEXER_HEAD`); GGUF carries it under
+/// `deepseek4.attention.indexer.head_count` and `validate_*` checks it
+/// against this value.
+pub const INDEXER_HEAD: u32 = 64;
+/// Indexer head dim. Hard-coded to 128 in the C reference
+/// (`DS4_N_INDEXER_HEAD_DIM`).
+pub const INDEXER_HEAD_DIM: u32 = 128;
+/// Indexer top-k cap. Hard-coded to 512 in the C reference
+/// (`DS4_N_INDEXER_TOP_K`). When `n_comp > top_k`, the indexer picks the
+/// `top_k` highest-scoring compressed rows and masks the rest.
+pub const INDEXER_TOP_K: u32 = 512;
+
+/// GGUF metadata keys for the indexer constants. The C reference reads
+/// these and `config_expect_u32`s each one against the matching `INDEXER_*`
+/// constant. We mirror that as optional validation: keys may be absent on
+/// the synthetic minimal-GGUF tests, but if present they must match.
+pub const INDEXER_HEAD_KEY: &str = "deepseek4.attention.indexer.head_count";
+pub const INDEXER_HEAD_DIM_KEY: &str = "deepseek4.attention.indexer.key_length";
+pub const INDEXER_TOP_K_KEY: &str = "deepseek4.attention.indexer.top_k";
+
 /// DeepSeek V4 Flash model configuration extracted from GGUF metadata.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -75,6 +96,26 @@ impl ModelConfig {
         let head_dim = get_u32("deepseek4.attention.key_length")
             .or_else(|_| get_u32("deepseek4.attention.head_dim"))
             .unwrap_or(n_embd / n_head);
+
+        // Indexer constants are hard-coded in the C reference but the
+        // GGUF carries them; if present, validate them against our
+        // constants so a model with an unexpected indexer shape fails
+        // fast at load time. Mirrors `config_expect_u32` calls in ds4.c
+        // (lines 2608-2610).
+        for (key, expected) in [
+            (INDEXER_HEAD_KEY, INDEXER_HEAD),
+            (INDEXER_HEAD_DIM_KEY, INDEXER_HEAD_DIM),
+            (INDEXER_TOP_K_KEY, INDEXER_TOP_K),
+        ] {
+            if let Some(v) = metadata.get(key) {
+                let got = v
+                    .to_u32()
+                    .ok_or_else(|| anyhow::anyhow!("Type mismatch for {key}: expected u32"))?;
+                if got != expected {
+                    anyhow::bail!("{key}: GGUF says {got}, expected {expected}");
+                }
+            }
+        }
 
         // Validate `deepseek4.attention.compress_ratios` against the
         // hard-coded `ds4_layer_compress_ratio` schedule when present. The
@@ -412,5 +453,58 @@ mod tests {
         m.insert(COMPRESS_RATIOS_KEY.to_string(), Value::U32(4));
         let err = ModelConfig::from_metadata(&m).unwrap_err();
         assert!(err.to_string().contains("expected array"), "got: {err}");
+    }
+
+    // ---------------------------------------------------------------------
+    // Indexer constant validation
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn indexer_keys_optional_for_back_compat() {
+        // base_metadata has none of the indexer keys — must still parse.
+        ModelConfig::from_metadata(&base_metadata()).expect("missing indexer keys OK");
+    }
+
+    #[test]
+    fn indexer_keys_matching_pass() {
+        let mut m = base_metadata();
+        m.insert(INDEXER_HEAD_KEY.to_string(), Value::U32(INDEXER_HEAD));
+        m.insert(
+            INDEXER_HEAD_DIM_KEY.to_string(),
+            Value::U32(INDEXER_HEAD_DIM),
+        );
+        m.insert(INDEXER_TOP_K_KEY.to_string(), Value::U32(INDEXER_TOP_K));
+        ModelConfig::from_metadata(&m).expect("matching indexer constants pass");
+    }
+
+    #[test]
+    fn indexer_head_mismatch_errors() {
+        let mut m = base_metadata();
+        m.insert(INDEXER_HEAD_KEY.to_string(), Value::U32(32));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("indexer.head_count") && msg.contains("32"),
+            "got: {msg}",
+        );
+    }
+
+    #[test]
+    fn indexer_top_k_mismatch_errors() {
+        let mut m = base_metadata();
+        m.insert(INDEXER_TOP_K_KEY.to_string(), Value::U32(256));
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(err.to_string().contains("indexer.top_k"), "got: {err}");
+    }
+
+    #[test]
+    fn indexer_key_wrong_type_errors() {
+        let mut m = base_metadata();
+        m.insert(
+            INDEXER_HEAD_KEY.to_string(),
+            Value::String("nope".to_string()),
+        );
+        let err = ModelConfig::from_metadata(&m).unwrap_err();
+        assert!(err.to_string().contains("Type mismatch"), "got: {err}");
     }
 }

@@ -21,7 +21,7 @@
 
 use anyhow::{Result, bail};
 
-use crate::config::layer_compress_ratio;
+use crate::config::{INDEXER_HEAD_DIM, layer_compress_ratio};
 
 /// Width of one cached KV row. Matches `DS4_N_HEAD_DIM` in ds4.c.
 pub const HEAD_DIM: usize = 512;
@@ -149,6 +149,113 @@ impl CompressorState {
     }
 }
 
+/// Width of the indexer's head dim (`DS4_N_INDEXER_HEAD_DIM` in ds4.c).
+/// Re-exported here for convenience; the source of truth is
+/// [`crate::config::INDEXER_HEAD_DIM`].
+pub const IDX_DIM: usize = INDEXER_HEAD_DIM as usize;
+
+/// Per-layer state for the streaming **indexer** compressor (ratio-4 layers
+/// only).
+///
+/// Mirrors the `index_state_kv / index_state_score / index_comp_kv /
+/// n_index_comp` quartet inside `ds4_layer_cache` in antirez/ds4 ds4.c
+/// (lines 6332-6470). Same shape rules as [`CompressorState`] but at width
+/// `INDEXER_HEAD_DIM = 128` rather than `HEAD_DIM = 512`, and only created
+/// for layers with `ratio == 4` (the dense first two layers and ratio-128
+/// layers carry no indexer).
+///
+/// Layout summary:
+/// * `coff = 2` (only ratio == 4 has an indexer; the C reference still computes coff for symmetry,
+///   but it's always 2 here).
+/// * `width = coff * IDX_DIM = 2 * 128 = 256` — per-row width of `state_kv`/`state_score`.
+/// * `state_kv`/`state_score` are `[coff*ratio, width] = [8, 256]` row-major. Score is initialised
+///   to `NEG_INF` so the softmax in the pool helper ignores slots until they receive a real score.
+/// * `comp_kv` is the emitted ring of `[comp_cap, IDX_DIM]` rows; `n_comp` is the watermark.
+///
+/// The emitted indexer rows are *not* yet consumed — that wiring lands when
+/// PR 4 plumbs the indexer mask into the mixed attention path.
+pub struct IndexerState {
+    pub comp_cap: usize,
+    pub state_kv: Vec<f32>,
+    pub state_score: Vec<f32>,
+    pub comp_kv: Vec<f32>,
+    pub n_comp: usize,
+}
+
+impl IndexerState {
+    /// Build a fresh indexer state for one ratio-4 layer.
+    ///
+    /// `ctx_size` controls the emitted-ring capacity (`comp_cap = ctx_size /
+    /// 4 + 2`, mirroring `kv_cache_alloc` in ds4.c).
+    pub fn new(ctx_size: usize) -> Result<Self> {
+        // Always ratio == 4 for the indexer (only ratio-4 layers carry one).
+        let ratio: usize = 4;
+        let coff: usize = 2;
+        let width = coff
+            .checked_mul(IDX_DIM)
+            .ok_or_else(|| anyhow::anyhow!("IndexerState: width overflow"))?;
+        let rows = coff
+            .checked_mul(ratio)
+            .ok_or_else(|| anyhow::anyhow!("IndexerState: row count overflow"))?;
+        let state_len = rows
+            .checked_mul(width)
+            .ok_or_else(|| anyhow::anyhow!("IndexerState: state buffer length overflow"))?;
+        let comp_cap = (ctx_size / ratio)
+            .checked_add(2)
+            .ok_or_else(|| anyhow::anyhow!("IndexerState: comp_cap overflow"))?;
+        let comp_kv_len = comp_cap
+            .checked_mul(IDX_DIM)
+            .ok_or_else(|| anyhow::anyhow!("IndexerState: comp_kv length overflow"))?;
+        Ok(Self {
+            comp_cap,
+            state_kv: vec![0.0f32; state_len],
+            state_score: vec![NEG_INF; state_len],
+            comp_kv: vec![0.0f32; comp_kv_len],
+            n_comp: 0,
+        })
+    }
+
+    /// `coff * IDX_DIM` — the per-row width of `state_kv`/`state_score`.
+    /// Always `2 * 128 = 256` for the indexer (only ratio-4 layers have one).
+    pub fn width(&self) -> usize {
+        2 * IDX_DIM
+    }
+
+    /// Reset KV to zero, scores to `NEG_INF`, watermark to zero.
+    pub fn clear(&mut self) {
+        self.state_kv.fill(0.0);
+        self.state_score.fill(NEG_INF);
+        self.n_comp = 0;
+    }
+
+    /// Append one `IDX_DIM`-wide row to the emitted ring. Errors if `comp_cap`
+    /// would be exceeded — ds4.c calls `ds4_die` here, but we surface it as
+    /// an error so the forward pass can roll back.
+    pub fn push_comp(&mut self, row: &[f32]) -> Result<()> {
+        if row.len() != IDX_DIM {
+            bail!(
+                "IndexerState::push_comp: row width {} != IDX_DIM {IDX_DIM}",
+                row.len(),
+            );
+        }
+        if self.n_comp >= self.comp_cap {
+            bail!(
+                "IndexerState::push_comp: capacity {} exceeded",
+                self.comp_cap,
+            );
+        }
+        let off = self.n_comp * IDX_DIM;
+        self.comp_kv[off..off + IDX_DIM].copy_from_slice(row);
+        self.n_comp += 1;
+        Ok(())
+    }
+
+    /// Slice of the `n_comp` emitted rows: `[n_comp, IDX_DIM]` row-major.
+    pub fn comp_rows(&self) -> &[f32] {
+        &self.comp_kv[..self.n_comp * IDX_DIM]
+    }
+}
+
 /// One layer's raw ring buffer. `[cap_raw, HEAD_DIM]` row-major with a
 /// watermark `n_raw <= cap_raw`. On overflow the oldest row is evicted by
 /// memmove (matches `kv_cache_push_raw` in ds4.c).
@@ -209,12 +316,14 @@ impl RawLayerCache {
 }
 
 /// Multi-layer KV cache: one `RawLayerCache` per transformer layer plus a
-/// matching slot of optional `CompressorState`. Dense layers (`ratio == 0`)
-/// store `None` rather than an empty `CompressorState` to make the
-/// "this layer skips the compressor" case visible at the type level.
+/// matching slot of optional `CompressorState` and (for ratio-4 layers) an
+/// optional `IndexerState`. Dense layers (`ratio == 0`) and ratio-128 layers
+/// store `None` in the indexer slot to make the "this layer skips the
+/// indexer" case visible at the type level.
 pub struct KvCache {
     layers: Vec<RawLayerCache>,
     compressors: Vec<Option<CompressorState>>,
+    indexers: Vec<Option<IndexerState>>,
 }
 
 impl KvCache {
@@ -225,6 +334,7 @@ impl KvCache {
     /// the dense layers (`il < 2`) get `None`, the rest carry a
     /// [`CompressorState`] sized with the full unclamped `ctx_size` (the
     /// compressor's emitted ring is independent of the SWA-clamped raw ring).
+    /// Per-layer indexer state is built only for ratio-4 layers.
     pub fn new(n_layer: usize, ctx_size: usize) -> Result<Self> {
         let cap_raw = SWA.min(ctx_size).max(1);
         let total = n_layer
@@ -248,9 +358,19 @@ impl KvCache {
                 }
             })
             .collect::<Result<Vec<_>>>()?;
+        let indexers = (0..n_layer)
+            .map(|il| {
+                if layer_compress_ratio(il as u32) == 4 {
+                    IndexerState::new(ctx_size).map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             layers: (0..n_layer).map(|_| RawLayerCache::new(cap_raw)).collect(),
             compressors,
+            indexers,
         })
     }
 
@@ -273,6 +393,17 @@ impl KvCache {
         self.compressors[il].as_mut()
     }
 
+    /// Borrow the indexer compressor state for layer `il`. Only ratio-4
+    /// layers carry one; everything else returns `None`.
+    pub fn indexer(&self, il: usize) -> Option<&IndexerState> {
+        self.indexers[il].as_ref()
+    }
+
+    /// Mutable counterpart of [`KvCache::indexer`].
+    pub fn indexer_mut(&mut self, il: usize) -> Option<&mut IndexerState> {
+        self.indexers[il].as_mut()
+    }
+
     pub fn n_layer(&self) -> usize {
         self.layers.len()
     }
@@ -288,6 +419,9 @@ impl KvCache {
         }
         for c in self.compressors.iter_mut().flatten() {
             c.clear();
+        }
+        for i in self.indexers.iter_mut().flatten() {
+            i.clear();
         }
     }
 
@@ -326,6 +460,11 @@ impl KvCache {
             self.compressors.len(),
             "KvCache::snapshot_into: compressor count mismatch"
         );
+        assert_eq!(
+            snap.indexers.len(),
+            self.indexers.len(),
+            "KvCache::snapshot_into: indexer count mismatch"
+        );
         for (dst, src) in snap.layers.iter_mut().zip(self.layers.iter()) {
             assert_eq!(
                 dst.0.len(),
@@ -362,6 +501,33 @@ impl KvCache {
                 _ => panic!("KvCache::snapshot_into: compressor presence mismatch"),
             }
         }
+        for (dst, src) in snap.indexers.iter_mut().zip(self.indexers.iter()) {
+            match (dst.as_mut(), src.as_ref()) {
+                (Some(snap_state), Some(state)) => {
+                    assert_eq!(
+                        snap_state.state_kv.len(),
+                        state.state_kv.len(),
+                        "KvCache::snapshot_into: indexer state_kv size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.state_score.len(),
+                        state.state_score.len(),
+                        "KvCache::snapshot_into: indexer state_score size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.comp_kv.len(),
+                        state.comp_kv.len(),
+                        "KvCache::snapshot_into: indexer comp_kv size mismatch"
+                    );
+                    snap_state.state_kv.copy_from_slice(&state.state_kv);
+                    snap_state.state_score.copy_from_slice(&state.state_score);
+                    snap_state.comp_kv.copy_from_slice(&state.comp_kv);
+                    snap_state.n_comp = state.n_comp;
+                }
+                (None, None) => {}
+                _ => panic!("KvCache::snapshot_into: indexer presence mismatch"),
+            }
+        }
     }
 
     /// Restore an in-place snapshot. Buffers are copied back into the cache;
@@ -376,6 +542,11 @@ impl KvCache {
             snap.compressors.len(),
             self.compressors.len(),
             "KvCache::restore: compressor count mismatch"
+        );
+        assert_eq!(
+            snap.indexers.len(),
+            self.indexers.len(),
+            "KvCache::restore: indexer count mismatch"
         );
         for (l, (raw, n_raw)) in self.layers.iter_mut().zip(snap.layers.iter()) {
             assert_eq!(
@@ -413,11 +584,38 @@ impl KvCache {
                 _ => panic!("KvCache::restore: compressor presence mismatch"),
             }
         }
+        for (slot, snap_slot) in self.indexers.iter_mut().zip(snap.indexers.iter()) {
+            match (slot.as_mut(), snap_slot.as_ref()) {
+                (Some(state), Some(snap_state)) => {
+                    assert_eq!(
+                        snap_state.state_kv.len(),
+                        state.state_kv.len(),
+                        "KvCache::restore: indexer state_kv size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.state_score.len(),
+                        state.state_score.len(),
+                        "KvCache::restore: indexer state_score size mismatch"
+                    );
+                    assert_eq!(
+                        snap_state.comp_kv.len(),
+                        state.comp_kv.len(),
+                        "KvCache::restore: indexer comp_kv size mismatch"
+                    );
+                    state.state_kv.copy_from_slice(&snap_state.state_kv);
+                    state.state_score.copy_from_slice(&snap_state.state_score);
+                    state.comp_kv.copy_from_slice(&snap_state.comp_kv);
+                    state.n_comp = snap_state.n_comp;
+                }
+                (None, None) => {}
+                _ => panic!("KvCache::restore: indexer presence mismatch"),
+            }
+        }
     }
 }
 
 /// Reusable rollback snapshot of every layer's ring buffer + watermark plus
-/// per-layer compressor state.
+/// per-layer compressor and indexer state.
 ///
 /// Build once via [`KvCacheSnapshot::with_shape`] and reuse across calls
 /// with [`KvCache::snapshot_into`] / [`KvCache::restore`] to avoid the
@@ -425,6 +623,7 @@ impl KvCache {
 pub struct KvCacheSnapshot {
     layers: Vec<(Vec<f32>, usize)>,
     compressors: Vec<Option<CompressorSnapshot>>,
+    indexers: Vec<Option<IndexerSnapshot>>,
 }
 
 impl KvCacheSnapshot {
@@ -450,11 +649,30 @@ impl KvCacheSnapshot {
                     })
                 })
                 .collect(),
+            indexers: cache
+                .indexers
+                .iter()
+                .map(|c| {
+                    c.as_ref().map(|s| IndexerSnapshot {
+                        state_kv: vec![0.0f32; s.state_kv.len()],
+                        state_score: vec![NEG_INF; s.state_score.len()],
+                        comp_kv: vec![0.0f32; s.comp_kv.len()],
+                        n_comp: 0,
+                    })
+                })
+                .collect(),
         }
     }
 }
 
 struct CompressorSnapshot {
+    state_kv: Vec<f32>,
+    state_score: Vec<f32>,
+    comp_kv: Vec<f32>,
+    n_comp: usize,
+}
+
+struct IndexerSnapshot {
     state_kv: Vec<f32>,
     state_score: Vec<f32>,
     comp_kv: Vec<f32>,

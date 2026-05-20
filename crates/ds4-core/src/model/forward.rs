@@ -12,7 +12,13 @@ use crate::{
     config::ModelConfig,
     engine::Engine,
     gguf::GgmlType,
-    model::{WeightMap, compressor::compressor_decode_one, kv_cache::KvCache, layer::LayerWeights},
+    model::{
+        WeightMap,
+        compressor::compressor_decode_one,
+        indexer::indexer_decode_one,
+        kv_cache::{IDX_DIM, KvCache},
+        layer::LayerWeights,
+    },
     ops::{
         hc::{hc_control_split, hc_from_plain_embedding, hc_post, hc_weighted_sum},
         matmul::{expert_subview, matmul_row},
@@ -264,6 +270,27 @@ fn layer_attention_decode(
             )?;
             if emitted {
                 state.push_comp(&out_comp)?;
+            }
+        }
+    }
+
+    // Streaming indexer (ratio-4 layers only). Emits 128-dim compressed rows
+    // into IndexerState. The per-head top-k allowed-mask is built but not yet
+    // consumed by attention — PR 4 will wire it into the mixed-attention path.
+    if let Some(idx_w) = layer.indexer.as_ref() {
+        let mut out_idx = [0.0f32; IDX_DIM];
+        if let Some(state) = kv_cache.indexer_mut(il) {
+            let emitted = indexer_decode_one(
+                &mut out_idx,
+                idx_w,
+                state,
+                &attn_norm,
+                &engine.rope_freqs_long,
+                pos as u32,
+                il as u32,
+            )?;
+            if emitted {
+                state.push_comp(&out_idx)?;
             }
         }
     }
