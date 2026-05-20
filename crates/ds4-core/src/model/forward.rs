@@ -16,7 +16,7 @@ use crate::{
     model::{
         WeightMap,
         compressor::compressor_decode_one,
-        indexer::{indexer_decode_one, indexer_allowed_decode_one},
+        indexer::{indexer_allowed_decode_one, indexer_decode_one},
         kv_cache::{HEAD_DIM, IDX_DIM, KvCache, NEG_INF, SWA},
         layer::LayerWeights,
     },
@@ -542,10 +542,9 @@ fn attention_rows_inner(
 /// Buffer contract:
 /// * `out_heads` is `[n_head, HEAD_DIM]`.
 /// * `q` is `[n_head, HEAD_DIM]`, already RoPE'd and per-head RMSNorm'd.
-/// * `q_lora_norm` is the Q-LoRA intermediate (post `attn_q_a_norm`),
-///   used by the indexer to project per-indexer-head queries.
-/// * `attn_norm` is the pre-QKV RMSNorm'd activation, used by the
-///   indexer's `proj` score.
+/// * `q_lora_norm` is the Q-LoRA intermediate (post `attn_q_a_norm`), used by the indexer to
+///   project per-indexer-head queries.
+/// * `attn_norm` is the pre-QKV RMSNorm'd activation, used by the indexer's `proj` score.
 #[allow(clippy::too_many_arguments)]
 fn attention_rows_mixed(
     out_heads: &mut [f32],
@@ -620,7 +619,11 @@ fn attention_rows_mixed(
         let has_indexer = layer.indexer.is_some();
         if n_comp > 0 {
             // Determine which indexer head maps to this query head.
-            let idx_h = if n_idx_head > 0 { h.min(n_idx_head - 1) } else { 0 };
+            let idx_h = if n_idx_head > 0 {
+                h.min(n_idx_head - 1)
+            } else {
+                0
+            };
             let head_allowed = if k > 0 {
                 &allowed[idx_h * k..(idx_h + 1) * k]
             } else {
@@ -1412,10 +1415,11 @@ mod tests {
     // Mixed attention (ratio-4 layers)
     // -----------------------------------------------------------------------
 
-    use crate::config::{INDEXER_HEAD, INDEXER_HEAD_DIM};
-    use crate::model::kv_cache::{CompressorState, IndexerState};
-    use crate::model::layer::{CompressorLayerWeights, IndexerLayerWeights};
-    use crate::ops::matmul::WeightView;
+    use crate::{
+        config::INDEXER_HEAD_DIM,
+        model::layer::{CompressorLayerWeights, IndexerLayerWeights},
+        ops::matmul::WeightView,
+    };
 
     /// Build a minimal `LayerWeights` for testing mixed attention.
     /// Only `attn_sinks`, `compressor`, and `indexer` are meaningful;
@@ -1512,11 +1516,7 @@ mod tests {
             compressor_ape: dummy_f16(&idx_bytes, 1, 1),
             compressor_norm: &idx_norm,
         };
-        let layer = dummy_layer_for_mixed(
-            &sinks,
-            Some(comp_w),
-            Some(idx_w),
-        );
+        let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), Some(idx_w));
 
         let mut out_mixed = vec![0.0f32; n_head * HEAD_DIM];
         attention_rows_mixed(
@@ -1560,7 +1560,11 @@ mod tests {
         // Push one compressed row with a different pattern.
         let mut comp_row = vec![0.0f32; HEAD_DIM];
         comp_row[0] = 100.0; // Distinctive value.
-        cache.compressor_mut(2).unwrap().push_comp(&comp_row).unwrap();
+        cache
+            .compressor_mut(2)
+            .unwrap()
+            .push_comp(&comp_row)
+            .unwrap();
 
         let sinks = vec![-1e30f32; n_head];
         let q = vec![0.1f32; HEAD_DIM]; // Uniform q → attends to everything.
@@ -1623,7 +1627,11 @@ mod tests {
         // Push one compressed row with a very different pattern.
         let mut comp_row = vec![0.0f32; HEAD_DIM];
         comp_row[0] = 1000.0;
-        cache.compressor_mut(2).unwrap().push_comp(&comp_row).unwrap();
+        cache
+            .compressor_mut(2)
+            .unwrap()
+            .push_comp(&comp_row)
+            .unwrap();
 
         let sinks = vec![-1e30f32; n_head];
         let q = vec![0.1f32; HEAD_DIM];
@@ -1704,24 +1712,10 @@ mod tests {
         let layer = dummy_layer_for_mixed(&sinks, Some(comp_w), None);
 
         let mut out = vec![0.0f32; n_head * HEAD_DIM];
-        attention_rows_mixed(
-            &mut out,
-            &layer,
-            &q,
-            &[],
-            &[],
-            &cache,
-            2,
-            n_head,
-            HEAD_DIM,
-        )
-        .unwrap();
+        attention_rows_mixed(&mut out, &layer, &q, &[], &[], &cache, 2, n_head, HEAD_DIM).unwrap();
 
         for (i, &v) in out.iter().enumerate() {
-            assert!(
-                v.abs() < 1e-6,
-                "dim {i}: expected ~0, got {v}"
-            );
+            assert!(v.abs() < 1e-6, "dim {i}: expected ~0, got {v}");
         }
     }
 }

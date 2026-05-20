@@ -14,7 +14,8 @@
 //! 2. **Top-k mask** (`indexer_allowed_decode_one`) — computes per-head dot-product scores between
 //!    the indexer Q (projected from the Q-LoRA activation via `indexer.attn_q_b`) and the emitted
 //!    compressed rows, then returns the `top_k = min(INDEXER_TOP_K, n_comp)` highest-scoring
-//!    indices for each indexer head. The mixed-attention path consumes this mask for ratio-4 layers.
+//!    indices for each indexer head. The mixed-attention path consumes this mask for ratio-4
+//!    layers.
 //!
 //! ### What this PR skips
 //!
