@@ -1,5 +1,4 @@
 use std::{
-    hash::{Hash, Hasher},
     io::{BufRead, Write},
     path::PathBuf,
 };
@@ -51,10 +50,16 @@ fn write_utf8<W: Write>(
 }
 
 /// Derive a unique KVC filename from a token sequence.
+/// Uses FNV-1a for stability across Rust compiler versions.
 fn kvc_filename(tokens: &[u32]) -> String {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    tokens.hash(&mut hasher);
-    format!("{:016x}.kvc", hasher.finish())
+    let mut hash: u64 = 0xcbf29ce484222325; // FNV offset basis
+    for &tok in tokens {
+        for byte in tok.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x100000001b3); // FNV prime
+        }
+    }
+    format!("{hash:016x}.kvc")
 }
 
 /// Auto-save session to the KVC cache directory.
@@ -310,16 +315,16 @@ fn repl(
                         Ok(Some((loaded, suffix))) => {
                             tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
                             session = loaded;
-                            if !suffix.is_empty()
-                                && let Err(err) = generate_turn(
-                                    engine,
-                                    &mut session,
-                                    &suffix,
-                                    max_tokens,
-                                    &mut out,
-                                )
+                            if let Err(err) =
+                                generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
                             {
                                 writeln!(out, "error: {err}")?;
+                            } else {
+                                kvc_auto_save(
+                                    kv_cache_dir,
+                                    &session,
+                                    kv_disk::SaveReason::Continued,
+                                );
                             }
                             continue;
                         }

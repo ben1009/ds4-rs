@@ -403,6 +403,10 @@ pub fn load_session(path: &Path, engine: &Arc<Engine>) -> Result<Session> {
 /// Returns `(token_ids, context_size)` without loading KV state.
 /// Used by [`find_prefix_match`] to compare token sequences cheaply.
 pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
+    read_token_ids_inner(path, None)
+}
+
+fn read_token_ids_inner(path: &Path, read_at_most: Option<usize>) -> Result<(Vec<u32>, u32)> {
     let file = std::fs::File::open(path)
         .with_context(|| format!("KVC: cannot open {}", path.display()))?;
     let mut r = BufReader::new(file);
@@ -446,21 +450,27 @@ pub fn read_token_ids(path: &Path) -> Result<(Vec<u32>, u32)> {
         read_u32(&mut r)?;
     }
 
-    // Read token IDs in chunks to reduce syscall overhead
-    let mut tokens = Vec::with_capacity(token_count as usize);
-    let mut chunk = [0u8; 1024];
-    while tokens.len() < token_count as usize {
-        let remaining = (token_count as usize - tokens.len()) * 4;
-        let n = std::cmp::min(chunk.len(), remaining);
-        r.read_exact(&mut chunk[..n])?;
-        tokens.extend(
-            chunk[..n]
-                .chunks_exact(4)
-                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
-        );
+    // Read token IDs. BufReader already handles buffering, so a simple
+    // loop is efficient enough. read_at_most limits I/O during prefix scans.
+    let count = usize::try_from(token_count)
+        .map_err(|_| anyhow::anyhow!("KVC: token_count {token_count} overflows usize"))?;
+    let read_count = read_at_most.map_or(count, |max| count.min(max));
+    let mut tokens = Vec::with_capacity(read_count);
+    for _ in 0..read_count {
+        tokens.push(read_u32(&mut r)?);
+    }
+    // Skip any remaining tokens we didn't need
+    if read_count < count {
+        skip_bytes(&mut r, ((count - read_count) as u64) * 4)?;
     }
 
     Ok((tokens, header.context_size))
+}
+
+/// Like [`read_token_ids`] but reads at most `max` tokens, skipping the rest.
+/// Used by [`find_prefix_match`] to avoid reading full token sequences.
+pub fn read_token_ids_limited(path: &Path, max: usize) -> Result<(Vec<u32>, u32)> {
+    read_token_ids_inner(path, Some(max))
 }
 
 /// Scan `cache_dir` for KVC files and find the one whose token IDs
@@ -492,7 +502,7 @@ pub fn find_prefix_match(
         if path.extension().is_none_or(|e| e != "kvc") {
             continue;
         }
-        let cached_tokens = match read_token_ids(&path) {
+        let cached_tokens = match read_token_ids_limited(&path, query_tokens.len()) {
             Ok((tokens, _)) => tokens,
             Err(e) => {
                 tracing::debug!("KVC: skipping {}: {e}", path.display());
