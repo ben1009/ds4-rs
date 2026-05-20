@@ -92,7 +92,7 @@ jobs:
       - name: Rust Cache
         uses: Swatinem/rust-cache@v2
       - name: cargo miri test -p ds4-cli
-        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-cli --lib --tests
+        run: cargo +${{ env.NIGHTLY }} miri test -p ds4-cli --bins
         env:
           MIRIFLAGS: ""
   # loom:
