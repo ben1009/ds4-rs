@@ -37,6 +37,16 @@ pub struct Session {
     /// `[n_embd]` vector captured after HC reduction but before output norm.
     /// Used by MTP speculative decoding as the "previous hidden state" input.
     pub(crate) last_hidden: Vec<f32>,
+    /// Reusable scratch for output head HC reduction `[n_hc * n_embd]`.
+    pub(crate) s_out_flat: Vec<f32>,
+    /// Reusable scratch for output head HC weights `[n_hc]`.
+    pub(crate) s_out_pre: Vec<f32>,
+    /// Reusable scratch for output head HC weights `[n_hc]`.
+    pub(crate) s_out_weights: Vec<f32>,
+    /// Reusable scratch for output head plain hidden state `[n_embd]`.
+    pub(crate) s_out_plain: Vec<f32>,
+    /// Reusable scratch for output head normed hidden state `[n_embd]`.
+    pub(crate) s_out_norm: Vec<f32>,
     /// Optional MTP state for speculative decoding. Created when the engine
     /// has MTP weights loaded.
     pub(crate) mtp_state: Option<MtpState>,
@@ -75,6 +85,11 @@ impl Session {
             after_attn_hc: vec![0.0f32; hc_dim],
             ffn_out: vec![0.0f32; n_embd],
             last_hidden: vec![0.0f32; n_embd],
+            s_out_flat: vec![0.0f32; hc_dim],
+            s_out_pre: vec![0.0f32; n_hc],
+            s_out_weights: vec![0.0f32; n_hc],
+            s_out_plain: vec![0.0f32; n_embd],
+            s_out_norm: vec![0.0f32; n_embd],
             mtp_state,
         })
     }

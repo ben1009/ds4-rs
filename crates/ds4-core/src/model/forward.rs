@@ -77,6 +77,11 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     let mut attn_out = std::mem::take(&mut session.attn_out);
     let mut after_attn_hc = std::mem::take(&mut session.after_attn_hc);
     let mut ffn_out = std::mem::take(&mut session.ffn_out);
+    let mut s_out_flat = std::mem::take(&mut session.s_out_flat);
+    let mut s_out_pre = std::mem::take(&mut session.s_out_pre);
+    let mut s_out_weights = std::mem::take(&mut session.s_out_weights);
+    let mut s_out_plain = std::mem::take(&mut session.s_out_plain);
+    let mut s_out_norm = std::mem::take(&mut session.s_out_norm);
     let q_dim = heads_scratch.len();
     let result = (|| -> Result<Vec<f32>> {
         for il in 0..config.n_layer {
@@ -99,10 +104,18 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
         // --- Output head ---------------------------------------------------
         // Split into reduce (HC collapse) + project (norm + LM head) so we
         // can capture the collapsed hidden state for MTP.
-        let plain = output_head_reduce(model, config, &residual_hc)?;
-        session.last_hidden.copy_from_slice(&plain);
+        output_head_reduce(
+            model,
+            config,
+            &residual_hc,
+            &mut s_out_flat,
+            &mut s_out_pre,
+            &mut s_out_weights,
+            &mut s_out_plain,
+        )?;
+        session.last_hidden.copy_from_slice(&s_out_plain);
         let mut logits = vec![0.0f32; config.n_vocab as usize];
-        output_head_project(model, config, &plain, &mut logits)?;
+        output_head_project(model, config, &s_out_plain, &mut logits, &mut s_out_norm)?;
         Ok(logits)
     })();
 
@@ -112,6 +125,11 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     session.attn_out = attn_out;
     session.after_attn_hc = after_attn_hc;
     session.ffn_out = ffn_out;
+    session.s_out_flat = s_out_flat;
+    session.s_out_pre = s_out_pre;
+    session.s_out_weights = s_out_weights;
+    session.s_out_plain = s_out_plain;
+    session.s_out_norm = s_out_norm;
     result
 }
 
@@ -1064,52 +1082,62 @@ pub(crate) fn run_transformer_block(
 /// Collapses `residual_hc` (`[n_hc * n_embd]`) to a single `plain` vector
 /// (`[n_embd]`) via learned HC stream weighting. The result is the hidden
 /// state used by MTP and captured in `session.last_hidden`.
+///
+/// `flat`, `pre`, `weights`, and `plain` are caller-owned scratch buffers
+/// sized `[n_hc * n_embd]`, `[n_hc]`, `[n_hc]`, and `[n_embd]` respectively.
+/// Hoisting them out of this function avoids per-token heap allocations.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn output_head_reduce(
     model: &WeightMap,
     config: &ModelConfig,
     residual_hc: &[f32],
-) -> Result<Vec<f32>> {
+    flat: &mut [f32],
+    pre: &mut [f32],
+    weights: &mut [f32],
+    plain: &mut [f32],
+) -> Result<()> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
-    let hc_dim = n_hc
-        .checked_mul(n_embd)
-        .ok_or_else(|| anyhow::anyhow!("output_head_reduce: HC dim overflow"))?;
 
-    let mut flat = vec![0.0f32; hc_dim];
-    rms_norm_no_weight(residual_hc, 1e-6, &mut flat);
+    flat.fill(0.0);
+    rms_norm_no_weight(residual_hc, 1e-6, flat);
 
     let hc_fn = model.f16("output_hc_fn.weight")?;
-    let mut pre = vec![0.0f32; n_hc];
-    matmul_row(hc_fn, &flat, &mut pre);
+    pre.fill(0.0);
+    matmul_row(hc_fn, flat, pre);
 
     let scale = model.f32_1d("output_hc_scale.weight", 1)?;
     let base = model.f32_1d("output_hc_base.weight", n_hc)?;
-    let mut weights = vec![0.0f32; n_hc];
-    output_hc_weights(&pre, scale[0], base, &mut weights);
+    weights.fill(0.0);
+    output_hc_weights(pre, scale[0], base, weights);
 
-    let mut plain = vec![0.0f32; n_embd];
-    hc_weighted_sum(residual_hc, &weights, &mut plain, n_embd, n_hc);
-    Ok(plain)
+    plain.fill(0.0);
+    hc_weighted_sum(residual_hc, weights, plain, n_embd, n_hc);
+    Ok(())
 }
 
 /// Second stage of the output head: norm + LM head projection.
 ///
 /// Takes the collapsed hidden state from [`output_head_reduce`] and produces
 /// logits (`[n_vocab]`).
+///
+/// `norm` is a caller-owned scratch buffer sized `[n_embd]`.
+/// Hoisting it out of this function avoids per-token heap allocations.
 pub(crate) fn output_head_project(
     model: &WeightMap,
     config: &ModelConfig,
     plain: &[f32],
     logits: &mut [f32],
+    norm: &mut [f32],
 ) -> Result<()> {
     let n_embd = config.n_embd as usize;
 
-    let mut norm = vec![0.0f32; n_embd];
+    norm.fill(0.0);
     let output_norm = model.f32_1d("output_norm.weight", n_embd)?;
-    rms_norm(plain, output_norm, 1e-6, &mut norm);
+    rms_norm(plain, output_norm, 1e-6, norm);
 
     let output_weight = model.q8_0("output.weight")?;
-    matmul_row(output_weight, &norm, logits);
+    matmul_row(output_weight, norm, logits);
 
     Ok(())
 }

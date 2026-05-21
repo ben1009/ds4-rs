@@ -66,6 +66,9 @@ pub fn generate_speculative(
     // drafting first, collecting draft tokens and hidden snapshots, then
     // release the borrow before verification.
 
+    // Copy last_hidden into a local buffer to avoid heap allocation.
+    // We can't use MtpState's scratch buffer here because we need to
+    // borrow session immutably for last_hidden() and mutably for mtp_state.
     let main_hidden = session.last_hidden().to_vec();
     let pos = session.pos();
 
@@ -89,8 +92,7 @@ pub fn generate_speculative(
 
     let (drafts, hidden_snapshots) = drafts_result;
 
-    // If MTP disagrees with the main model on draft[0], no speculation benefit.
-    // draft_tokens returns empty when draft[0] != main_token.
+    // If no drafts were generated, skip speculation.
     if drafts.is_empty() {
         session.eval_token(main_token)?;
         return Ok(vec![main_token]);
@@ -101,14 +103,15 @@ pub fn generate_speculative(
     // during verification so that eval_token_inner does not overwrite this
     // snapshot with per-token rollback state.
     session.snapshot_kv();
-    let tokens_before = session.tokens().len();
 
     // Evaluate main_token (always accepted).
     session.eval_token_no_snapshot(main_token)?;
     let mut accepted = vec![main_token];
 
-    // Verify each subsequent draft token.
-    for &draft in drafts.iter().skip(1) {
+    // Verify each draft token against the main model's prediction.
+    // After evaluating main_token, the main model's logits predict position P+1.
+    // drafts[0] is MTP's prediction for position P+1, so we should compare them.
+    for &draft in drafts.iter() {
         let main_pred = Session::argmax(session.logits())
             .ok_or_else(|| anyhow::anyhow!("speculative: empty logits during verification"))?;
         if main_pred != draft {
@@ -118,42 +121,31 @@ pub fn generate_speculative(
         accepted.push(draft);
     }
 
-    // === Rollback if needed ===
+    // === No rollback needed ===
+    // eval_token_no_snapshot is only called for tokens that pass verification,
+    // so the KV cache and session tokens are already in the correct state.
     let n_accepted = accepted.len();
     let total_drafts = drafts.len();
-
-    // If we didn't accept all drafts, restore the pre-verification state and
-    // re-evaluate only the accepted tokens. We must truncate tokens back to
-    // the pre-verification length (eval_token pushes tokens) and restore the
-    // KV cache from our snapshot.
-    if n_accepted < total_drafts {
-        session.restore_kv();
-        // Truncate tokens back to pre-verification length. This also resets
-        // pos via the tokens.len() calculation in eval_token_inner.
-        session.truncate_tokens(tokens_before);
-        for &tok in &accepted {
-            session.eval_token(tok)?;
-        }
-    }
 
     // === MTP state alignment ===
     {
         let mtp_state = session.mtp_state.as_mut().unwrap();
 
         // Restore prev_hidden to the state after the last accepted draft.
-        // hidden_snapshots[i] is MTP state after drafts[i]. The last accepted
-        // draft is drafts[n_accepted - 1], so we need hidden_snapshots[n_accepted - 1].
-        if n_accepted <= hidden_snapshots.len() {
+        // hidden_snapshots[i] is MTP state after drafts[i].
+        // n_accepted includes main_token, so m = n_accepted - 1 draft tokens accepted.
+        // Last accepted draft is drafts[m-1] = drafts[n_accepted - 2].
+        if n_accepted >= 2 && n_accepted - 1 <= hidden_snapshots.len() {
             mtp_state
                 .prev_hidden
-                .clone_from(&hidden_snapshots[n_accepted - 1]);
+                .clone_from(&hidden_snapshots[n_accepted - 2]);
         }
 
         // Pop rejected entries from MTP KV cache.
-        // Each draft (including draft[0]) runs mtp_forward which pushes one KV
-        // entry. Accepted MTP KV entries = n_accepted (draft[0]=main_token +
-        // n_accepted - 1 subsequent). Total MTP KV entries = total_drafts.
-        let rejected = total_drafts.saturating_sub(n_accepted);
+        // Each draft runs mtp_forward which pushes one KV entry.
+        // Accepted draft tokens = m = n_accepted - 1.
+        // Rejected drafts = total_drafts - m = total_drafts - (n_accepted - 1).
+        let rejected = total_drafts.saturating_sub(n_accepted - 1);
         for _ in 0..rejected {
             mtp_state.kv_cache.pop_last_row();
         }
