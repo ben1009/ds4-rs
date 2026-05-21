@@ -437,9 +437,9 @@ fn generate_turn<W: Write>(
                 Session::argmax(logits)
                     .ok_or_else(|| anyhow::anyhow!("speculative returned empty logits"))?
             };
-            let new_tokens: Vec<u32> = session.tokens()[old_len..].to_vec();
+            let new_tokens = &session.tokens()[old_len..];
             let mut stop = false;
-            for &t in &new_tokens {
+            for &t in new_tokens {
                 if t == eos {
                     stop = true;
                     break;

@@ -82,6 +82,21 @@ pub struct MtpState {
     pub heads_scratch: Vec<f32>,
     /// Draft logits output buffer `[n_vocab]`.
     pub logits: Vec<f32>,
+    // Reusable scratch buffers for mtp_forward (avoid per-call heap allocations).
+    s_plain: Vec<f32>,
+    s_enormed: Vec<f32>,
+    s_eproj: Vec<f32>,
+    s_eproj_hc: Vec<f32>,
+    s_hnormed: Vec<f32>,
+    s_hproj: Vec<f32>,
+    s_hproj_hc: Vec<f32>,
+    s_residual_hc: Vec<f32>,
+    // Reusable scratch buffers for mtp_output_head.
+    s_out_flat: Vec<f32>,
+    s_out_pre: Vec<f32>,
+    s_out_weights: Vec<f32>,
+    s_out_plain: Vec<f32>,
+    s_out_normed: Vec<f32>,
 }
 
 impl MtpState {
@@ -89,14 +104,31 @@ impl MtpState {
     pub fn new(config: &ModelConfig, ctx_size: u32) -> Result<Self> {
         let n_embd = config.n_embd as usize;
         let n_vocab = config.n_vocab as usize;
+        let n_hc = config.n_hc as usize;
         let q_dim = (config.n_head as usize)
             .checked_mul(config.head_dim as usize)
             .ok_or_else(|| anyhow::anyhow!("MtpState: Q dimension overflow"))?;
+        let hc_dim = n_hc
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow::anyhow!("MtpState: HC dim overflow"))?;
         Ok(Self {
             kv_cache: KvCache::new(1, ctx_size as usize)?,
             prev_hidden: vec![0.0f32; n_embd],
             heads_scratch: vec![0.0f32; q_dim],
             logits: vec![0.0f32; n_vocab],
+            s_plain: vec![0.0f32; n_embd],
+            s_enormed: vec![0.0f32; n_embd],
+            s_eproj: vec![0.0f32; n_embd],
+            s_eproj_hc: vec![0.0f32; hc_dim],
+            s_hnormed: vec![0.0f32; n_embd],
+            s_hproj: vec![0.0f32; n_embd],
+            s_hproj_hc: vec![0.0f32; hc_dim],
+            s_residual_hc: vec![0.0f32; hc_dim],
+            s_out_flat: vec![0.0f32; hc_dim],
+            s_out_pre: vec![0.0f32; n_hc],
+            s_out_weights: vec![0.0f32; n_hc],
+            s_out_plain: vec![0.0f32; n_embd],
+            s_out_normed: vec![0.0f32; n_embd],
         })
     }
 
@@ -127,43 +159,49 @@ pub fn mtp_forward(
     let n_hc = config.n_hc as usize;
 
     // 1. Embed token from main model's embedding table.
-    let mut plain = vec![0.0f32; n_embd];
-    embed_token(main_weights, token, &mut plain)?;
+    mtp_state.s_plain.fill(0.0);
+    embed_token(main_weights, token, &mut mtp_state.s_plain)?;
 
     // 2. RMSNorm embedding.
-    let mut enormed = vec![0.0f32; n_embd];
-    rms_norm(&plain, mtp_weights.enorm, 1e-6, &mut enormed);
+    rms_norm(
+        &mtp_state.s_plain,
+        mtp_weights.enorm,
+        1e-6,
+        &mut mtp_state.s_enormed,
+    );
 
     // 3. Project embedding.
-    let mut eproj = vec![0.0f32; n_embd];
-    matmul_row(mtp_weights.e_proj, &enormed, &mut eproj);
+    matmul_row(
+        mtp_weights.e_proj,
+        &mtp_state.s_enormed,
+        &mut mtp_state.s_eproj,
+    );
 
     // 4. Expand to HC layout.
-    let hc_dim = n_hc * n_embd;
-    let mut eproj_hc = vec![0.0f32; hc_dim];
-    hc_from_plain_embedding(&mut eproj_hc, &eproj, n_embd, n_hc);
+    hc_from_plain_embedding(&mut mtp_state.s_eproj_hc, &mtp_state.s_eproj, n_embd, n_hc);
 
     // 5. Norm hidden state.
-    let mut hnormed = vec![0.0f32; n_embd];
-    rms_norm(hidden, mtp_weights.hnorm, 1e-6, &mut hnormed);
+    rms_norm(hidden, mtp_weights.hnorm, 1e-6, &mut mtp_state.s_hnormed);
 
     // 6. Project hidden state.
-    let mut hproj = vec![0.0f32; n_embd];
-    matmul_row(mtp_weights.h_proj, &hnormed, &mut hproj);
+    matmul_row(
+        mtp_weights.h_proj,
+        &mtp_state.s_hnormed,
+        &mut mtp_state.s_hproj,
+    );
 
     // 7. Expand to HC layout.
-    let mut hproj_hc = vec![0.0f32; hc_dim];
-    hc_from_plain_embedding(&mut hproj_hc, &hproj, n_embd, n_hc);
+    hc_from_plain_embedding(&mut mtp_state.s_hproj_hc, &mtp_state.s_hproj, n_embd, n_hc);
 
     // 8. Combine: eproj_hc + hproj_hc.
-    let mut residual_hc = vec![0.0f32; hc_dim];
+    let hc_dim = n_hc * n_embd;
     for i in 0..hc_dim {
-        residual_hc[i] = eproj_hc[i] + hproj_hc[i];
+        mtp_state.s_residual_hc[i] = mtp_state.s_eproj_hc[i] + mtp_state.s_hproj_hc[i];
     }
 
     // 9. Run the single transformer block (attention + FFN with HC pre/post).
     crate::model::forward::run_transformer_block(
-        &mut residual_hc,
+        &mut mtp_state.s_residual_hc,
         engine,
         &mtp_weights.block,
         &mut mtp_state.kv_cache,
@@ -178,8 +216,13 @@ pub fn mtp_forward(
         mtp_weights,
         main_weights,
         config,
-        &residual_hc,
+        &mtp_state.s_residual_hc,
         &mut mtp_state.logits,
+        &mut mtp_state.s_out_flat,
+        &mut mtp_state.s_out_pre,
+        &mut mtp_state.s_out_weights,
+        &mut mtp_state.s_out_plain,
+        &mut mtp_state.s_out_normed,
     )?;
 
     // 11. Argmax → draft token.
@@ -192,7 +235,7 @@ pub fn mtp_forward(
     for h in 0..n_hc {
         let offset = h * n_embd;
         for d in 0..n_embd {
-            mtp_state.prev_hidden[d] += residual_hc[offset + d];
+            mtp_state.prev_hidden[d] += mtp_state.s_residual_hc[offset + d];
         }
     }
     // Normalize by n_hc to keep magnitudes stable.
@@ -208,44 +251,42 @@ pub fn mtp_forward(
 ///
 /// Uses MTP's own HC head weights (`hc_head_fn`, `hc_head_scale`,
 /// `hc_head_base`) and `norm`, but the main model's shared `output.weight`.
+#[allow(clippy::too_many_arguments)]
 fn mtp_output_head(
     mtp_weights: &MtpWeights<'_>,
     main_weights: &WeightMap,
     config: &ModelConfig,
     residual_hc: &[f32],
     logits: &mut [f32],
+    flat: &mut [f32],
+    pre: &mut [f32],
+    weights: &mut [f32],
+    plain: &mut [f32],
+    normed: &mut [f32],
 ) -> Result<()> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
-    let hc_dim = n_hc
-        .checked_mul(n_embd)
-        .ok_or_else(|| anyhow::anyhow!("mtp_output_head: HC dim overflow"))?;
 
     // Learned HC reduction (same formula as main model's output head).
-    let mut flat = vec![0.0f32; hc_dim];
-    rms_norm_no_weight(residual_hc, 1e-6, &mut flat);
+    rms_norm_no_weight(residual_hc, 1e-6, flat);
 
-    let mut pre = vec![0.0f32; n_hc];
-    matmul_row(mtp_weights.hc_head_fn, &flat, &mut pre);
+    matmul_row(mtp_weights.hc_head_fn, flat, pre);
 
-    let mut weights = vec![0.0f32; n_hc];
     output_hc_weights(
-        &pre,
+        pre,
         mtp_weights.hc_head_scale[0],
         mtp_weights.hc_head_base,
-        &mut weights,
+        weights,
     );
 
-    let mut plain = vec![0.0f32; n_embd];
-    hc_weighted_sum(residual_hc, &weights, &mut plain, n_embd, n_hc);
+    hc_weighted_sum(residual_hc, weights, plain, n_embd, n_hc);
 
     // Output norm (MTP's own norm weight, not the main model's output_norm).
-    let mut normed = vec![0.0f32; n_embd];
-    rms_norm(&plain, mtp_weights.norm, 1e-6, &mut normed);
+    rms_norm(plain, mtp_weights.norm, 1e-6, normed);
 
     // LM head projection (shared with main model's output.weight).
     let output_weight = main_weights.q8_0("output.weight")?;
-    matmul_row(output_weight, &normed, logits);
+    matmul_row(output_weight, normed, logits);
 
     Ok(())
 }

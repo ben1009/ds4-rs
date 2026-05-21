@@ -143,8 +143,8 @@ fn process_request(
                 Session::argmax(logits)
                     .ok_or_else(|| anyhow::anyhow!("speculative returned empty logits"))?
             };
-            let new_tokens: Vec<u32> = session.tokens()[old_len..].to_vec();
-            for &t in &new_tokens {
+            let new_tokens = &session.tokens()[old_len..];
+            for &t in new_tokens {
                 if t == eos_token {
                     finish_reason = "stop";
                     let _ = request.response_tx.blocking_send(GenerationEvent::Done {

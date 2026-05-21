@@ -131,8 +131,7 @@ pub fn generate_speculative(
         // Truncate tokens back to pre-verification length. This also resets
         // pos via the tokens.len() calculation in eval_token_inner.
         session.truncate_tokens(tokens_before);
-        let accepted_copy = accepted.clone();
-        for &tok in &accepted_copy {
+        for &tok in &accepted {
             session.eval_token(tok)?;
         }
     }
