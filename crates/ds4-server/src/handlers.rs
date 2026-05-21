@@ -49,7 +49,7 @@ pub async fn openai_chat_completions(
     if let Err(e) = state.inference.submit(request).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"error": {"message": e.to_string(), "type": "server_error"}})),
         )
             .into_response();
     }
@@ -63,6 +63,7 @@ pub async fn openai_chat_completions(
         let mut content = String::new();
         let mut prompt_tok_count = 0u32;
         let mut completion_tok_count = 0u32;
+        let mut finish_reason = "stop";
         let mut stream = rx;
 
         while let Some(event) = stream.recv().await {
@@ -71,14 +72,16 @@ pub async fn openai_chat_completions(
                 GenerationEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    finish_reason: reason,
                 } => {
                     prompt_tok_count = prompt_tokens;
                     completion_tok_count = completion_tokens;
+                    finish_reason = reason;
                 }
                 GenerationEvent::Error(msg) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": msg})),
+                        Json(serde_json::json!({"error": {"message": msg, "type": "server_error"}})),
                     )
                         .into_response();
                 }
@@ -96,7 +99,7 @@ pub async fn openai_chat_completions(
                     role: "assistant".into(),
                     content,
                 },
-                finish_reason: Some("stop".into()),
+                finish_reason: Some(finish_reason.into()),
             }],
             usage: OpenaiUsage {
                 prompt_tokens: prompt_tok_count,
@@ -138,7 +141,7 @@ pub async fn anthropic_messages(
     if let Err(e) = state.inference.submit(request).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
+            Json(serde_json::json!({"type": "error", "error": {"type": "api_error", "message": e.to_string()}})),
         )
             .into_response();
     }
@@ -198,7 +201,7 @@ pub async fn anthropic_messages(
                                 .data(serde_json::to_string(&delta).unwrap_or_default()),
                         );
                     }
-                    GenerationEvent::Done { .. } => {
+                    GenerationEvent::Done { finish_reason, .. } => {
                         // content_block_stop
                         let block_stop = AnthropicStreamContentBlockStop {
                             event_type: "content_block_stop".into(),
@@ -210,10 +213,15 @@ pub async fn anthropic_messages(
                                 .data(serde_json::to_string(&block_stop).unwrap_or_default()),
                         );
                         // message_delta (carries stop_reason + usage)
+                        let anthropic_stop = if finish_reason == "length" {
+                            "max_tokens"
+                        } else {
+                            "end_turn"
+                        };
                         let msg_delta = AnthropicStreamMessageDelta {
                             event_type: "message_delta".into(),
                             delta: AnthropicMessageDelta {
-                                stop_reason: "end_turn".into(),
+                                stop_reason: anthropic_stop.into(),
                             },
                             usage: AnthropicStreamUsage {
                                 output_tokens: completion_tokens,
@@ -250,6 +258,7 @@ pub async fn anthropic_messages(
         let mut content = String::new();
         let mut prompt_tok_count = 0u32;
         let mut completion_tok_count = 0u32;
+        let mut finish_reason = "stop";
         let mut stream = rx;
 
         while let Some(event) = stream.recv().await {
@@ -258,20 +267,27 @@ pub async fn anthropic_messages(
                 GenerationEvent::Done {
                     prompt_tokens,
                     completion_tokens,
+                    finish_reason: reason,
                 } => {
                     prompt_tok_count = prompt_tokens;
                     completion_tok_count = completion_tokens;
+                    finish_reason = reason;
                 }
                 GenerationEvent::Error(msg) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": msg})),
+                        Json(serde_json::json!({"type": "error", "error": {"type": "api_error", "message": msg}})),
                     )
                         .into_response();
                 }
             }
         }
 
+        let anthropic_stop = if finish_reason == "length" {
+            "max_tokens"
+        } else {
+            "end_turn"
+        };
         let response = AnthropicResponse {
             id: msg_id,
             msg_type: "message".into(),
@@ -281,7 +297,7 @@ pub async fn anthropic_messages(
                 text: content,
             }],
             model,
-            stop_reason: Some("end_turn".into()),
+            stop_reason: Some(anthropic_stop.into()),
             usage: AnthropicUsage {
                 input_tokens: prompt_tok_count,
                 output_tokens: completion_tok_count,

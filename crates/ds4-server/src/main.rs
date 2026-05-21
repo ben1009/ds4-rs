@@ -46,6 +46,10 @@ async fn main() -> Result<()> {
     tracing::info!("loading model from {}", args.model.display());
     let engine = Engine::open(&args.model)?;
 
+    if let Some(ref dir) = args.kv_cache_dir {
+        std::fs::create_dir_all(dir)?;
+    }
+
     let (inference, _worker) = generation::spawn_worker(engine.clone(), args.kv_cache_dir.clone())?;
 
     let state = AppState { engine, inference };

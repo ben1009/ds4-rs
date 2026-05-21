@@ -108,7 +108,9 @@ fn process_request(
     // Save after prefill
     if let Some(dir) = kv_cache_dir {
         let path = kvc_save_path(dir, &request.prompt_tokens);
-        let _ = kv_disk::save_session(&path, session, kv_disk::SaveReason::Cold);
+        if let Err(e) = kv_disk::save_session(&path, session, kv_disk::SaveReason::Cold) {
+            tracing::warn!("failed to save KVC after prefill: {e}");
+        }
     }
 
     // Generate tokens
@@ -117,8 +119,13 @@ fn process_request(
     let mut token =
         Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("no logits available"))?;
 
+    let mut finish_reason = "stop";
     loop {
+        if token == eos_token {
+            break;
+        }
         if completion_tokens >= request.max_tokens {
+            finish_reason = "length";
             break;
         }
 
@@ -134,10 +141,6 @@ fn process_request(
 
         completion_tokens += 1;
 
-        if token == eos_token {
-            break;
-        }
-
         session.eval_token(token)?;
         token = Session::argmax(session.logits())
             .ok_or_else(|| anyhow::anyhow!("no logits after eval"))?;
@@ -146,12 +149,15 @@ fn process_request(
     // Save after generation
     if let Some(dir) = kv_cache_dir {
         let path = kvc_save_path(dir, &request.prompt_tokens);
-        let _ = kv_disk::save_session(&path, session, kv_disk::SaveReason::Continued);
+        if let Err(e) = kv_disk::save_session(&path, session, kv_disk::SaveReason::Continued) {
+            tracing::warn!("failed to save KVC after generation: {e}");
+        }
     }
 
     let _ = request.response_tx.blocking_send(GenerationEvent::Done {
         prompt_tokens: request.prompt_tokens.len() as u32,
         completion_tokens,
+        finish_reason,
     });
 
     Ok(())

@@ -33,7 +33,7 @@ pub fn stream_from_receiver(
                 vec![Ok(Event::default()
                     .data(serde_json::to_string(&chunk).unwrap_or_default()))]
             }
-            GenerationEvent::Done { .. } => {
+            GenerationEvent::Done { finish_reason, .. } => {
                 let chunk = OpenaiChatChunk {
                     id: request_id.clone(),
                     object: "chat.completion.chunk".into(),
@@ -42,7 +42,7 @@ pub fn stream_from_receiver(
                     choices: vec![OpenaiChunkChoice {
                         index: 0,
                         delta: OpenaiDelta { content: None },
-                        finish_reason: Some("stop".into()),
+                        finish_reason: Some(finish_reason.into()),
                     }],
                 };
                 vec![

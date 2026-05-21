@@ -198,6 +198,7 @@ pub enum GenerationEvent {
     Done {
         prompt_tokens: u32,
         completion_tokens: u32,
+        finish_reason: &'static str,
     },
     Error(String),
 }
@@ -350,6 +351,7 @@ mod tests {
         let e = GenerationEvent::Done {
             prompt_tokens: 5,
             completion_tokens: 3,
+            finish_reason: "stop",
         };
         assert!(format!("{e:?}").contains("Done"));
         let e = GenerationEvent::Error("fail".into());
