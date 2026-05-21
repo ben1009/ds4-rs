@@ -165,7 +165,8 @@ impl MtpState {
     /// Copy a hidden snapshot into prev_hidden by index.
     pub fn restore_hidden_snapshot(&mut self, index: usize, n_embd: usize) {
         let idx = index * n_embd;
-        self.prev_hidden.copy_from_slice(&self.hidden_snapshots_flat[idx..idx + n_embd]);
+        self.prev_hidden
+            .copy_from_slice(&self.hidden_snapshots_flat[idx..idx + n_embd]);
     }
 
     /// Reset the hidden snapshot counter (call at start of drafting).
