@@ -2,30 +2,61 @@ use std::convert::Infallible;
 
 use axum::response::sse::{Event, Sse};
 use futures_core::Stream;
+use futures_util::{StreamExt, stream};
 use tokio::sync::mpsc;
-use tokio_stream::{StreamExt, wrappers::ReceiverStream};
+use tokio_stream::wrappers::ReceiverStream;
 
-use crate::types::GenerationEvent;
+use crate::types::{GenerationEvent, OpenaiChatChunk, OpenaiChunkChoice, OpenaiDelta};
 
 pub fn stream_from_receiver(
+    request_id: String,
+    model: String,
+    created: u64,
     rx: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = ReceiverStream::new(rx).map(|event| {
-        let data = match event {
-            GenerationEvent::Token(text) => serde_json::json!({"token": text}).to_string(),
-            GenerationEvent::Done {
-                prompt_tokens,
-                completion_tokens,
-            } => serde_json::json!({
-                "done": true,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens
-            })
-            .to_string(),
-            GenerationEvent::Error(msg) => serde_json::json!({"error": msg}).to_string(),
-        };
-        Ok(Event::default().data(data))
-    });
+    let stream = ReceiverStream::new(rx).map(move |event| -> Vec<Result<Event, Infallible>> {
+        match event {
+            GenerationEvent::Token(text) => {
+                let chunk = OpenaiChatChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![OpenaiChunkChoice {
+                        index: 0,
+                        delta: OpenaiDelta {
+                            content: Some(text),
+                        },
+                        finish_reason: None,
+                    }],
+                };
+                vec![Ok(Event::default()
+                    .data(serde_json::to_string(&chunk).unwrap_or_default()))]
+            }
+            GenerationEvent::Done { .. } => {
+                let chunk = OpenaiChatChunk {
+                    id: request_id.clone(),
+                    object: "chat.completion.chunk".into(),
+                    created,
+                    model: model.clone(),
+                    choices: vec![OpenaiChunkChoice {
+                        index: 0,
+                        delta: OpenaiDelta { content: None },
+                        finish_reason: Some("stop".into()),
+                    }],
+                };
+                vec![
+                    Ok(Event::default()
+                        .data(serde_json::to_string(&chunk).unwrap_or_default())),
+                    Ok(Event::default().data("[DONE]")),
+                ]
+            }
+            GenerationEvent::Error(msg) => {
+                vec![Ok(Event::default()
+                    .data(serde_json::json!({"error": msg}).to_string()))]
+            }
+        }
+    }).flat_map(|events| stream::iter(events));
 
     Sse::new(stream)
 }
@@ -34,77 +65,117 @@ pub fn stream_from_receiver(
 mod tests {
     use super::*;
 
-    fn format_event(event: &GenerationEvent) -> String {
-        match event {
-            GenerationEvent::Token(text) => serde_json::json!({"token": text}).to_string(),
-            GenerationEvent::Done {
-                prompt_tokens,
-                completion_tokens,
-            } => serde_json::json!({
-                "done": true,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens
-            })
-            .to_string(),
-            GenerationEvent::Error(msg) => serde_json::json!({"error": msg}).to_string(),
+    fn sample_chunk() -> OpenaiChatChunk {
+        OpenaiChatChunk {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion.chunk".into(),
+            created: 1000,
+            model: "ds4".into(),
+            choices: vec![OpenaiChunkChoice {
+                index: 0,
+                delta: OpenaiDelta {
+                    content: Some("Hello".into()),
+                },
+                finish_reason: None,
+            }],
         }
     }
 
     #[test]
-    fn token_event_format() {
-        let data = format_event(&GenerationEvent::Token("Hello".into()));
-        assert_eq!(data, r#"{"token":"Hello"}"#);
+    fn token_chunk_format() {
+        let chunk = sample_chunk();
+        let json = serde_json::to_string(&chunk).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["object"], "chat.completion.chunk");
+        assert_eq!(parsed["choices"][0]["delta"]["content"], "Hello");
+        assert!(parsed["choices"][0]["finish_reason"].is_null());
     }
 
     #[test]
-    fn done_event_format() {
-        let data = format_event(&GenerationEvent::Done {
-            prompt_tokens: 10,
-            completion_tokens: 5,
-        });
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["done"], true);
-        assert_eq!(parsed["prompt_tokens"], 10);
-        assert_eq!(parsed["completion_tokens"], 5);
+    fn done_chunk_format() {
+        let chunk = OpenaiChatChunk {
+            id: "chatcmpl-test".into(),
+            object: "chat.completion.chunk".into(),
+            created: 1000,
+            model: "ds4".into(),
+            choices: vec![OpenaiChunkChoice {
+                index: 0,
+                delta: OpenaiDelta { content: None },
+                finish_reason: Some("stop".into()),
+            }],
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert!(parsed["choices"][0]["delta"]["content"].is_null());
+    }
+
+    #[test]
+    fn delta_with_none_content() {
+        let delta = OpenaiDelta { content: None };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert_eq!(json, r#"{"content":null}"#);
+    }
+
+    #[test]
+    fn delta_with_content() {
+        let delta = OpenaiDelta {
+            content: Some("Hi".into()),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert_eq!(json, r#"{"content":"Hi"}"#);
+    }
+
+    #[test]
+    fn chunk_choice_with_stop() {
+        let choice = OpenaiChunkChoice {
+            index: 0,
+            delta: OpenaiDelta { content: None },
+            finish_reason: Some("stop".into()),
+        };
+        let json = serde_json::to_string(&choice).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn chunk_choice_with_content() {
+        let choice = OpenaiChunkChoice {
+            index: 0,
+            delta: OpenaiDelta {
+                content: Some("token".into()),
+            },
+            finish_reason: None,
+        };
+        let json = serde_json::to_string(&choice).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["delta"]["content"], "token");
+        assert!(parsed["finish_reason"].is_null());
     }
 
     #[test]
     fn error_event_format() {
-        let data = format_event(&GenerationEvent::Error("something failed".into()));
+        let data = serde_json::json!({"error": "something failed"}).to_string();
         let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
         assert_eq!(parsed["error"], "something failed");
     }
 
     #[test]
     fn token_empty_string() {
-        let data = format_event(&GenerationEvent::Token("".into()));
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["token"], "");
+        let delta = OpenaiDelta {
+            content: Some("".into()),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        assert_eq!(json, r#"{"content":""}"#);
     }
 
     #[test]
     fn token_unicode() {
-        let data = format_event(&GenerationEvent::Token("你好".into()));
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["token"], "你好");
-    }
-
-    #[test]
-    fn done_zero_counts() {
-        let data = format_event(&GenerationEvent::Done {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-        });
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["done"], true);
-        assert_eq!(parsed["prompt_tokens"], 0);
-        assert_eq!(parsed["completion_tokens"], 0);
-    }
-
-    #[test]
-    fn error_empty_message() {
-        let data = format_event(&GenerationEvent::Error("".into()));
-        let parsed: serde_json::Value = serde_json::from_str(&data).unwrap();
-        assert_eq!(parsed["error"], "");
+        let delta = OpenaiDelta {
+            content: Some("你好".into()),
+        };
+        let json = serde_json::to_string(&delta).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["content"], "你好");
     }
 }

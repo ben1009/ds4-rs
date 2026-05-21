@@ -505,19 +505,28 @@ pub fn find_prefix_match(
     entries
         .flatten()
         .par_bridge()
-        .filter(|entry| entry.path().extension().is_some_and(|e| e == "kvc"))
         .filter_map(|entry| {
             let path = entry.path();
-            let (cached_tokens, _ctx, total) =
-                read_token_ids_limited(&path, query_tokens.len()).ok()?;
-            let common = common_prefix_len(&cached_tokens, query_tokens);
-            // The entire cached sequence must be a prefix of the query.
-            // Allow exact matches (total == query_tokens.len()) — the caller
-            // handles the empty-suffix case by re-evaluating the last token.
-            if common > 0 && common == cached_tokens.len() && total <= query_tokens.len() {
-                Some((path, common))
-            } else {
-                None
+            if !path.extension().is_some_and(|e| e == "kvc") {
+                return None;
+            }
+            match read_token_ids_limited(&path, query_tokens.len()) {
+                Ok((cached_tokens, _ctx, total)) => {
+                    let common = common_prefix_len(&cached_tokens, query_tokens);
+                    // The entire cached sequence must be a prefix of the query.
+                    // Allow exact matches (total == query_tokens.len()) — the caller
+                    // handles the empty-suffix case by re-evaluating the last token.
+                    if common > 0 && common == cached_tokens.len() && total <= query_tokens.len()
+                    {
+                        Some((path, common))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("KVC: skipping {}: {e}", path.display());
+                    None
+                }
             }
         })
         .reduce_with(|a, b| if a.1 >= b.1 { a } else { b })

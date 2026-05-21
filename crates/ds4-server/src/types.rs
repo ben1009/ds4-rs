@@ -46,6 +46,29 @@ pub struct OpenaiUsage {
     pub total_tokens: u32,
 }
 
+// ── OpenAI streaming chunk types ────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiChatChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<OpenaiChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiChunkChoice {
+    pub index: u32,
+    pub delta: OpenaiDelta,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiDelta {
+    pub content: Option<String>,
+}
+
 // ── Anthropic Messages ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -125,7 +148,46 @@ pub struct AnthropicDelta {
 pub struct AnthropicStreamStop {
     #[serde(rename = "type")]
     pub event_type: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicStreamContentBlockStart {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub index: u32,
+    pub content_block: AnthropicContentBlock,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    pub block_type: String,
+    pub text: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicStreamContentBlockStop {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub index: u32,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicStreamMessageDelta {
+    #[serde(rename = "type")]
+    pub event_type: String,
+    pub delta: AnthropicMessageDelta,
+    pub usage: AnthropicStreamUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicMessageDelta {
     pub stop_reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AnthropicStreamUsage {
+    pub output_tokens: u32,
 }
 
 // ── Shared ───────────────────────────────────────────────────────────────────
@@ -262,11 +324,23 @@ mod tests {
 
         let stop = AnthropicStreamStop {
             event_type: "message_stop".into(),
-            stop_reason: "end_turn".into(),
         };
         let json = serde_json::to_string(&stop).unwrap();
         assert!(json.contains("\"type\":\"message_stop\""));
+
+        let msg_delta = AnthropicStreamMessageDelta {
+            event_type: "message_delta".into(),
+            delta: AnthropicMessageDelta {
+                stop_reason: "end_turn".into(),
+            },
+            usage: AnthropicStreamUsage {
+                output_tokens: 5,
+            },
+        };
+        let json = serde_json::to_string(&msg_delta).unwrap();
+        assert!(json.contains("\"type\":\"message_delta\""));
         assert!(json.contains("\"stop_reason\":\"end_turn\""));
+        assert!(json.contains("\"output_tokens\":5"));
     }
 
     #[test]

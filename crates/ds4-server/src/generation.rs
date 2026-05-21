@@ -61,14 +61,15 @@ pub fn spawn_worker(
 }
 
 fn kvc_save_path(cache_dir: &Path, tokens: &[u32]) -> PathBuf {
-    use std::{
-        collections::hash_map::DefaultHasher,
-        hash::{Hash, Hasher},
-    };
-
-    let mut hasher = DefaultHasher::new();
-    tokens.hash(&mut hasher);
-    let hash = hasher.finish();
+    // FNV-1a — stable across compiler versions, unlike DefaultHasher.
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for tok in tokens {
+        let bytes = tok.to_le_bytes();
+        for b in bytes {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+    }
     cache_dir.join(format!("{hash:016x}.kvc"))
 }
 

@@ -55,7 +55,10 @@ pub async fn openai_chat_completions(
     }
 
     if req.stream {
-        sse::stream_from_receiver(rx).into_response()
+        let req_id = request_id();
+        let model_name = req.model.unwrap_or_else(|| "ds4".into());
+        let created = timestamp();
+        sse::stream_from_receiver(req_id, model_name, created, rx).into_response()
     } else {
         let mut content = String::new();
         let mut prompt_tok_count = 0u32;
@@ -145,6 +148,7 @@ pub async fn anthropic_messages(
 
     if req.stream {
         let stream = async_stream::stream! {
+            // message_start
             let start = AnthropicStreamStart {
                 event_type: "message_start".into(),
                 message: AnthropicStreamMessage {
@@ -160,10 +164,27 @@ pub async fn anthropic_messages(
                     .data(serde_json::to_string(&start).unwrap_or_default()),
             );
 
+            // content_block_start
+            let block_start = AnthropicStreamContentBlockStart {
+                event_type: "content_block_start".into(),
+                index: 0,
+                content_block: AnthropicContentBlock {
+                    block_type: "text".into(),
+                    text: String::new(),
+                },
+            };
+            yield Ok(
+                axum::response::sse::Event::default()
+                    .event("content_block_start")
+                    .data(serde_json::to_string(&block_start).unwrap_or_default()),
+            );
+
+            let mut completion_tokens = 0u32;
             let mut stream = rx;
             while let Some(event) = stream.recv().await {
                 match event {
                     GenerationEvent::Token(text) => {
+                        completion_tokens += 1;
                         let delta = AnthropicStreamDelta {
                             event_type: "content_block_delta".into(),
                             delta: AnthropicDelta {
@@ -178,9 +199,34 @@ pub async fn anthropic_messages(
                         );
                     }
                     GenerationEvent::Done { .. } => {
+                        // content_block_stop
+                        let block_stop = AnthropicStreamContentBlockStop {
+                            event_type: "content_block_stop".into(),
+                            index: 0,
+                        };
+                        yield Ok(
+                            axum::response::sse::Event::default()
+                                .event("content_block_stop")
+                                .data(serde_json::to_string(&block_stop).unwrap_or_default()),
+                        );
+                        // message_delta (carries stop_reason + usage)
+                        let msg_delta = AnthropicStreamMessageDelta {
+                            event_type: "message_delta".into(),
+                            delta: AnthropicMessageDelta {
+                                stop_reason: "end_turn".into(),
+                            },
+                            usage: AnthropicStreamUsage {
+                                output_tokens: completion_tokens,
+                            },
+                        };
+                        yield Ok(
+                            axum::response::sse::Event::default()
+                                .event("message_delta")
+                                .data(serde_json::to_string(&msg_delta).unwrap_or_default()),
+                        );
+                        // message_stop
                         let stop = AnthropicStreamStop {
                             event_type: "message_stop".into(),
-                            stop_reason: "end_turn".into(),
                         };
                         yield Ok(
                             axum::response::sse::Event::default()
