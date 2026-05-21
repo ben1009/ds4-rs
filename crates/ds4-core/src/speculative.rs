@@ -79,6 +79,9 @@ pub fn generate_speculative(
     let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
     let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
 
+    // Snapshot MTP KV cache before drafting for atomic rollback on error.
+    mtp_state.snapshot_kv();
+
     let draft_result = {
         let s_prev_hidden = &mut session.s_prev_hidden;
 
@@ -98,8 +101,8 @@ pub fn generate_speculative(
     let drafts = match draft_result {
         Ok(d) => d,
         Err(e) => {
-            // Restore mtp_state to session before returning the error,
-            // otherwise subsequent calls will find session.mtp_state == None.
+            // Restore MTP KV cache and mtp_state to session before returning.
+            mtp_state.restore_kv();
             session.mtp_state = Some(mtp_state);
             return Err(e);
         }
@@ -116,12 +119,13 @@ pub fn generate_speculative(
     }
 
     // === Verification phase ===
-    // Snapshot the KV cache, token length, and logits before verification.
-    // We use eval_token_no_snapshot during verification so that eval_token_inner
-    // does not overwrite this snapshot with per-token rollback state.
+    // Snapshot main model and MTP KV caches, token length, and logits before
+    // verification. We use eval_token_no_snapshot during verification so that
+    // eval_token_inner does not overwrite this snapshot with per-token rollback state.
     session.snapshot_kv();
     let tokens_snapshot = session.tokens().len();
     session.snapshot_logits();
+    session.mtp_state.as_mut().unwrap().snapshot_kv();
 
     // Evaluate main_token (always accepted).
     // Use a closure to capture errors and restore KV cache + tokens on failure.
@@ -146,13 +150,14 @@ pub fn generate_speculative(
         Ok(accepted)
     })();
 
-    // If verification failed, restore KV cache, tokens, pos, and logits.
+    // If verification failed, restore KV cache, tokens, pos, logits, and MTP KV.
     let accepted = match verify_result {
         Ok(accepted) => accepted,
         Err(e) => {
             session.restore_kv();
             session.truncate_tokens(tokens_snapshot);
             session.restore_logits();
+            session.mtp_state.as_mut().unwrap().restore_kv();
             return Err(e);
         }
     };

@@ -14,7 +14,7 @@ use crate::{
     model::{
         WeightMap,
         forward::{embed_token, output_hc_weights},
-        kv_cache::KvCache,
+        kv_cache::{KvCache, KvCacheSnapshot},
         layer::LayerWeights,
     },
     ops::{
@@ -75,6 +75,8 @@ impl<'a> MtpWeights<'a> {
 pub struct MtpState {
     /// KV cache for the single MTP transformer block (1 layer, no compressor/indexer).
     pub kv_cache: KvCache,
+    /// Reusable rollback snapshot for the MTP KV cache.
+    kv_snapshot: KvCacheSnapshot,
     /// Collapsed hidden state `[n_embd]` from the last MTP forward step.
     /// Zeros on first use; updated after each `mtp_forward` call.
     pub prev_hidden: Vec<f32>,
@@ -123,8 +125,11 @@ impl MtpState {
         let hc_dim = n_hc
             .checked_mul(n_embd)
             .ok_or_else(|| anyhow::anyhow!("MtpState: HC dim overflow"))?;
+        let kv_cache = KvCache::new(1, ctx_size as usize)?;
+        let kv_snapshot = KvCacheSnapshot::with_shape(&kv_cache);
         Ok(Self {
-            kv_cache: KvCache::new(1, ctx_size as usize)?,
+            kv_cache,
+            kv_snapshot,
             prev_hidden: vec![0.0f32; n_embd],
             heads_scratch: vec![0.0f32; q_dim],
             logits: vec![0.0f32; n_vocab],
@@ -189,6 +194,16 @@ impl MtpState {
         self.prev_hidden.fill(0.0);
         self.kv_cache.clear_all();
     }
+
+    /// Snapshot the MTP KV cache into the reusable rollback buffer.
+    pub fn snapshot_kv(&mut self) {
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+    }
+
+    /// Restore the MTP KV cache from the rollback snapshot.
+    pub fn restore_kv(&mut self) {
+        self.kv_cache.restore(&self.kv_snapshot);
+    }
 }
 
 /// Run the MTP forward pass for one draft token.
@@ -246,9 +261,12 @@ pub fn mtp_forward(
     hc_from_plain_embedding(&mut mtp_state.s_hproj_hc, &mtp_state.s_hproj, n_embd, n_hc);
 
     // 8. Combine: eproj_hc + hproj_hc.
-    for i in 0..mtp_state.s_residual_hc.len() {
-        mtp_state.s_residual_hc[i] = mtp_state.s_eproj_hc[i] + mtp_state.s_hproj_hc[i];
-    }
+    mtp_state
+        .s_residual_hc
+        .iter_mut()
+        .zip(mtp_state.s_eproj_hc.iter())
+        .zip(mtp_state.s_hproj_hc.iter())
+        .for_each(|((res, e), h)| *res = e + h);
 
     // 9. Run the single transformer block (attention + FFN with HC pre/post).
     crate::model::forward::run_transformer_block(
