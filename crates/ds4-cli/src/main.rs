@@ -325,7 +325,10 @@ fn repl(
                             tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
                             session = loaded;
                             if suffix.is_empty() {
-                                let _ = session.recompute_last_logits();
+                                if let Err(err) = session.recompute_last_logits() {
+                                    writeln!(out, "error: {err}")?;
+                                    continue;
+                                }
                             } else if let Err(err) = session.prefill(&suffix) {
                                 writeln!(out, "error: {err}")?;
                                 continue;

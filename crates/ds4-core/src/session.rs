@@ -221,13 +221,18 @@ impl Session {
             .tokens
             .last()
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
+        // Snapshot KV + state before modification for atomic rollback.
         let saved_len = self.tokens.len();
         let saved_pos = self.pos;
+        let saved_logits = self.logits.clone();
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         self.tokens.pop();
         self.pos -= 1;
-        if let Err(err) = self.eval_token_inner(last, true) {
+        if let Err(err) = self.eval_token_inner(last, false) {
             self.tokens.truncate(saved_len);
             self.pos = saved_pos;
+            self.logits = saved_logits;
+            self.kv_cache.restore(&self.kv_snapshot);
             return Err(err);
         }
         Ok(&self.logits)
