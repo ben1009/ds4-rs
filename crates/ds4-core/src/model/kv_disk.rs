@@ -22,6 +22,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 
 use super::kv_cache::{HEAD_DIM, IDX_DIM, SWA};
 use crate::{config::layer_compress_ratio, engine::Engine, session::Session};
@@ -396,6 +397,189 @@ pub fn load_session(path: &Path, engine: &Arc<Engine>) -> Result<Session> {
     Ok(session)
 }
 
+/// Load a KVC session from `path` into an existing `Session`, reusing its
+/// pre-allocated buffers (KV cache, logits, scratch space). This avoids the
+/// heap churn of creating a new `Session` via [`load_session`].
+///
+/// The existing session is invalidated first. The `ctx_size` in the file must
+/// match the session's `ctx_size`; if not, an error is returned.
+pub fn load_session_into(path: &Path, session: &mut Session, engine: &Arc<Engine>) -> Result<()> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("KVC: cannot open {}", path.display()))?;
+    let mut r = BufReader::new(file);
+
+    let header = read_header(&mut r)?;
+    if header.magic != *KVC_MAGIC {
+        bail!("KVC: bad magic: {:?}", header.magic);
+    }
+    if header.version != KVC_VERSION {
+        bail!("KVC: unsupported version {}", header.version);
+    }
+
+    let config = &engine.config;
+    let n_layer = config.n_layer as usize;
+    let n_vocab = config.n_vocab as usize;
+
+    // Validate ctx_size matches
+    if header.context_size != session.ctx_size() {
+        bail!(
+            "KVC: ctx_size mismatch: file={}, session={}",
+            header.context_size,
+            session.ctx_size()
+        );
+    }
+
+    // Text section (skip — tokens are authoritative)
+    let text_len = read_u32(&mut r)? as u64;
+    skip_bytes(&mut r, text_len)?;
+
+    // Clear existing session state but keep buffers
+    session.invalidate();
+
+    // Load DSV4 payload into existing session
+    load_dsv4_payload_into(&mut r, session, engine, n_layer, n_vocab, &header)?;
+
+    Ok(())
+}
+
+fn load_dsv4_payload_into(
+    r: &mut impl Read,
+    session: &mut Session,
+    _engine: &Arc<Engine>,
+    n_layer: usize,
+    n_vocab: usize,
+    header: &KvcHeader,
+) -> Result<()> {
+    let dsv4_magic = read_u32(r)?;
+    if dsv4_magic != DSV4_MAGIC {
+        bail!("KVC/DSV4: bad magic: 0x{dsv4_magic:08X}");
+    }
+    let _dsv4_version = read_u32(r)?;
+    let _ctx_size = read_u32(r)?;
+    let _prefill_cap = read_u32(r)?;
+    let raw_cap = read_u32(r)?;
+    let _raw_window = read_u32(r)?;
+    let _comp_cap = read_u32(r)?;
+    let token_count = read_u32(r)?;
+    let file_layer_count = read_u32(r)?;
+    let file_head_dim = read_u32(r)?;
+    let file_idx_head_dim = read_u32(r)?;
+    let file_vocab_size = read_u32(r)?;
+    let raw_live = read_u32(r)?;
+
+    if file_layer_count as usize != n_layer {
+        bail!("DSV4: layer_count mismatch: file={file_layer_count}, engine={n_layer}");
+    }
+    if file_head_dim as usize != HEAD_DIM {
+        bail!("DSV4: head_dim mismatch: file={file_head_dim}, engine={HEAD_DIM}");
+    }
+    if file_idx_head_dim as usize != IDX_DIM {
+        bail!("DSV4: indexer_head_dim mismatch: file={file_idx_head_dim}, engine={IDX_DIM}");
+    }
+    if file_vocab_size as usize != n_vocab {
+        bail!("DSV4: vocab_size mismatch: file={file_vocab_size}, engine={n_vocab}");
+    }
+    if token_count != header.cached_token_count {
+        bail!(
+            "DSV4: token_count mismatch: payload={token_count}, header={}",
+            header.cached_token_count
+        );
+    }
+    if raw_live > raw_cap {
+        bail!("DSV4: raw_live ({raw_live}) > raw_cap ({raw_cap})");
+    }
+    let expected_cap_raw = SWA.min(session.ctx_size() as usize).max(1);
+    if raw_live as usize > expected_cap_raw {
+        bail!("DSV4: raw_live ({raw_live}) > expected cap_raw ({expected_cap_raw})");
+    }
+
+    if token_count > header.context_size {
+        bail!(
+            "DSV4: token_count {token_count} exceeds context_size {}",
+            header.context_size
+        );
+    }
+
+    // Read token IDs
+    let mut tokens = Vec::with_capacity(token_count as usize);
+    for _ in 0..token_count {
+        let tok = read_u32(r)?;
+        if tok >= file_vocab_size {
+            bail!("DSV4: token ID {tok} >= vocab_size {file_vocab_size}");
+        }
+        tokens.push(tok);
+    }
+
+    // Skip logits
+    skip_bytes(r, (n_vocab as u64) * 4)?;
+
+    // Read compressed row counts per layer
+    let mut comp_counts = Vec::with_capacity(n_layer);
+    for _ in 0..n_layer {
+        comp_counts.push(read_u32(r)? as usize);
+    }
+
+    let mut idx_counts = Vec::with_capacity(n_layer);
+    for _ in 0..n_layer {
+        idx_counts.push(read_u32(r)? as usize);
+    }
+
+    // Per-layer data
+    for il in 0..n_layer {
+        let ratio = layer_compress_ratio(il as u32);
+
+        let mut row = [0.0f32; HEAD_DIM];
+        for _ in 0..raw_live as usize {
+            read_f32_slice(r, &mut row)?;
+            session.kv_cache_mut().layer_mut(il).push(&row);
+        }
+
+        if ratio != 0 {
+            let n_comp = comp_counts[il];
+            let comp = session.kv_cache_mut().compressor_mut(il).unwrap();
+            if n_comp > comp.comp_cap {
+                bail!(
+                    "DSV4: n_comp {n_comp} exceeds capacity {} at layer {il}",
+                    comp.comp_cap
+                );
+            }
+
+            read_f32_slice(r, &mut comp.state_kv)?;
+            read_f32_slice(r, &mut comp.state_score)?;
+
+            for _ in 0..n_comp {
+                read_f32_slice(r, &mut row)?;
+                comp.push_comp(&row)?;
+            }
+        }
+
+        if ratio == 4 {
+            let n_idx = idx_counts[il];
+            let idx = session.kv_cache_mut().indexer_mut(il).unwrap();
+            if n_idx > idx.comp_cap {
+                bail!(
+                    "DSV4: n_idx {n_idx} exceeds capacity {} at layer {il}",
+                    idx.comp_cap
+                );
+            }
+
+            read_f32_slice(r, &mut idx.state_kv)?;
+            read_f32_slice(r, &mut idx.state_score)?;
+
+            let mut idx_row = [0.0f32; IDX_DIM];
+            for _ in 0..n_idx {
+                read_f32_slice(r, &mut idx_row)?;
+                idx.push_comp(&idx_row)?;
+            }
+        }
+    }
+
+    // Restore tokens and position
+    session.restore_from_tokens(tokens)?;
+
+    Ok(())
+}
+
 // ── Prefix matching ─────────────────────────────────────────────────────────
 
 /// Lightweight scan: read just the token IDs from a KVC file.
@@ -501,37 +685,33 @@ pub fn find_prefix_match(
         Err(_) => return None,
     };
 
-    let mut best: Option<(std::path::PathBuf, usize)> = None;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "kvc") {
-            continue;
-        }
-        let (cached_tokens, _ctx, total) = match read_token_ids_limited(&path, query_tokens.len()) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("KVC: skipping {}: {e}", path.display());
-                continue;
+    entries
+        .flatten()
+        .par_bridge()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.extension().is_some_and(|e| e == "kvc") {
+                return None;
             }
-        };
-        let common = common_prefix_len(&cached_tokens, query_tokens);
-        // The entire cached sequence must be a prefix of the query.
-        // If cached_tokens was truncated (total > cached.len()), the full
-        // sequence can't be a prefix since we already matched all we read
-        // but there are more tokens in the file.
-        // Allow exact matches (total == query_tokens.len()) — the caller
-        // handles the empty-suffix case by re-evaluating the last token.
-        if common > 0
-            && common == cached_tokens.len()
-            && total <= query_tokens.len()
-            && best.as_ref().is_none_or(|(_, prev)| common > *prev)
-        {
-            best = Some((path, common));
-        }
-    }
-
-    best
+            match read_token_ids_limited(&path, query_tokens.len()) {
+                Ok((cached_tokens, _ctx, total)) => {
+                    let common = common_prefix_len(&cached_tokens, query_tokens);
+                    // The entire cached sequence must be a prefix of the query.
+                    // Allow exact matches (total == query_tokens.len()) — the caller
+                    // handles the empty-suffix case by re-evaluating the last token.
+                    if common > 0 && common == cached_tokens.len() && total <= query_tokens.len() {
+                        Some((path, common))
+                    } else {
+                        None
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("KVC: skipping {}: {e}", path.display());
+                    None
+                }
+            }
+        })
+        .reduce_with(|a, b| if a.1 >= b.1 { a } else { b })
 }
 
 /// Load the best prefix-matching KVC session from `cache_dir` for
@@ -540,8 +720,9 @@ pub fn find_prefix_match(
 pub fn load_prefix_match(
     cache_dir: &Path,
     query_tokens: &[u32],
+    session: &mut Session,
     engine: &Arc<Engine>,
-) -> Result<Option<(Session, Vec<u32>)>> {
+) -> Result<Option<Vec<u32>>> {
     let (path, common_len) = match find_prefix_match(cache_dir, query_tokens) {
         Some(v) => v,
         None => return Ok(None),
@@ -553,9 +734,9 @@ pub fn load_prefix_match(
         common_len
     );
 
-    let session = load_session(&path, engine)?;
+    load_session_into(&path, session, engine)?;
     let suffix = query_tokens[common_len..].to_vec();
-    Ok(Some((session, suffix)))
+    Ok(Some(suffix))
 }
 
 fn read_dsv4_payload(
@@ -1045,8 +1226,10 @@ mod tests {
         save_session(&dir.join("cached.kvc"), &s, SaveReason::Manual).unwrap();
 
         let query = vec![10, 20, 30, 40, 50, 60];
-        let result = load_prefix_match(&dir, &query, &engine).unwrap();
-        let (session, suffix) = result.unwrap();
+        let mut session = Session::new(engine.clone(), 2048).unwrap();
+        let suffix = load_prefix_match(&dir, &query, &mut session, &engine)
+            .unwrap()
+            .unwrap();
 
         assert_eq!(session.tokens(), &[10, 20, 30, 40]);
         assert_eq!(suffix, vec![50, 60]);
@@ -1066,8 +1249,11 @@ mod tests {
 
         // Exact match returns session with empty suffix
         let query = vec![10, 20, 30];
-        let (loaded, suffix) = load_prefix_match(&dir, &query, &engine).unwrap().unwrap();
-        assert_eq!(loaded.tokens(), &[10, 20, 30]);
+        let mut session = Session::new(engine.clone(), 2048).unwrap();
+        let suffix = load_prefix_match(&dir, &query, &mut session, &engine)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.tokens(), &[10, 20, 30]);
         assert!(suffix.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
