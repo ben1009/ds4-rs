@@ -234,6 +234,7 @@ impl Session {
     ///
     /// Used by speculative decoding to undo tokens pushed during verification
     /// before re-evaluating only the accepted prefix.
+    #[allow(dead_code)]
     pub(crate) fn truncate_tokens(&mut self, len: usize) {
         self.tokens.truncate(len);
         self.pos = self.tokens.len() as u32;
