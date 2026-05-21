@@ -14,49 +14,53 @@ pub fn stream_from_receiver(
     created: u64,
     rx: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let stream = ReceiverStream::new(rx).map(move |event| -> Vec<Result<Event, Infallible>> {
-        match event {
-            GenerationEvent::Token(text) => {
-                let chunk = OpenaiChatChunk {
-                    id: request_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model.clone(),
-                    choices: vec![OpenaiChunkChoice {
-                        index: 0,
-                        delta: OpenaiDelta {
-                            content: Some(text),
-                        },
-                        finish_reason: None,
-                    }],
-                };
-                vec![Ok(Event::default()
-                    .data(serde_json::to_string(&chunk).unwrap_or_default()))]
+    let stream = ReceiverStream::new(rx)
+        .map(move |event| -> Vec<Result<Event, Infallible>> {
+            match event {
+                GenerationEvent::Token(text) => {
+                    let chunk = OpenaiChatChunk {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![OpenaiChunkChoice {
+                            index: 0,
+                            delta: OpenaiDelta {
+                                content: Some(text),
+                            },
+                            finish_reason: None,
+                        }],
+                    };
+                    vec![Ok(
+                        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
+                    )]
+                }
+                GenerationEvent::Done { finish_reason, .. } => {
+                    let chunk = OpenaiChatChunk {
+                        id: request_id.clone(),
+                        object: "chat.completion.chunk".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![OpenaiChunkChoice {
+                            index: 0,
+                            delta: OpenaiDelta { content: None },
+                            finish_reason: Some(finish_reason.into()),
+                        }],
+                    };
+                    vec![
+                        Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())),
+                        Ok(Event::default().data("[DONE]")),
+                    ]
+                }
+                GenerationEvent::Error(msg) => {
+                    vec![Ok(
+                        Event::default().data(serde_json::json!({"error": msg}).to_string())
+                    )]
+                }
             }
-            GenerationEvent::Done { finish_reason, .. } => {
-                let chunk = OpenaiChatChunk {
-                    id: request_id.clone(),
-                    object: "chat.completion.chunk".into(),
-                    created,
-                    model: model.clone(),
-                    choices: vec![OpenaiChunkChoice {
-                        index: 0,
-                        delta: OpenaiDelta { content: None },
-                        finish_reason: Some(finish_reason.into()),
-                    }],
-                };
-                vec![
-                    Ok(Event::default()
-                        .data(serde_json::to_string(&chunk).unwrap_or_default())),
-                    Ok(Event::default().data("[DONE]")),
-                ]
-            }
-            GenerationEvent::Error(msg) => {
-                vec![Ok(Event::default()
-                    .data(serde_json::json!({"error": msg}).to_string()))]
-            }
-        }
-    }).flat_map(|events| stream::iter(events));
+        })
+        .flat_map(stream::iter);
 
     Sse::new(stream)
 }

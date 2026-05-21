@@ -81,7 +81,9 @@ pub async fn openai_chat_completions(
                 GenerationEvent::Error(msg) => {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(serde_json::json!({"error": {"message": msg, "type": "server_error"}})),
+                        Json(
+                            serde_json::json!({"error": {"message": msg, "type": "server_error"}}),
+                        ),
                     )
                         .into_response();
                 }

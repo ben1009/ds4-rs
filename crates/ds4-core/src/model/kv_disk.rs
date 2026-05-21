@@ -516,8 +516,7 @@ pub fn find_prefix_match(
                     // The entire cached sequence must be a prefix of the query.
                     // Allow exact matches (total == query_tokens.len()) — the caller
                     // handles the empty-suffix case by re-evaluating the last token.
-                    if common > 0 && common == cached_tokens.len() && total <= query_tokens.len()
-                    {
+                    if common > 0 && common == cached_tokens.len() && total <= query_tokens.len() {
                         Some((path, common))
                     } else {
                         None

@@ -334,9 +334,7 @@ mod tests {
             delta: AnthropicMessageDelta {
                 stop_reason: "end_turn".into(),
             },
-            usage: AnthropicStreamUsage {
-                output_tokens: 5,
-            },
+            usage: AnthropicStreamUsage { output_tokens: 5 },
         };
         let json = serde_json::to_string(&msg_delta).unwrap();
         assert!(json.contains("\"type\":\"message_delta\""));
