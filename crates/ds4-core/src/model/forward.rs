@@ -114,9 +114,11 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
             &mut s_out_plain,
         )?;
         session.last_hidden.copy_from_slice(&s_out_plain);
-        let mut logits = vec![0.0f32; config.n_vocab as usize];
-        output_head_project(model, config, &s_out_plain, &mut logits, &mut s_out_norm)?;
-        Ok(logits)
+        // Reuse session.logits buffer to avoid per-token heap allocation.
+        session.logits.resize(config.n_vocab as usize, 0.0);
+        session.logits.fill(0.0);
+        output_head_project(model, config, &s_out_plain, &mut session.logits, &mut s_out_norm)?;
+        Ok(std::mem::take(&mut session.logits))
     })();
 
     // Restore the scratch buffers no matter what — capacity preserved.

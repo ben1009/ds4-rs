@@ -16,7 +16,7 @@ pub struct Session {
     tokens: Vec<u32>,
     pos: u32,
     ctx_size: u32,
-    logits: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
     kv_cache: KvCache,
     /// Reusable rollback buffer. Sized once at session creation; refilled
     /// by `kv_cache.snapshot_into` on each `eval_token` so a mid-forward

@@ -69,6 +69,9 @@ pub fn generate_speculative(
     let mut mtp_state = session.mtp_state.take().unwrap();
     let main_hidden = session.last_hidden().to_vec();
     let pos = session.pos();
+    // The last token in the sequence (at position pos). MTP embeds this token
+    // and predicts the next position (pos + 1), which is what main_token is.
+    let input_token = *session.tokens().last().unwrap();
 
     // Parse MTP weights outside the mutable borrow of mtp_state.
     let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
@@ -83,6 +86,7 @@ pub fn generate_speculative(
             &engine.weights,
             engine,
             main_token,
+            input_token,
             pos,
             &main_hidden,
             spec_config.mtp_draft_tokens,
@@ -147,17 +151,19 @@ pub fn generate_speculative(
         let n_embd = engine.config.n_embd as usize;
 
         // Restore prev_hidden to the state after the last accepted draft.
-        // hidden_snapshots[i] is MTP state after drafts[i].
+        // hidden_snapshots[i] is MTP state after generating drafts[i].
         // n_accepted includes main_token, so m = n_accepted - 1 draft tokens accepted.
         // Last accepted draft is drafts[m-1] = drafts[n_accepted - 2].
-        if n_accepted >= 2 && n_accepted - 1 <= mtp_state.hidden_snapshot_count() {
+        // The state after generating drafts[n_accepted - 2] is snapshots[n_accepted - 2].
+        if n_accepted >= 2 && n_accepted - 2 < mtp_state.hidden_snapshot_count() {
             mtp_state.restore_hidden_snapshot(n_accepted - 2, n_embd);
         }
 
         // Pop rejected entries from MTP KV cache.
         // Each draft runs mtp_forward which pushes one KV entry.
+        // total_drafts KV entries were pushed (one per draft).
         // Accepted draft tokens = m = n_accepted - 1.
-        // Rejected drafts = total_drafts - m = total_drafts - (n_accepted - 1).
+        // We keep the first m entries, pop the rest.
         let rejected = total_drafts.saturating_sub(n_accepted - 1);
         for _ in 0..rejected {
             mtp_state.kv_cache.pop_last_row();
@@ -181,6 +187,7 @@ fn draft_tokens(
     main_weights: &crate::model::WeightMap,
     engine: &Engine,
     main_token: u32,
+    input_token: u32,
     pos: u32,
     main_hidden: &[f32],
     max_drafts: usize,
@@ -193,13 +200,14 @@ fn draft_tokens(
     // Reset snapshot counter at start of drafting.
     mtp_state.reset_hidden_snapshots();
 
-    // Draft[0]: MTP predicts using the main model's hidden state.
+    // Draft[0]: MTP embeds input_token (the last token in the sequence at position pos)
+    // and predicts the next position (pos + 1). main_token is also for pos + 1.
     let draft0 = mtp_forward(
         mtp_state,
         mtp_weights,
         main_weights,
         engine,
-        main_token,
+        input_token,
         pos,
         main_hidden,
     )?;
