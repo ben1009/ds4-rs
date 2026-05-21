@@ -8,7 +8,7 @@ use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Result;
 use clap::Parser;
-use ds4_core::engine::Engine;
+use ds4_core::{engine::Engine, speculative::SpecConfig};
 use generation::InferenceHandle;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -27,6 +27,18 @@ struct Args {
     /// KV cache directory for session persistence
     #[arg(long)]
     kv_cache_dir: Option<PathBuf>,
+
+    /// Path to MTP draft model GGUF (enables speculative decoding)
+    #[arg(long)]
+    mtp: Option<PathBuf>,
+
+    /// Maximum number of MTP draft tokens per step
+    #[arg(long, default_value = "1")]
+    mtp_draft: usize,
+
+    /// Logit margin threshold for MTP confidence gating
+    #[arg(long, default_value = "3.0")]
+    mtp_margin: f32,
 }
 
 #[derive(Clone)]
@@ -44,13 +56,22 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     tracing::info!("loading model from {}", args.model.display());
-    let engine = Engine::open(&args.model)?;
+    let engine = match &args.mtp {
+        Some(mtp_path) => Engine::open_with_mtp(&args.model, mtp_path)?,
+        None => Engine::open(&args.model)?,
+    };
 
     if let Some(ref dir) = args.kv_cache_dir {
         std::fs::create_dir_all(dir)?;
     }
 
-    let (inference, _worker) = generation::spawn_worker(engine.clone(), args.kv_cache_dir.clone())?;
+    let spec_config = args.mtp.as_ref().map(|_| SpecConfig {
+        mtp_draft_tokens: args.mtp_draft,
+        mtp_margin: args.mtp_margin,
+    });
+
+    let (inference, _worker) =
+        generation::spawn_worker(engine.clone(), args.kv_cache_dir.clone(), spec_config)?;
 
     let state = AppState { engine, inference };
 

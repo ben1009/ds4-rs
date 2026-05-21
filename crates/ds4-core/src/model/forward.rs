@@ -78,56 +78,25 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     let result = (|| -> Result<Vec<f32>> {
         for il in 0..config.n_layer {
             let layer = LayerWeights::from_map(model, il)?;
-            let mut attn_out = vec![0.0f32; n_embd];
-            let (attn_post, attn_comb) = layer_attention_decode(
-                &mut attn_out,
+            run_transformer_block(
+                &mut residual_hc,
                 engine,
                 &layer,
-                &residual_hc,
                 session.kv_cache_mut(),
                 &mut heads_scratch,
                 il as usize,
                 pos,
-            )?;
-
-            // HC post for attention.
-            let mut after_attn_hc = vec![0.0f32; hc_dim];
-            hc_post(
-                &mut after_attn_hc,
-                &attn_out,
-                &residual_hc,
-                &attn_post,
-                &attn_comb,
-                n_embd,
-                n_hc,
-            );
-
-            // FFN sublayer.
-            let mut ffn_out = vec![0.0f32; n_embd];
-            let (ffn_post, ffn_comb) = layer_ffn_decode(
-                &mut ffn_out,
-                config,
-                &layer,
-                &after_attn_hc,
-                il as usize,
                 token,
             )?;
-
-            // HC post for FFN.
-            hc_post(
-                &mut residual_hc,
-                &ffn_out,
-                &after_attn_hc,
-                &ffn_post,
-                &ffn_comb,
-                n_embd,
-                n_hc,
-            );
         }
 
         // --- Output head ---------------------------------------------------
+        // Split into reduce (HC collapse) + project (norm + LM head) so we
+        // can capture the collapsed hidden state for MTP.
+        let plain = output_head_reduce(model, config, &residual_hc)?;
+        session.last_hidden.copy_from_slice(&plain);
         let mut logits = vec![0.0f32; config.n_vocab as usize];
-        output_head(model, config, &residual_hc, &mut logits)?;
+        output_head_project(model, config, &plain, &mut logits)?;
         Ok(logits)
     })();
 
@@ -141,7 +110,7 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
 // Embedding
 // =========================================================================
 
-fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
+pub(crate) fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
     let info = model
         .tensor_info("token_embd.weight")
         .ok_or_else(|| anyhow::anyhow!("token_embd.weight not found"))?;
@@ -179,7 +148,7 @@ fn embed_token(model: &WeightMap, token: u32, out: &mut [f32]) -> Result<()> {
 // =========================================================================
 
 #[allow(clippy::too_many_arguments)]
-fn layer_attention_decode(
+pub(crate) fn layer_attention_decode(
     out: &mut [f32],
     engine: &Engine,
     layer: &LayerWeights<'_>,
@@ -760,7 +729,7 @@ fn grouped_out_decode(
 // FFN (decode)
 // =========================================================================
 
-fn layer_ffn_decode(
+pub(crate) fn layer_ffn_decode(
     out: &mut [f32],
     config: &ModelConfig,
     layer: &LayerWeights<'_>,
@@ -1014,28 +983,83 @@ fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
 // Output head
 // =========================================================================
 
-fn output_head(
+/// Run one transformer block (attention + FFN) with HC pre/post.
+///
+/// Encapsulates the per-layer loop body from `forward_decode` so that both
+/// the main model and MTP can reuse the same code path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_transformer_block(
+    residual_hc: &mut [f32],
+    engine: &Engine,
+    layer: &LayerWeights<'_>,
+    kv_cache: &mut KvCache,
+    heads_scratch: &mut [f32],
+    il: usize,
+    pos: usize,
+    token: u32,
+) -> Result<()> {
+    let config = &engine.config;
+    let n_embd = config.n_embd as usize;
+    let n_hc = config.n_hc as usize;
+
+    // Attention sublayer.
+    let mut attn_out = vec![0.0f32; n_embd];
+    let (attn_post, attn_comb) = layer_attention_decode(
+        &mut attn_out,
+        engine,
+        layer,
+        residual_hc,
+        kv_cache,
+        heads_scratch,
+        il,
+        pos,
+    )?;
+
+    let mut after_attn_hc = vec![0.0f32; n_hc * n_embd];
+    hc_post(
+        &mut after_attn_hc,
+        &attn_out,
+        residual_hc,
+        &attn_post,
+        &attn_comb,
+        n_embd,
+        n_hc,
+    );
+
+    // FFN sublayer.
+    let mut ffn_out = vec![0.0f32; n_embd];
+    let (ffn_post, ffn_comb) =
+        layer_ffn_decode(&mut ffn_out, config, layer, &after_attn_hc, il, token)?;
+
+    hc_post(
+        residual_hc,
+        &ffn_out,
+        &after_attn_hc,
+        &ffn_post,
+        &ffn_comb,
+        n_embd,
+        n_hc,
+    );
+
+    Ok(())
+}
+
+/// First stage of the output head: HC reduction.
+///
+/// Collapses `residual_hc` (`[n_hc * n_embd]`) to a single `plain` vector
+/// (`[n_embd]`) via learned HC stream weighting. The result is the hidden
+/// state used by MTP and captured in `session.last_hidden`.
+pub(crate) fn output_head_reduce(
     model: &WeightMap,
     config: &ModelConfig,
     residual_hc: &[f32],
-    logits: &mut [f32],
-) -> Result<()> {
+) -> Result<Vec<f32>> {
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
     let hc_dim = n_hc
         .checked_mul(n_embd)
-        .ok_or_else(|| anyhow::anyhow!("output_head: HC dim overflow"))?;
+        .ok_or_else(|| anyhow::anyhow!("output_head_reduce: HC dim overflow"))?;
 
-    // Learned HC reduction (matches `output_hc_head_one` in antirez/ds4 ds4.c):
-    //   1. flat = rms_norm_no_weight(residual_hc, eps=1e-6)        // [hc_dim]
-    //   2. pre  = output_hc_fn @ flat                              // [n_hc]
-    //   3. w[i] = sigmoid_stable(pre[i] * scale[0] + base[i]) + eps_hc
-    //   4. out  = sum_h residual_hc[h] * w[h]                      // [n_embd]
-    //
-    // The bias/scale tensors are tiny F32 vectors:
-    //   * output_hc_fn.weight    F16 shape [n_hc, hc_dim]
-    //   * output_hc_scale.weight F32 scalar
-    //   * output_hc_base.weight  F32 shape [n_hc]
     let mut flat = vec![0.0f32; hc_dim];
     rms_norm_no_weight(residual_hc, 1e-6, &mut flat);
 
@@ -1050,13 +1074,25 @@ fn output_head(
 
     let mut plain = vec![0.0f32; n_embd];
     hc_weighted_sum(residual_hc, &weights, &mut plain, n_embd, n_hc);
+    Ok(plain)
+}
 
-    // Final RMSNorm.
+/// Second stage of the output head: norm + LM head projection.
+///
+/// Takes the collapsed hidden state from [`output_head_reduce`] and produces
+/// logits (`[n_vocab]`).
+pub(crate) fn output_head_project(
+    model: &WeightMap,
+    config: &ModelConfig,
+    plain: &[f32],
+    logits: &mut [f32],
+) -> Result<()> {
+    let n_embd = config.n_embd as usize;
+
     let mut norm = vec![0.0f32; n_embd];
     let output_norm = model.f32_1d("output_norm.weight", n_embd)?;
-    rms_norm(&plain, output_norm, 1e-6, &mut norm);
+    rms_norm(plain, output_norm, 1e-6, &mut norm);
 
-    // Output projection.
     let output_weight = model.q8_0("output.weight")?;
     matmul_row(output_weight, &norm, logits);
 
@@ -1072,7 +1108,7 @@ const HC_EPS: f32 = 1.0e-6;
 ///
 /// Pure math, factored out for testing — matches `output_hc_head_one` in
 /// antirez/ds4 ds4.c.
-fn output_hc_weights(pre: &[f32], scale: f32, base: &[f32], weights: &mut [f32]) {
+pub(crate) fn output_hc_weights(pre: &[f32], scale: f32, base: &[f32], weights: &mut [f32]) {
     assert_eq!(pre.len(), weights.len());
     assert_eq!(base.len(), weights.len());
     for (w, (&p, &b)) in weights.iter_mut().zip(pre.iter().zip(base.iter())) {

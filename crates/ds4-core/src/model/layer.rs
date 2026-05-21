@@ -117,9 +117,16 @@ pub struct LayerWeights<'a> {
 impl<'a> LayerWeights<'a> {
     /// Load all tensors for layer `il` from the weight map.
     pub fn from_map(map: &'a WeightMap, il: u32) -> Result<Self> {
-        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
+        Self::from_prefix(map, &format!("blk.{il}."), il)
+    }
 
-        let prefix = format!("blk.{il}.");
+    /// Load all tensors using an arbitrary tensor name prefix and layer index.
+    ///
+    /// The layer index controls compressor/indexer loading via
+    /// [`layer_compress_ratio`]. Pass `0` (or any `il < 2`) to skip
+    /// compressor/indexer — useful for standalone blocks like MTP.
+    pub fn from_prefix(map: &'a WeightMap, prefix: &str, il: u32) -> Result<Self> {
+        use crate::model::kv_cache::{K_PE_DIM, KV_LATENT_DIM};
         let n_embd = map.config.n_embd as usize;
         let n_head = map.config.n_head as usize;
         let n_hc = map.config.n_hc as usize;

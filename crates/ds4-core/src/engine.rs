@@ -28,6 +28,9 @@ pub struct Engine {
     /// `freq_base = 160_000`, `scale_factor = 16`. Built once at engine open
     /// alongside [`Engine::rope_freqs`].
     pub rope_freqs_long: RopeFreqs,
+    /// Optional MTP draft model weights loaded from a separate GGUF file.
+    /// `None` when speculative decoding is not enabled.
+    pub mtp_weights: Option<WeightMap>,
 }
 
 impl Engine {
@@ -93,7 +96,40 @@ impl Engine {
             config,
             rope_freqs,
             rope_freqs_long,
+            mtp_weights: None,
         }))
+    }
+
+    /// Load a model with an optional MTP draft model for speculative decoding.
+    ///
+    /// The MTP GGUF must have compatible `n_embd` and `n_vocab` values.
+    pub fn open_with_mtp(model_path: &Path, mtp_path: &Path) -> Result<Arc<Self>> {
+        let mut engine = Self::open(model_path)?;
+        let mtp_map = WeightMap::open(mtp_path)?;
+
+        // Validate compatibility.
+        let main = &engine.config;
+        let mtp_cfg = &mtp_map.config;
+        if mtp_cfg.n_embd != main.n_embd {
+            bail!(
+                "MTP n_embd mismatch: main={}, mtp={}",
+                main.n_embd,
+                mtp_cfg.n_embd
+            );
+        }
+        if mtp_cfg.n_vocab != main.n_vocab {
+            bail!(
+                "MTP n_vocab mismatch: main={}, mtp={}",
+                main.n_vocab,
+                mtp_cfg.n_vocab
+            );
+        }
+
+        tracing::info!("MTP draft model loaded from: {}", mtp_path.display());
+        Arc::get_mut(&mut engine)
+            .expect("open_with_mtp: sole owner")
+            .mtp_weights = Some(mtp_map);
+        Ok(engine)
     }
 }
 
