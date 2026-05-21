@@ -74,6 +74,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
     // session), then put it back in a scope guard so an early `?` doesn't
     // leak the empty Vec.
     let mut heads_scratch = std::mem::take(&mut session.heads_scratch);
+    let mut attn_out = std::mem::take(&mut session.attn_out);
+    let mut after_attn_hc = std::mem::take(&mut session.after_attn_hc);
+    let mut ffn_out = std::mem::take(&mut session.ffn_out);
     let q_dim = heads_scratch.len();
     let result = (|| -> Result<Vec<f32>> {
         for il in 0..config.n_layer {
@@ -84,6 +87,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
                 &layer,
                 session.kv_cache_mut(),
                 &mut heads_scratch,
+                &mut attn_out,
+                &mut after_attn_hc,
+                &mut ffn_out,
                 il as usize,
                 pos,
                 token,
@@ -100,9 +106,12 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
         Ok(logits)
     })();
 
-    // Restore the scratch buffer no matter what — capacity preserved.
+    // Restore the scratch buffers no matter what — capacity preserved.
     debug_assert_eq!(heads_scratch.len(), q_dim);
     session.heads_scratch = heads_scratch;
+    session.attn_out = attn_out;
+    session.after_attn_hc = after_attn_hc;
+    session.ffn_out = ffn_out;
     result
 }
 
@@ -987,6 +996,10 @@ fn topk_indices_desc(values: &[f32], k: usize, out: &mut [usize]) {
 ///
 /// Encapsulates the per-layer loop body from `forward_decode` so that both
 /// the main model and MTP can reuse the same code path.
+///
+/// `attn_out`, `after_attn_hc`, and `ffn_out` are caller-owned scratch
+/// buffers sized `[n_embd]`, `[n_hc * n_embd]`, and `[n_embd]` respectively.
+/// Hoisting them out of this function avoids per-layer heap allocations.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_transformer_block(
     residual_hc: &mut [f32],
@@ -994,6 +1007,9 @@ pub(crate) fn run_transformer_block(
     layer: &LayerWeights<'_>,
     kv_cache: &mut KvCache,
     heads_scratch: &mut [f32],
+    attn_out: &mut [f32],
+    after_attn_hc: &mut [f32],
+    ffn_out: &mut [f32],
     il: usize,
     pos: usize,
     token: u32,
@@ -1003,9 +1019,9 @@ pub(crate) fn run_transformer_block(
     let n_hc = config.n_hc as usize;
 
     // Attention sublayer.
-    let mut attn_out = vec![0.0f32; n_embd];
+    attn_out.fill(0.0);
     let (attn_post, attn_comb) = layer_attention_decode(
-        &mut attn_out,
+        attn_out,
         engine,
         layer,
         residual_hc,
@@ -1015,10 +1031,10 @@ pub(crate) fn run_transformer_block(
         pos,
     )?;
 
-    let mut after_attn_hc = vec![0.0f32; n_hc * n_embd];
+    after_attn_hc.fill(0.0);
     hc_post(
-        &mut after_attn_hc,
-        &attn_out,
+        after_attn_hc,
+        attn_out,
         residual_hc,
         &attn_post,
         &attn_comb,
@@ -1027,14 +1043,13 @@ pub(crate) fn run_transformer_block(
     );
 
     // FFN sublayer.
-    let mut ffn_out = vec![0.0f32; n_embd];
-    let (ffn_post, ffn_comb) =
-        layer_ffn_decode(&mut ffn_out, config, layer, &after_attn_hc, il, token)?;
+    ffn_out.fill(0.0);
+    let (ffn_post, ffn_comb) = layer_ffn_decode(ffn_out, config, layer, after_attn_hc, il, token)?;
 
     hc_post(
         residual_hc,
-        &ffn_out,
-        &after_attn_hc,
+        ffn_out,
+        after_attn_hc,
         &ffn_post,
         &ffn_comb,
         n_embd,

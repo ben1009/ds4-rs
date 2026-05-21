@@ -27,6 +27,12 @@ pub struct Session {
     /// forward pass takes ownership for the duration of one decode step
     /// via `mem::take` and puts it back, avoiding a per-token alloc.
     pub(crate) heads_scratch: Vec<f32>,
+    /// Reusable scratch for attention output `[n_embd]`.
+    pub(crate) attn_out: Vec<f32>,
+    /// Reusable scratch for post-attention HC state `[n_hc * n_embd]`.
+    pub(crate) after_attn_hc: Vec<f32>,
+    /// Reusable scratch for FFN output `[n_embd]`.
+    pub(crate) ffn_out: Vec<f32>,
     /// Collapsed hidden state from the most recent forward pass.
     /// `[n_embd]` vector captured after HC reduction but before output norm.
     /// Used by MTP speculative decoding as the "previous hidden state" input.
@@ -45,6 +51,10 @@ impl Session {
         let q_dim = (engine.config.n_head as usize)
             .checked_mul(engine.config.head_dim as usize)
             .ok_or_else(|| anyhow::anyhow!("Session: Q dimension overflow"))?;
+        let n_hc = engine.config.n_hc as usize;
+        let hc_dim = n_hc
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow::anyhow!("Session: HC dim overflow"))?;
         let kv_cache = KvCache::new(n_layer, ctx_size as usize)?;
         let kv_snapshot = KvCacheSnapshot::with_shape(&kv_cache);
         let mtp_state = if engine.mtp_weights.is_some() {
@@ -61,6 +71,9 @@ impl Session {
             kv_cache,
             kv_snapshot,
             heads_scratch: vec![0.0f32; q_dim],
+            attn_out: vec![0.0f32; n_embd],
+            after_attn_hc: vec![0.0f32; hc_dim],
+            ffn_out: vec![0.0f32; n_embd],
             last_hidden: vec![0.0f32; n_embd],
             mtp_state,
         })

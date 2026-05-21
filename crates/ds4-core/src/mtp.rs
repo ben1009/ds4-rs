@@ -91,6 +91,10 @@ pub struct MtpState {
     s_hproj: Vec<f32>,
     s_hproj_hc: Vec<f32>,
     s_residual_hc: Vec<f32>,
+    // Scratch buffers for run_transformer_block.
+    s_attn_out: Vec<f32>,
+    s_after_attn_hc: Vec<f32>,
+    s_ffn_out: Vec<f32>,
     // Reusable scratch buffers for mtp_output_head.
     s_out_flat: Vec<f32>,
     s_out_pre: Vec<f32>,
@@ -124,6 +128,9 @@ impl MtpState {
             s_hproj: vec![0.0f32; n_embd],
             s_hproj_hc: vec![0.0f32; hc_dim],
             s_residual_hc: vec![0.0f32; hc_dim],
+            s_attn_out: vec![0.0f32; n_embd],
+            s_after_attn_hc: vec![0.0f32; hc_dim],
+            s_ffn_out: vec![0.0f32; n_embd],
             s_out_flat: vec![0.0f32; hc_dim],
             s_out_pre: vec![0.0f32; n_hc],
             s_out_weights: vec![0.0f32; n_hc],
@@ -206,12 +213,16 @@ pub fn mtp_forward(
         &mtp_weights.block,
         &mut mtp_state.kv_cache,
         &mut mtp_state.heads_scratch,
+        &mut mtp_state.s_attn_out,
+        &mut mtp_state.s_after_attn_hc,
+        &mut mtp_state.s_ffn_out,
         0, // il = 0 (single block)
         pos as usize,
         token,
     )?;
 
     // 10. Output head using MTP's HC head + main model's output projection.
+    // mtp_output_head writes the HC-collapsed hidden state into s_out_plain.
     mtp_output_head(
         mtp_weights,
         main_weights,
@@ -230,19 +241,14 @@ pub fn mtp_forward(
         .ok_or_else(|| anyhow::anyhow!("mtp_forward: no valid token"))?;
 
     // 12. Collapse HC → prev_hidden for next step.
-    // Simple uniform stream sum: for each dim d, sum across HC streams.
-    mtp_state.prev_hidden.fill(0.0);
-    for h in 0..n_hc {
-        let offset = h * n_embd;
-        for d in 0..n_embd {
-            mtp_state.prev_hidden[d] += mtp_state.s_residual_hc[offset + d];
-        }
-    }
-    // Normalize by n_hc to keep magnitudes stable.
-    let inv_hc = 1.0 / n_hc as f32;
-    for v in &mut mtp_state.prev_hidden {
-        *v *= inv_hc;
-    }
+    // Use the learned HC head output (s_out_plain) with RMSNorm, matching
+    // how the main model captures last_hidden after HC reduction.
+    rms_norm(
+        &mtp_state.s_out_plain,
+        mtp_weights.norm,
+        1e-6,
+        &mut mtp_state.prev_hidden,
+    );
 
     Ok(draft_token)
 }
