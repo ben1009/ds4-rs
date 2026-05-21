@@ -563,9 +563,13 @@ fn load_dsv4_payload_into(
                 );
             }
 
+            read_f32_slice(r, &mut idx.state_kv)?;
+            read_f32_slice(r, &mut idx.state_score)?;
+
+            let mut idx_row = [0.0f32; IDX_DIM];
             for _ in 0..n_idx {
-                read_f32_slice(r, &mut row)?;
-                idx.push_comp(&row)?;
+                read_f32_slice(r, &mut idx_row)?;
+                idx.push_comp(&idx_row)?;
             }
         }
     }
