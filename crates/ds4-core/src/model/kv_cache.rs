@@ -301,6 +301,13 @@ impl RawLayerCache {
         self.n_raw = 0;
     }
 
+    /// Drop the last row. No-op if empty.
+    pub fn pop_row(&mut self) {
+        if self.n_raw > 0 {
+            self.n_raw -= 1;
+        }
+    }
+
     pub fn n_raw(&self) -> usize {
         self.n_raw
     }
@@ -380,6 +387,14 @@ impl KvCache {
 
     pub fn layer_mut(&mut self, il: usize) -> &mut RawLayerCache {
         &mut self.layers[il]
+    }
+
+    /// Pop the last KV row from all layers. Used by `recompute_last_logits`
+    /// to rewind the watermark before re-evaluating the last token.
+    pub fn pop_last_row(&mut self) {
+        for layer in &mut self.layers {
+            layer.pop_row();
+        }
     }
 
     /// Borrow the streaming compressor for layer `il`. Dense layers return

@@ -209,6 +209,42 @@ impl Session {
         Ok(())
     }
 
+    /// Pop the last token and re-evaluate it to recover logits.
+    ///
+    /// Used for exact prefix matches where the KV cache has all prompt tokens
+    /// but no logits are available (logits aren't saved to disk). This
+    /// overwrites the last KV row and returns logits for the next token.
+    ///
+    /// Returns `Err` if the session has no tokens.
+    pub fn recompute_last_logits(&mut self) -> Result<&[f32]> {
+        let last = *self
+            .tokens
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
+        // Snapshot everything before modification for atomic rollback.
+        let saved_pos = self.pos;
+        let saved_logits = self.logits.clone();
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+        // Pop last token, decrement pos, and rewind KV watermark so
+        // eval_token_inner overwrites the last KV row instead of appending.
+        self.tokens.pop();
+        self.pos -= 1;
+        self.kv_cache.pop_last_row();
+        // eval_token_inner pushes the token back and attempts forward.
+        // On failure it pops and restores pos, but we must also
+        // restore the token vec, logits, and KV to the pre-call state.
+        if let Err(err) = self.eval_token_inner(last, false) {
+            // eval_token_inner already popped `last` on error, so
+            // tokens.len() == saved_len - 1. Push it back.
+            self.tokens.push(last);
+            self.pos = saved_pos;
+            self.logits = saved_logits;
+            self.kv_cache.restore(&self.kv_snapshot);
+            return Err(err);
+        }
+        Ok(&self.logits)
+    }
+
     /// Greedy argmax: select the token with highest logit.
     /// NaN values are ignored. Returns `None` if `logits` is empty.
     pub fn argmax(logits: &[f32]) -> Option<u32> {
@@ -235,6 +271,11 @@ impl Session {
 
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// Current logits from the most recent `prefill` or `eval_token`.
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
     }
 
     pub fn engine(&self) -> &Engine {
