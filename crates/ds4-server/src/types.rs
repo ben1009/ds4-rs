@@ -128,6 +128,7 @@ pub struct AnthropicStreamMessage {
     pub msg_type: String,
     pub role: String,
     pub model: String,
+    pub usage: AnthropicUsage,
 }
 
 #[derive(Debug, Serialize)]
@@ -307,10 +308,15 @@ mod tests {
                 msg_type: "message".into(),
                 role: "assistant".into(),
                 model: "ds4".into(),
+                usage: AnthropicUsage {
+                    input_tokens: 10,
+                    output_tokens: 0,
+                },
             },
         };
         let json = serde_json::to_string(&start).unwrap();
         assert!(json.contains("\"type\":\"message_start\""));
+        assert!(json.contains("\"input_tokens\":10"));
 
         let delta = AnthropicStreamDelta {
             event_type: "content_block_delta".into(),

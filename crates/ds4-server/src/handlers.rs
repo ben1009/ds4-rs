@@ -132,6 +132,7 @@ pub async fn anthropic_messages(
 
     let prompt = chat_template::render(&messages);
     let prompt_tokens = state.engine.tokenizer.encode(&prompt, false);
+    let input_token_count = prompt_tokens.len() as u32;
 
     let (tx, rx) = mpsc::channel(64);
     let request = InferenceRequest {
@@ -161,6 +162,10 @@ pub async fn anthropic_messages(
                     msg_type: "message".into(),
                     role: "assistant".into(),
                     model: model.clone(),
+                    usage: AnthropicUsage {
+                        input_tokens: input_token_count,
+                        output_tokens: 0,
+                    },
                 },
             };
             yield Ok::<_, std::convert::Infallible>(
