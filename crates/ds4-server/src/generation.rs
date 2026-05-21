@@ -83,15 +83,13 @@ fn process_request(
 
     // Try prefix match if cache dir is set
     let suffix = if let Some(dir) = kv_cache_dir {
-        if let Some((mut loaded, suffix)) =
-            kv_disk::load_prefix_match(dir, &request.prompt_tokens, engine)?
-        {
-            std::mem::swap(session, &mut loaded);
-            suffix
-        } else {
-            // No match — reuse session memory, just clear state
-            session.invalidate();
-            request.prompt_tokens.clone()
+        match kv_disk::load_prefix_match(dir, &request.prompt_tokens, session, engine)? {
+            Some(suffix) => suffix,
+            None => {
+                // No match — reuse session memory, just clear state
+                session.invalidate();
+                request.prompt_tokens.clone()
+            }
         }
     } else {
         session.invalidate();
@@ -144,14 +142,6 @@ fn process_request(
         session.eval_token(token)?;
         token = Session::argmax(session.logits())
             .ok_or_else(|| anyhow::anyhow!("no logits after eval"))?;
-    }
-
-    // Save after generation
-    if let Some(dir) = kv_cache_dir {
-        let path = kvc_save_path(dir, &request.prompt_tokens);
-        if let Err(e) = kv_disk::save_session(&path, session, kv_disk::SaveReason::Continued) {
-            tracing::warn!("failed to save KVC after generation: {e}");
-        }
     }
 
     let _ = request.response_tx.blocking_send(GenerationEvent::Done {

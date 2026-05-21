@@ -137,20 +137,21 @@ fn one_shot(
     tracing::info!("Prompt: {} tokens", tokens.len());
 
     // Try prefix match from disk cache
-    let (mut session, suffix) = if let Some(dir) = kv_cache_dir {
-        match kv_disk::load_prefix_match(dir, &tokens, engine)? {
-            Some((session, suffix)) => {
+    let mut session = Session::new(engine.clone(), ctx)?;
+    let suffix = if let Some(dir) = kv_cache_dir {
+        match kv_disk::load_prefix_match(dir, &tokens, &mut session, engine)? {
+            Some(suffix) => {
                 tracing::info!(
                     "Prefix match: {} cached, {} suffix to prefill",
                     tokens.len() - suffix.len(),
                     suffix.len(),
                 );
-                (session, suffix)
+                suffix
             }
-            None => (Session::new(engine.clone(), ctx)?, tokens.clone()),
+            None => tokens.clone(),
         }
     } else {
-        (Session::new(engine.clone(), ctx)?, tokens.clone())
+        tokens.clone()
     };
 
     let stdout = std::io::stdout();
@@ -320,10 +321,12 @@ fn repl(
                 if session.tokens().is_empty()
                     && let Some(dir) = kv_cache_dir
                 {
-                    match kv_disk::load_prefix_match(dir, &tokens, engine) {
-                        Ok(Some((loaded, suffix))) => {
-                            tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
-                            session = loaded;
+                    match kv_disk::load_prefix_match(dir, &tokens, &mut session, engine) {
+                        Ok(Some(suffix)) => {
+                            tracing::info!(
+                                "Prefix match: {} cached tokens",
+                                session.tokens().len()
+                            );
                             if suffix.is_empty() {
                                 if let Err(err) = session.recompute_last_logits() {
                                     writeln!(out, "error: {err}")?;
