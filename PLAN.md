@@ -117,6 +117,11 @@ via the `DS4_TEST_MODEL`-gated integration test in
 - MTP draft model loading + draft-then-verify loop
 - Test vector validation against official DeepSeek API outputs
 - Full CLI arg parity (`--kv-disk-dir`, `--mtp`, `--kv-disk-space-mb`, etc.)
+- `POST /v1/completions` (raw text completion endpoint)
+- `GET /v1/models` (model listing endpoint)
+- DSML tool schema rendering + generated output parsing
+- Streaming state machine: DSML → OpenAI tool call translation
+- KV disk cache: continued/evict/shutdown saves (currently only cold saves)
 - Documentation
 
 ## Dependencies

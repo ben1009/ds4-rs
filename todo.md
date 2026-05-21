@@ -5,7 +5,7 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 
 ## Current Baseline
 
-- `cargo test --workspace` passes (500+ tests across ds4-core, ds4-cli,
+- `cargo test --workspace` passes (529 tests across ds4-core, ds4-cli,
   ds4-server; one ignored doctest and one ignored end-to-end smoke test
   gated behind `DS4_TEST_MODEL`).
 - Phase 1 forward pass is numerically complete.

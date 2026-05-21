@@ -175,7 +175,7 @@ Additional security measures:
 * **GGUF dim ordering.** The loader maps 2-D weight tensor dims `(ne0, ne1)` to `(in_features, out_features)` (matching `ggml_new_tensor_2d`). The previous flipped axes are gone; all `WeightView` constructors share the `dims_in_out` helper.
 * **Topk NaN fallback.** `topk_indices_desc` falls back to lowest unselected index when all values are NaN/-inf instead of panicking, matching the C reference's behaviour on model files with NaN F16 weights.
 * **Session lifecycle and REPL.** `Session::rewind`, `Session::invalidate`, `Session::pos`, `Session::tokens`, and `Session::ctx_size` ship in `crates/ds4-core/src/session.rs`. The CLI exposes an interactive REPL (default when no `-p` is supplied) with `/reset` (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), and `/exit` (`/quit`). Reasoning-mode toggles (`/think`, `/nothink`) and file-read (`/read`) are not yet implemented.
-* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Raw KV ring + compressor/indexer are still pending (see todo.md).
+* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Long-range context via raw KV ring + compressor/indexer is wired but numerically unvalidated (needs a healthy GGUF for sign-off).
 * **Performance:** CPU reference, single-threaded, seconds-per-token on commodity hardware. SIMD/threading/GPU are deferred.
 * **Binary name:** `ds4` (from `ds4-cli/src/main.rs`).
 * **Default model path:** `./ds4flash.gguf` (override with `--model`).
@@ -195,7 +195,7 @@ cargo build --release --bin ds4
 
 # 4. Build and run the HTTP server
 cargo build --release --bin ds4-server
-./target/release/ds4-server --model ./ds4flash.gguf --port 8080
+./target/release/ds4-server --model ./ds4flash.gguf --port 8080 --kv-cache-dir ./kvcache
 
 # 5. Regenerate vectors after an op change (manual, not in CI)
 scripts/regen_vectors.sh q8_0
