@@ -153,13 +153,17 @@ fn one_shot(
         (Session::new(engine.clone(), ctx)?, tokens.clone())
     };
 
-    // Save before generation so the cache contains only prompt tokens.
-    // This allows exact-prompt prefix matches on subsequent runs.
-    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
-
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
-    generate_turn(engine, &mut session, &suffix, max_tokens, &mut handle)?;
+
+    // Prefill the suffix so the session has the full prompt, then save
+    // and generate with an empty suffix. This ensures the cache always
+    // contains the full prompt (not an empty session for cold starts).
+    if !suffix.is_empty() {
+        session.prefill(&suffix)?;
+    }
+    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
+    generate_turn(engine, &mut session, &[], max_tokens, &mut handle)?;
 
     Ok(())
 }
@@ -352,16 +356,14 @@ fn generate_turn<W: Write>(
     max_tokens: u32,
     out: &mut W,
 ) -> Result<()> {
-    // For exact prefix matches (empty suffix), rewind one token and
-    // re-evaluate it to recover logits for generation.
+    // For exact prefix matches (empty suffix), recompute logits by
+    // popping and re-evaluating the last token. This avoids a full
+    // KV cache replay.
     let logits = if tokens.is_empty() {
-        let all = session.tokens();
-        if all.is_empty() {
+        if session.tokens().is_empty() {
             return Ok(());
         }
-        let last = *all.last().unwrap();
-        session.rewind(session.pos() - 1)?;
-        session.eval_token(last)?
+        session.recompute_last_logits()?
     } else {
         session.prefill(tokens)?
     };

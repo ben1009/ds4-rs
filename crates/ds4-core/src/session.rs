@@ -209,6 +209,23 @@ impl Session {
         Ok(())
     }
 
+    /// Pop the last token and re-evaluate it to recover logits.
+    ///
+    /// Used for exact prefix matches where the KV cache has all prompt tokens
+    /// but no logits are available (logits aren't saved to disk). This
+    /// overwrites the last KV row and returns logits for the next token.
+    ///
+    /// Returns `Err` if the session has no tokens.
+    pub fn recompute_last_logits(&mut self) -> Result<&[f32]> {
+        let last = *self
+            .tokens
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
+        self.tokens.pop();
+        self.pos -= 1;
+        self.eval_token(last)
+    }
+
     /// Greedy argmax: select the token with highest logit.
     /// NaN values are ignored. Returns `None` if `logits` is empty.
     pub fn argmax(logits: &[f32]) -> Option<u32> {
