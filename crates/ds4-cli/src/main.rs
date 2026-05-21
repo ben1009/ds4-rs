@@ -156,14 +156,18 @@ fn one_shot(
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
 
-    // Prefill the suffix so the session has the full prompt, then save
-    // and generate with an empty suffix. This ensures the cache always
-    // contains the full prompt (not an empty session for cold starts).
-    if !suffix.is_empty() {
+    // Prefill the suffix so the session has the full prompt, then save.
+    // For exact prefix matches (empty suffix), recompute logits from
+    // the last cached token. This ensures the cache always contains
+    // the full prompt and generation works in all cases.
+    if suffix.is_empty() {
+        // Exact match: session already has all tokens, recompute logits
+        session.recompute_last_logits()?;
+    } else {
         session.prefill(&suffix)?;
     }
     kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
-    generate_turn(engine, &mut session, &[], max_tokens, &mut handle)?;
+    generate_turn(engine, &mut session, max_tokens, &mut handle)?;
 
     Ok(())
 }
@@ -320,8 +324,14 @@ fn repl(
                         Ok(Some((loaded, suffix))) => {
                             tracing::info!("Prefix match: {} cached tokens", loaded.tokens().len());
                             session = loaded;
+                            if suffix.is_empty() {
+                                let _ = session.recompute_last_logits();
+                            } else if let Err(err) = session.prefill(&suffix) {
+                                writeln!(out, "error: {err}")?;
+                                continue;
+                            }
                             if let Err(err) =
-                                generate_turn(engine, &mut session, &suffix, max_tokens, &mut out)
+                                generate_turn(engine, &mut session, max_tokens, &mut out)
                             {
                                 writeln!(out, "error: {err}")?;
                             }
@@ -332,8 +342,11 @@ fn repl(
                     }
                 }
 
-                if let Err(err) = generate_turn(engine, &mut session, &tokens, max_tokens, &mut out)
-                {
+                if let Err(err) = session.prefill(&tokens) {
+                    writeln!(out, "error: {err}")?;
+                    continue;
+                }
+                if let Err(err) = generate_turn(engine, &mut session, max_tokens, &mut out) {
                     writeln!(out, "error: {err}")?;
                 }
             }
@@ -342,8 +355,9 @@ fn repl(
     }
 }
 
-/// Run one turn against an already-encoded prompt: prefill, then generate up
-/// to `max_tokens` tokens, streaming UTF-8 output. Empty input is a no-op.
+/// Generate up to `max_tokens` tokens from the current session state,
+/// streaming UTF-8 output. The session must already have logits available
+/// (from `prefill` or `recompute_last_logits`).
 ///
 /// Errors leave session state intact: `Session::prefill` and `eval_token`
 /// already roll their own state back on forward failures, so the REPL can
@@ -352,23 +366,12 @@ fn repl(
 fn generate_turn<W: Write>(
     engine: &Engine,
     session: &mut Session,
-    tokens: &[u32],
     max_tokens: u32,
     out: &mut W,
 ) -> Result<()> {
-    // For exact prefix matches (empty suffix), recompute logits by
-    // popping and re-evaluating the last token. This avoids a full
-    // KV cache replay.
-    let logits = if tokens.is_empty() {
-        if session.tokens().is_empty() {
-            return Ok(());
-        }
-        session.recompute_last_logits()?
-    } else {
-        session.prefill(tokens)?
-    };
-    let mut token =
-        Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
+    let logits = session.logits();
+    let mut token = Session::argmax(logits)
+        .ok_or_else(|| anyhow::anyhow!("no logits available for generation"))?;
     let eos = engine.tokenizer.eos_token();
     let mut pending: Vec<u8> = Vec::new();
 

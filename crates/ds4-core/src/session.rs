@@ -221,9 +221,16 @@ impl Session {
             .tokens
             .last()
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
+        let saved_len = self.tokens.len();
+        let saved_pos = self.pos;
         self.tokens.pop();
         self.pos -= 1;
-        self.eval_token(last)
+        if let Err(err) = self.eval_token_inner(last, true) {
+            self.tokens.truncate(saved_len);
+            self.pos = saved_pos;
+            return Err(err);
+        }
+        Ok(&self.logits)
     }
 
     /// Greedy argmax: select the token with highest logit.
@@ -252,6 +259,11 @@ impl Session {
 
     pub fn tokens(&self) -> &[u32] {
         &self.tokens
+    }
+
+    /// Current logits from the most recent `prefill` or `eval_token`.
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
     }
 
     pub fn engine(&self) -> &Engine {
