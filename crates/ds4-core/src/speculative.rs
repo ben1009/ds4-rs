@@ -87,7 +87,7 @@ pub fn generate_speculative(
             main_token,
             input_token,
             pos,
-            &main_hidden,
+            main_hidden,
             spec_config.mtp_draft_tokens,
             s_prev_hidden,
         )?
@@ -96,19 +96,22 @@ pub fn generate_speculative(
     session.mtp_state = Some(mtp_state);
 
     // If no drafts were generated, skip speculation.
+    // Pop the MTP KV cache entry from the failed mtp_forward call.
     if drafts.is_empty() {
+        session.mtp_state.as_mut().unwrap().kv_cache.pop_last_row();
         session.eval_token(main_token)?;
         return Ok(vec![main_token]);
     }
 
     // === Verification phase ===
-    // Snapshot the KV cache before verification. We use eval_token_no_snapshot
-    // during verification so that eval_token_inner does not overwrite this
-    // snapshot with per-token rollback state.
+    // Snapshot the KV cache and token length before verification.
+    // We use eval_token_no_snapshot during verification so that eval_token_inner
+    // does not overwrite this snapshot with per-token rollback state.
     session.snapshot_kv();
+    let tokens_snapshot = session.tokens().len();
 
     // Evaluate main_token (always accepted).
-    // Use a closure to capture errors and restore KV cache on failure.
+    // Use a closure to capture errors and restore KV cache + tokens on failure.
     let verify_result = (|| -> Result<Vec<u32>> {
         session.eval_token_no_snapshot(main_token)?;
         let mut accepted = vec![main_token];
@@ -130,11 +133,12 @@ pub fn generate_speculative(
         Ok(accepted)
     })();
 
-    // If verification failed, restore KV cache and propagate the error.
+    // If verification failed, restore KV cache, tokens, and pos.
     let accepted = match verify_result {
         Ok(accepted) => accepted,
         Err(e) => {
             session.restore_kv();
+            session.truncate_tokens(tokens_snapshot);
             return Err(e);
         }
     };
@@ -152,19 +156,18 @@ pub fn generate_speculative(
 
         // Restore prev_hidden to the state after the last accepted draft.
         // hidden_snapshots[i] is MTP state after generating drafts[i].
-        // n_accepted includes main_token, so m = n_accepted - 1 draft tokens accepted.
-        // Last accepted draft is drafts[m-1] = drafts[n_accepted - 2].
-        // The state after generating drafts[n_accepted - 2] is snapshots[n_accepted - 2].
-        if n_accepted >= 2 && n_accepted - 2 < mtp_state.hidden_snapshot_count() {
-            mtp_state.restore_hidden_snapshot(n_accepted - 2, n_embd);
+        // Verification skips drafts[0], so accepted drafts are drafts[1..n_accepted-1].
+        // Last accepted draft is drafts[n_accepted - 1].
+        // The state after generating drafts[n_accepted - 1] is snapshots[n_accepted - 1].
+        if n_accepted > 0 && n_accepted - 1 < mtp_state.hidden_snapshot_count() {
+            mtp_state.restore_hidden_snapshot(n_accepted - 1, n_embd);
         }
 
         // Pop rejected entries from MTP KV cache.
         // Each draft runs mtp_forward which pushes one KV entry.
-        // total_drafts KV entries were pushed (one per draft).
-        // Accepted draft tokens = m = n_accepted - 1.
-        // We keep the first m entries, pop the rest.
-        let rejected = total_drafts.saturating_sub(n_accepted - 1);
+        // We need to keep n_accepted entries (for input_token + accepted drafts).
+        // Pop the rest: total_drafts - n_accepted.
+        let rejected = total_drafts.saturating_sub(n_accepted);
         for _ in 0..rejected {
             mtp_state.kv_cache.pop_last_row();
         }
