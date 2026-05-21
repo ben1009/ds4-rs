@@ -448,20 +448,21 @@ fn read_token_ids_inner(
     // raw_live (5 × u32 = 20 bytes)
     skip_bytes(&mut r, 20)?;
 
-    // Read token IDs
+    // Read token IDs directly into Vec<u32> to avoid intermediate allocation
     let count = usize::try_from(token_count)
         .map_err(|_| anyhow::anyhow!("KVC: token_count {token_count} overflows usize"))?;
     let read_count = read_at_most.map_or(count, |max| count.min(max));
-    // Read all token bytes in one shot, then convert to u32
-    let mut bytes = vec![0u8; read_count * 4];
-    r.read_exact(&mut bytes)?;
-    let tokens: Vec<u32> = bytes
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect();
+    let mut tokens = Vec::with_capacity(read_count);
+    for _ in 0..read_count {
+        tokens.push(read_u32(&mut r)?);
+    }
     // Skip any remaining tokens we didn't need
     if read_count < count {
-        skip_bytes(&mut r, ((count - read_count) as u64) * 4)?;
+        let skip = (count - read_count)
+            .checked_mul(4)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or_else(|| anyhow::anyhow!("KVC: skip byte count overflow"))?;
+        skip_bytes(&mut r, skip)?;
     }
 
     Ok((tokens, header.context_size, count))
