@@ -61,14 +61,12 @@ pub fn generate_speculative(
     }
 
     // === Drafting phase ===
-    // We need to borrow session.mtp_state mutably for mtp_forward, but we
-    // can't hold that borrow across session.eval_token calls. So we do all
-    // drafting first, collecting draft tokens and hidden snapshots, then
-    // release the borrow before verification.
-
-    // Copy last_hidden into a local buffer to avoid heap allocation.
-    // We can't use MtpState's scratch buffer here because we need to
-    // borrow session immutably for last_hidden() and mutably for mtp_state.
+    // Take ownership of mtp_state to avoid borrowing session mutably and
+    // immutably at the same time. We still need .to_vec() for last_hidden
+    // because mtp_state is passed mutably to draft_tokens while main_hidden
+    // (from session.last_hidden()) must live across the call. The allocation
+    // is bounded by n_embd (typically 16KB).
+    let mut mtp_state = session.mtp_state.take().unwrap();
     let main_hidden = session.last_hidden().to_vec();
     let pos = session.pos();
 
@@ -76,12 +74,11 @@ pub fn generate_speculative(
     let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
     let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
 
-    let drafts_result = {
-        let mtp_state = session.mtp_state.as_mut().unwrap();
+    let drafts = {
         let s_prev_hidden = &mut session.s_prev_hidden;
 
         draft_tokens(
-            mtp_state,
+            &mut mtp_state,
             &mtp_weights,
             &engine.weights,
             engine,
@@ -92,9 +89,8 @@ pub fn generate_speculative(
             s_prev_hidden,
         )?
     };
-    // mtp_state borrow is released here.
-
-    let (drafts, hidden_snapshots) = drafts_result;
+    // Restore mtp_state to session.
+    session.mtp_state = Some(mtp_state);
 
     // If no drafts were generated, skip speculation.
     if drafts.is_empty() {
@@ -148,15 +144,14 @@ pub fn generate_speculative(
     // === MTP state alignment ===
     {
         let mtp_state = session.mtp_state.as_mut().unwrap();
+        let n_embd = engine.config.n_embd as usize;
 
         // Restore prev_hidden to the state after the last accepted draft.
         // hidden_snapshots[i] is MTP state after drafts[i].
         // n_accepted includes main_token, so m = n_accepted - 1 draft tokens accepted.
         // Last accepted draft is drafts[m-1] = drafts[n_accepted - 2].
-        if n_accepted >= 2 && n_accepted - 1 <= hidden_snapshots.len() {
-            mtp_state
-                .prev_hidden
-                .clone_from(&hidden_snapshots[n_accepted - 2]);
+        if n_accepted >= 2 && n_accepted - 1 <= mtp_state.hidden_snapshot_count() {
+            mtp_state.restore_hidden_snapshot(n_accepted - 2, n_embd);
         }
 
         // Pop rejected entries from MTP KV cache.
@@ -172,15 +167,13 @@ pub fn generate_speculative(
     Ok(accepted)
 }
 
-/// Maximum number of draft tokens per speculative step.
-const MAX_DRAFT_TOKENS: usize = 16;
-
-/// Draft tokens using the MTP model. Returns `(drafts, hidden_snapshots)`.
+/// Draft tokens using the MTP model. Returns the draft tokens.
 ///
 /// `drafts[0]` is the MTP prediction using the main model's hidden state.
 /// Subsequent drafts use MTP's own `prev_hidden`.
 ///
-/// `hidden_snapshots[i]` is MTP's `prev_hidden` after generating `drafts[i]`.
+/// Hidden snapshots are stored in `mtp_state.hidden_snapshots_flat` and
+/// can be retrieved via `mtp_state.get_hidden_snapshot(i, n_embd)`.
 #[allow(clippy::too_many_arguments)]
 fn draft_tokens(
     mtp_state: &mut MtpState,
@@ -192,9 +185,13 @@ fn draft_tokens(
     main_hidden: &[f32],
     max_drafts: usize,
     s_prev_hidden: &mut [f32],
-) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
+) -> Result<Vec<u32>> {
     let eos = engine.tokenizer.eos_token();
-    let max_drafts = max_drafts.min(MAX_DRAFT_TOKENS);
+    let max_drafts = max_drafts.min(crate::mtp::MAX_DRAFT_TOKENS);
+    let n_embd = engine.config.n_embd as usize;
+
+    // Reset snapshot counter at start of drafting.
+    mtp_state.reset_hidden_snapshots();
 
     // Draft[0]: MTP predicts using the main model's hidden state.
     let draft0 = mtp_forward(
@@ -209,13 +206,12 @@ fn draft_tokens(
 
     // If draft[0] != main_token, return empty to signal "no speculation".
     if draft0 != main_token {
-        return Ok((vec![], vec![]));
+        return Ok(vec![]);
     }
 
     let mut drafts = Vec::with_capacity(max_drafts);
-    let mut hidden_snapshots = Vec::with_capacity(max_drafts);
     drafts.push(draft0);
-    hidden_snapshots.push(mtp_state.prev_hidden.clone());
+    mtp_state.store_hidden_snapshot(n_embd);
 
     // Draft[1..N] using MTP's own prev_hidden.
     for i in 1..max_drafts {
@@ -240,14 +236,14 @@ fn draft_tokens(
         )?;
 
         drafts.push(draft);
-        hidden_snapshots.push(mtp_state.prev_hidden.clone());
+        mtp_state.store_hidden_snapshot(n_embd);
 
         if draft == eos {
             break;
         }
     }
 
-    Ok((drafts, hidden_snapshots))
+    Ok(drafts)
 }
 
 /// Check if the main model is confident enough for speculation.

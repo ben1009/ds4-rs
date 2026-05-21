@@ -82,6 +82,11 @@ pub struct MtpState {
     pub heads_scratch: Vec<f32>,
     /// Draft logits output buffer `[n_vocab]`.
     pub logits: Vec<f32>,
+    /// Pre-allocated flat buffer for hidden state snapshots during speculative drafting.
+    /// Layout: `[MAX_DRAFT_TOKENS * n_embd]`. Avoids per-draft heap allocations.
+    hidden_snapshots_flat: Vec<f32>,
+    /// Number of valid snapshots stored in `hidden_snapshots_flat`.
+    hidden_snapshots_count: usize,
     // Reusable scratch buffers for mtp_forward (avoid per-call heap allocations).
     s_plain: Vec<f32>,
     s_enormed: Vec<f32>,
@@ -103,6 +108,9 @@ pub struct MtpState {
     s_out_normed: Vec<f32>,
 }
 
+/// Maximum number of draft tokens for pre-allocated buffers.
+pub(crate) const MAX_DRAFT_TOKENS: usize = 16;
+
 impl MtpState {
     /// Allocate MTP state. `ctx_size` controls the KV ring capacity.
     pub fn new(config: &ModelConfig, ctx_size: u32) -> Result<Self> {
@@ -120,6 +128,8 @@ impl MtpState {
             prev_hidden: vec![0.0f32; n_embd],
             heads_scratch: vec![0.0f32; q_dim],
             logits: vec![0.0f32; n_vocab],
+            hidden_snapshots_flat: vec![0.0f32; MAX_DRAFT_TOKENS * n_embd],
+            hidden_snapshots_count: 0,
             s_plain: vec![0.0f32; n_embd],
             s_enormed: vec![0.0f32; n_embd],
             s_eproj: vec![0.0f32; n_embd],
@@ -137,6 +147,40 @@ impl MtpState {
             s_out_plain: vec![0.0f32; n_embd],
             s_out_normed: vec![0.0f32; n_embd],
         })
+    }
+
+    /// Store a snapshot of `prev_hidden` into the pre-allocated flat buffer.
+    pub fn store_hidden_snapshot(&mut self, n_embd: usize) {
+        let idx = self.hidden_snapshots_count * n_embd;
+        self.hidden_snapshots_flat[idx..idx + n_embd].copy_from_slice(&self.prev_hidden);
+        self.hidden_snapshots_count += 1;
+    }
+
+    /// Get a slice to a stored hidden snapshot by index.
+    pub fn get_hidden_snapshot(&self, index: usize, n_embd: usize) -> &[f32] {
+        let idx = index * n_embd;
+        &self.hidden_snapshots_flat[idx..idx + n_embd]
+    }
+
+    /// Copy a hidden snapshot into prev_hidden by index.
+    pub fn restore_hidden_snapshot(&mut self, index: usize, n_embd: usize) {
+        let idx = index * n_embd;
+        self.prev_hidden.copy_from_slice(&self.hidden_snapshots_flat[idx..idx + n_embd]);
+    }
+
+    /// Reset the hidden snapshot counter (call at start of drafting).
+    pub fn reset_hidden_snapshots(&mut self) {
+        self.hidden_snapshots_count = 0;
+    }
+
+    /// Get the number of stored hidden snapshots.
+    pub fn hidden_snapshot_count(&self) -> usize {
+        self.hidden_snapshots_count
+    }
+
+    /// Borrow the s_out_plain scratch buffer (for temporary hidden state storage).
+    pub fn scratch_plain(&mut self) -> &mut [f32] {
+        &mut self.s_out_plain
     }
 
     /// Zero the hidden state and clear the KV ring.
@@ -201,8 +245,7 @@ pub fn mtp_forward(
     hc_from_plain_embedding(&mut mtp_state.s_hproj_hc, &mtp_state.s_hproj, n_embd, n_hc);
 
     // 8. Combine: eproj_hc + hproj_hc.
-    let hc_dim = n_hc * n_embd;
-    for i in 0..hc_dim {
+    for i in 0..mtp_state.s_residual_hc.len() {
         mtp_state.s_residual_hc[i] = mtp_state.s_eproj_hc[i] + mtp_state.s_hproj_hc[i];
     }
 
