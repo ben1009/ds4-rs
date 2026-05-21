@@ -53,20 +53,19 @@ pub struct MtpWeights<'a> {
 impl<'a> MtpWeights<'a> {
     /// Load MTP weights from a `WeightMap` (the separately-mmapped MTP GGUF).
     pub fn from_map(map: &'a WeightMap) -> Result<Self> {
-        let p = "mtp.0.";
         let n_embd = map.config.n_embd as usize;
         let n_hc = map.config.n_hc as usize;
 
         Ok(Self {
-            e_proj: map.q8_0(&format!("{p}e_proj.weight"))?,
-            h_proj: map.q8_0(&format!("{p}h_proj.weight"))?,
-            enorm: map.f32_1d(&format!("{p}enorm.weight"), n_embd)?,
-            hnorm: map.f32_1d(&format!("{p}hnorm.weight"), n_embd)?,
-            norm: map.f32_1d(&format!("{p}norm.weight"), n_embd)?,
-            hc_head_fn: map.f16(&format!("{p}hc_head_fn.weight"))?,
-            hc_head_scale: map.f32_1d(&format!("{p}hc_head_scale.weight"), 1)?,
-            hc_head_base: map.f32_1d(&format!("{p}hc_head_base.weight"), n_hc)?,
-            block: LayerWeights::from_prefix(map, p, 0)?,
+            e_proj: map.q8_0("mtp.0.e_proj.weight")?,
+            h_proj: map.q8_0("mtp.0.h_proj.weight")?,
+            enorm: map.f32_1d("mtp.0.enorm.weight", n_embd)?,
+            hnorm: map.f32_1d("mtp.0.hnorm.weight", n_embd)?,
+            norm: map.f32_1d("mtp.0.norm.weight", n_embd)?,
+            hc_head_fn: map.f16("mtp.0.hc_head_fn.weight")?,
+            hc_head_scale: map.f32_1d("mtp.0.hc_head_scale.weight", 1)?,
+            hc_head_base: map.f32_1d("mtp.0.hc_head_base.weight", n_hc)?,
+            block: LayerWeights::from_prefix(map, "mtp.0.", 0)?,
         })
     }
 }
