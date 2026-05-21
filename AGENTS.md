@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-`ds4-rs` is a Rust port of [antirez/ds4](https://github.com/antirez/ds4), a focused, single-model local inference engine for DeepSeek V4 Flash. The goal is to load GGUF model weights, run a CPU reference forward pass, and generate tokens greedily. Future work includes an OpenAI/Anthropic-compatible HTTP server, on-disk KV cache, and speculative decoding.
+`ds4-rs` is a Rust port of [antirez/ds4](https://github.com/antirez/ds4), a focused, single-model local inference engine for DeepSeek V4 Flash. It loads GGUF model weights, runs a CPU reference forward pass, and generates tokens greedily. It also includes an interactive REPL with session lifecycle, on-disk KV cache with prefix matching, and an OpenAI/Anthropic-compatible HTTP server with SSE streaming. Future work includes speculative decoding and GPU backends.
 
 * **Target platform:** Linux only. GPU compute backends (Metal, Vulkan, CUDA, etc.) are deferred.
 * **License:** MIT
@@ -65,7 +65,16 @@ Makefile.toml           # cargo-make task definitions
  │           ├── manifest.toml
  │           └── *.bin             # Frozen cross-reference vectors
  └── ds4-cli/             # CLI binary (`ds4`)
-     ├── src/main.rs      # clap args, one-shot generation loop
+     ├── src/main.rs      # clap args, one-shot generation loop, interactive REPL
+     └── Cargo.toml
+ └── ds4-server/          # HTTP inference server
+     ├── src/
+     │   ├── main.rs      # CLI args, axum server startup
+     │   ├── types.rs     # Request/response serde types (OpenAI + Anthropic)
+     │   ├── handlers.rs  # Route handlers for both API formats
+     │   ├── sse.rs       # SSE streaming bridge (mpsc → axum Sse)
+     │   ├── generation.rs# Inference worker thread + channel bridge
+     │   └── chat_template.rs # DeepSeek V4 chat template rendering
      └── Cargo.toml
 rfcs/
  ├── 0001-port-overview.md
@@ -160,13 +169,13 @@ Additional security measures:
 
 ## Current Status & Known Limitations (as of latest commit)
 
-* **Phase 1 forward pass is numerically complete.** The workspace scaffold, GGUF loader, tokenizer, tensor views, all Phase 1 quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL), RMSNorm, partial RoPE + YaRN, softmax, SwiGLU, HC helpers, typed weight accessors, MLA latent KV cache, real attention (the cached 512-dim row plays K and V across all 64 query heads — no separate per-head up-projection, matching antirez/ds4), routed MoE assembly (hash routing for layers 0–2, biased top-k for layers 3+), learned output HC reduction, and CLI wiring have landed. The `DS4_TEST_MODEL` smoke run now reaches the full forward graph end-to-end against a real DS4 GGUF; full numerical validation still needs a healthy GGUF (see Testing Strategy).
+* **Phase 1 (core engine + CLI), Phase 2 (session + KV cache), and Phase 3 (HTTP server) are complete.** The workspace scaffold, GGUF loader, tokenizer, tensor views, all Phase 1 quant kernels (Q8_0, Q8_K, Q2_K, IQ2_XXS, Q4_K, IQ4_XS, IQ4_NL), RMSNorm, partial RoPE + YaRN, softmax, SwiGLU, HC helpers, typed weight accessors, MLA latent KV cache, real attention (the cached 512-dim row plays K and V across all 64 query heads — no separate per-head up-projection, matching antirez/ds4), routed MoE assembly (hash routing for layers 0–2, biased top-k for layers 3+), learned output HC reduction, and CLI wiring have landed. Phase 2 added on-disk KVC with prefix matching (parallelized via rayon), session lifecycle (rewind, invalidate, multi-turn), and an interactive REPL. Phase 3 added an axum HTTP server with OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) compatible APIs, SSE streaming, channel-based inference worker, content-addressed KVC filenames (FNV-1a), and DeepSeek V4 chat template rendering. See `todo.md` for the current backlog.
 * **GGUF metadata keys.** Config reads `deepseek4.*` keys (no longer placeholder `llama.*`), including `deepseek4.attention.q_lora_rank` for the Q-LoRA rank.
 * **Tokenizer.** JoyAI BPE (`tokenizer.ggml.pre = "joyai-llm"`): GPT-2 byte encoding, JoyAI pre-tokenizer cascade, BPE with single-byte fallback. No LLaMA-style `<0xNN>` byte-fallback tokens.
 * **GGUF dim ordering.** The loader maps 2-D weight tensor dims `(ne0, ne1)` to `(in_features, out_features)` (matching `ggml_new_tensor_2d`). The previous flipped axes are gone; all `WeightView` constructors share the `dims_in_out` helper.
 * **Topk NaN fallback.** `topk_indices_desc` falls back to lowest unselected index when all values are NaN/-inf instead of panicking, matching the C reference's behaviour on model files with NaN F16 weights.
 * **Session lifecycle and REPL.** `Session::rewind`, `Session::invalidate`, `Session::pos`, `Session::tokens`, and `Session::ctx_size` ship in `crates/ds4-core/src/session.rs`. The CLI exposes an interactive REPL (default when no `-p` is supplied) with `/reset` (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), and `/exit` (`/quit`). Reasoning-mode toggles (`/think`, `/nothink`) and file-read (`/read`) are not yet implemented.
-* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Long-range context via raw KV ring + compressor/indexer, on-disk KVC, and prefix matching are Phase 2.
+* **Effective context:** Sliding-window attention only (`sliding_window = 128`). Long-range context via raw KV ring + compressor/indexer is wired but numerically unvalidated (needs a healthy GGUF for sign-off).
 * **Performance:** CPU reference, single-threaded, seconds-per-token on commodity hardware. SIMD/threading/GPU are deferred.
 * **Binary name:** `ds4` (from `ds4-cli/src/main.rs`).
 * **Default model path:** `./ds4flash.gguf` (override with `--model`).
@@ -184,7 +193,11 @@ cargo make check
 cargo build --release --bin ds4
 ./target/release/ds4 -p "hello world" -n 16
 
-# 4. Regenerate vectors after an op change (manual, not in CI)
+# 4. Build and run the HTTP server
+cargo build --release --bin ds4-server
+./target/release/ds4-server --model ./ds4flash.gguf --port 8080 --kv-cache-dir ./kvcache
+
+# 5. Regenerate vectors after an op change (manual, not in CI)
 scripts/regen_vectors.sh q8_0
 # Then update crates/ds4-core/tests/vectors/manifest.toml
 ```
