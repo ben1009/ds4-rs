@@ -47,6 +47,8 @@ pub struct Session {
     pub(crate) s_out_plain: Vec<f32>,
     /// Reusable scratch for output head normed hidden state `[n_embd]`.
     pub(crate) s_out_norm: Vec<f32>,
+    /// Reusable scratch for copying prev_hidden in speculative decoding.
+    pub(crate) s_prev_hidden: Vec<f32>,
     /// Optional MTP state for speculative decoding. Created when the engine
     /// has MTP weights loaded.
     pub(crate) mtp_state: Option<MtpState>,
@@ -90,6 +92,7 @@ impl Session {
             s_out_weights: vec![0.0f32; n_hc],
             s_out_plain: vec![0.0f32; n_embd],
             s_out_norm: vec![0.0f32; n_embd],
+            s_prev_hidden: vec![0.0f32; n_embd],
             mtp_state,
         })
     }

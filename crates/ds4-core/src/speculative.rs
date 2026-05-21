@@ -72,10 +72,13 @@ pub fn generate_speculative(
     let main_hidden = session.last_hidden().to_vec();
     let pos = session.pos();
 
+    // Parse MTP weights outside the mutable borrow of mtp_state.
+    let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
+    let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
+
     let drafts_result = {
-        let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
-        let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
         let mtp_state = session.mtp_state.as_mut().unwrap();
+        let s_prev_hidden = &mut session.s_prev_hidden;
 
         draft_tokens(
             mtp_state,
@@ -86,6 +89,7 @@ pub fn generate_speculative(
             pos,
             &main_hidden,
             spec_config.mtp_draft_tokens,
+            s_prev_hidden,
         )?
     };
     // mtp_state borrow is released here.
@@ -105,21 +109,35 @@ pub fn generate_speculative(
     session.snapshot_kv();
 
     // Evaluate main_token (always accepted).
-    session.eval_token_no_snapshot(main_token)?;
-    let mut accepted = vec![main_token];
+    // Use a closure to capture errors and restore KV cache on failure.
+    let verify_result = (|| -> Result<Vec<u32>> {
+        session.eval_token_no_snapshot(main_token)?;
+        let mut accepted = vec![main_token];
 
-    // Verify each draft token against the main model's prediction.
-    // After evaluating main_token, the main model's logits predict position P+1.
-    // drafts[0] is MTP's prediction for position P+1, so we should compare them.
-    for &draft in drafts.iter() {
-        let main_pred = Session::argmax(session.logits())
-            .ok_or_else(|| anyhow::anyhow!("speculative: empty logits during verification"))?;
-        if main_pred != draft {
-            break;
+        // Verify each draft token against the main model's prediction.
+        // After evaluating main_token, the main model's logits predict position P+1.
+        // drafts[0] is MTP's prediction for position P+1, so we should compare them.
+        for &draft in drafts.iter() {
+            let main_pred = Session::argmax(session.logits())
+                .ok_or_else(|| anyhow::anyhow!("speculative: empty logits during verification"))?;
+            if main_pred != draft {
+                break;
+            }
+            session.eval_token_no_snapshot(draft)?;
+            accepted.push(draft);
         }
-        session.eval_token_no_snapshot(draft)?;
-        accepted.push(draft);
-    }
+
+        Ok(accepted)
+    })();
+
+    // If verification failed, restore KV cache and propagate the error.
+    let accepted = match verify_result {
+        Ok(accepted) => accepted,
+        Err(e) => {
+            session.restore_kv();
+            return Err(e);
+        }
+    };
 
     // === No rollback needed ===
     // eval_token_no_snapshot is only called for tokens that pass verification,
@@ -154,6 +172,9 @@ pub fn generate_speculative(
     Ok(accepted)
 }
 
+/// Maximum number of draft tokens per speculative step.
+const MAX_DRAFT_TOKENS: usize = 16;
+
 /// Draft tokens using the MTP model. Returns `(drafts, hidden_snapshots)`.
 ///
 /// `drafts[0]` is the MTP prediction using the main model's hidden state.
@@ -170,9 +191,10 @@ fn draft_tokens(
     pos: u32,
     main_hidden: &[f32],
     max_drafts: usize,
+    s_prev_hidden: &mut [f32],
 ) -> Result<(Vec<u32>, Vec<Vec<f32>>)> {
     let eos = engine.tokenizer.eos_token();
-    let max_drafts = max_drafts.min(16);
+    let max_drafts = max_drafts.min(MAX_DRAFT_TOKENS);
 
     // Draft[0]: MTP predicts using the main model's hidden state.
     let draft0 = mtp_forward(
@@ -190,8 +212,10 @@ fn draft_tokens(
         return Ok((vec![], vec![]));
     }
 
-    let mut drafts = vec![draft0];
-    let mut hidden_snapshots = vec![mtp_state.prev_hidden.clone()];
+    let mut drafts = Vec::with_capacity(max_drafts);
+    let mut hidden_snapshots = Vec::with_capacity(max_drafts);
+    drafts.push(draft0);
+    hidden_snapshots.push(mtp_state.prev_hidden.clone());
 
     // Draft[1..N] using MTP's own prev_hidden.
     for i in 1..max_drafts {
@@ -200,7 +224,10 @@ fn draft_tokens(
             break;
         }
         let draft_pos = pos + i as u32;
-        let prev_hidden = mtp_state.prev_hidden.clone();
+
+        // Copy prev_hidden to scratch buffer before calling mtp_forward,
+        // which will overwrite prev_hidden with the new hidden state.
+        s_prev_hidden.copy_from_slice(&mtp_state.prev_hidden);
 
         let draft = mtp_forward(
             mtp_state,
@@ -209,7 +236,7 @@ fn draft_tokens(
             engine,
             prev_token,
             draft_pos,
-            &prev_hidden,
+            s_prev_hidden,
         )?;
 
         drafts.push(draft);
