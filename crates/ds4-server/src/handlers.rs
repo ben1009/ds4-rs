@@ -157,7 +157,7 @@ pub async fn anthropic_messages(
             yield Ok::<_, std::convert::Infallible>(
                 axum::response::sse::Event::default()
                     .event("message_start")
-                    .data(serde_json::to_string(&start).unwrap()),
+                    .data(serde_json::to_string(&start).unwrap_or_default()),
             );
 
             let mut stream = rx;
@@ -174,7 +174,7 @@ pub async fn anthropic_messages(
                         yield Ok(
                             axum::response::sse::Event::default()
                                 .event("content_block_delta")
-                                .data(serde_json::to_string(&delta).unwrap()),
+                                .data(serde_json::to_string(&delta).unwrap_or_default()),
                         );
                     }
                     GenerationEvent::Done { .. } => {
@@ -185,7 +185,7 @@ pub async fn anthropic_messages(
                         yield Ok(
                             axum::response::sse::Event::default()
                                 .event("message_stop")
-                                .data(serde_json::to_string(&stop).unwrap()),
+                                .data(serde_json::to_string(&stop).unwrap_or_default()),
                         );
                     }
                     GenerationEvent::Error(msg) => {
