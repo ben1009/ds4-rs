@@ -222,7 +222,6 @@ impl Session {
             .last()
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
         // Snapshot everything before modification for atomic rollback.
-        let saved_len = self.tokens.len();
         let saved_pos = self.pos;
         let saved_logits = self.logits.clone();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
