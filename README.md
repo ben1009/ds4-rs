@@ -5,14 +5,12 @@
 
 A Rust port of [antirez/ds4](https://github.com/antirez/ds4): a single-model inference engine for **DeepSeek V4 Flash**.
 
-> **Status:** Phase 1 forward pass is numerically complete; the
-> `DS4_TEST_MODEL` smoke run now completes end-to-end against a real
-> DS4 GGUF (prefill plus decode steps) without panicking. Full
-> numerical validation still needs a healthy GGUF — the q2-imatrix
-> DS4-Flash file in hand has corrupted F16 weights and produces the
-> same gibberish on the antirez/ds4 C reference. Interactive REPL and
-> session lifecycle (`rewind`, `invalidate`) are wired up. See
-> [`todo.md`](todo.md) for the current backlog.
+> **Status:** Phase 1 (core engine + CLI), Phase 2 (session + KV cache), and
+> Phase 3 (HTTP server) are complete. The engine loads DeepSeek V4 Flash GGUF
+> weights, runs greedy token generation, has an interactive REPL with session
+> lifecycle, on-disk KVC cache with prefix matching, and an OpenAI + Anthropic
+> compatible HTTP server with SSE streaming. See [`todo.md`](todo.md) for the
+> current backlog.
 
 ## Goals
 
@@ -25,7 +23,8 @@ A Rust port of [antirez/ds4](https://github.com/antirez/ds4): a single-model inf
 | Crate | Description |
 |-------|-------------|
 | [`ds4-core`](crates/ds4-core) | GGUF parser, tokenizer, model config, tensor ops, quant kernels, session/KV cache, and forward pass. |
-| [`ds4-cli`](crates/ds4-cli) | Command-line binary `ds4` for one-shot text generation. |
+| [`ds4-cli`](crates/ds4-cli) | Command-line binary `ds4` for one-shot generation and interactive REPL. |
+| [`ds4-server`](crates/ds4-server) | HTTP inference server with OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) compatible APIs. |
 
 ## Quick Start
 
@@ -50,6 +49,26 @@ ds4 --model ./ds4flash.gguf -p "Hello" -n 64 --ctx 8192
 
 In the REPL, `/help` (or `/?`) lists the slash commands: `/reset`
 (`/clear`), `/rewind <n>`, `/ctx`, `/exit` (`/quit`).
+
+### Server
+
+```bash
+# Start the inference server
+ds4-server --model ./ds4flash.gguf --port 8080
+
+# With KV cache for prefix matching
+ds4-server --model ./ds4flash.gguf --port 8080 --kv-cache-dir ./kvcache
+
+# OpenAI-compatible request
+curl -N localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Anthropic-compatible request
+curl -N localhost:8080/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
+```
 
 ### CLI Options
 

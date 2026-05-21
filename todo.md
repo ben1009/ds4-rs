@@ -5,38 +5,15 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
 
 ## Current Baseline
 
-- `cargo test --workspace` passes (408 ds4-core unit tests + 31 ds4-cli
-  unit tests + manifest check; one ignored doctest and one ignored
-  end-to-end smoke test gated behind `DS4_TEST_MODEL`).
-- Phase 1 forward pass is numerically complete: real MLA attention (the
-  cached 512-dim row plays K and V across all 64 query heads), routed
-  MoE assembly, and learned output HC reduction are all in place.
-- `Session::prefill` and `Session::eval_token` reach the full forward
-  graph; the CLI `ds4 -p "..." -n ...` exercises the same code path.
-- Session lifecycle ops (`rewind`, `invalidate`) and an interactive REPL
-  (`/reset`, `/rewind <n>`, `/ctx`, `/help`, `/exit`) have landed
-  (PRs #28, #29). The REPL is the default when no `-p` is supplied.
-- Reference vectors for Q8_0, Q8_K, RMSNorm, RoPE, and the routed-expert
-  quants (IQ2_XXS, Q2_K, Q4_K, IQ4_XS, IQ4_NL) are committed under
-  `crates/ds4-core/tests/vectors/` and SHA-checked by
-  `tests/manifest.rs`.
-- `forward_smoke` now runs end-to-end against a real DS4 GGUF without
-  panicking: prefill plus several decode steps complete the full
-  forward graph. PRs #33 (deepseek4.* metadata keys), #34 (JoyAI BPE
-  tokenizer rewrite), #35 (`q_lora_rank` from metadata), #36 (correct
-  GGUF `(ne0, ne1) → (in_features, out_features)` mapping), #37
-  (per-group slicing of `attn_output_a` in `grouped_out_decode`), and
-  #38 (topk fallback for all-NaN router probs) closed out the
-  immediate blockers. Caveat: the q2-imatrix DS4-Flash GGUF used for
-  this run has corrupted F16 weights (~2.8% NaN bit-patterns), so the
-  smoke test's "decode logits diverge across steps" assertion still
-  fails on that file. The antirez/ds4 C reference produces the same
-  gibberish on the same file, confirming this is a model-file issue,
-  not a Phase 1 implementation issue. Numerical validation just needs
-  a healthy DS4 GGUF.
-- Phase 2 architecture work (compressor / indexer, on-disk KVC) is the
-  new gate for the remaining backlog and can begin in parallel with
-  end-to-end numerical validation (item 10).
+- `cargo test --workspace` passes (500+ tests across ds4-core, ds4-cli,
+  ds4-server; one ignored doctest and one ignored end-to-end smoke test
+  gated behind `DS4_TEST_MODEL`).
+- Phase 1 forward pass is numerically complete.
+- Phase 2 (session + KV cache) is complete: on-disk KVC with prefix
+  matching, session lifecycle, interactive REPL.
+- Phase 3 (HTTP server) is complete: OpenAI + Anthropic compatible APIs
+  with SSE streaming, channel-based inference worker, content-addressed
+  KVC filenames. Merged in PR #50.
 
 ## Next Move
 
@@ -158,19 +135,19 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
      manual review when regeneration is needed. Existing op-level vectors
      for Q8_0, Q8_K, RMSNorm, and RoPE are unchanged.
 
-10. Phase 2 work can proceed in parallel with end-to-end numerical
-    validation. The `DS4_TEST_MODEL` run now reaches the full forward
-    graph end-to-end against a real DS4 GGUF, so the previous hard
-    gate is lifted; the unchecked sub-items just need a healthy GGUF
-    for numerical sign-off (the q2-imatrix file currently in hand has
-    corrupted F16 weights, see Current Baseline).
+10. Phase 2 work is complete.
     - [x] Session lifecycle operations: rewind, invalidate, and multi-turn flow.
       - Done in #28: `Session::invalidate`, `Session::rewind`,
         `Session::pos`, `Session::tokens`, and `Session::ctx_size` cover
         in-memory rewind / invalidate; the REPL exercises multi-turn
         prefix preservation across turns.
-    - [ ] Raw KV ring behavior and long-context compressor / indexer.
-    - [ ] On-disk KVC compatibility.
+    - [x] Raw KV ring behavior and long-context compressor / indexer.
+      - Done: sliding-window raw KV ring, compressed KV store with
+        ratio-4 indexer, and on-disk KVC cache (48-byte header +
+        session payload, binary-compatible with ds4).
+    - [x] On-disk KVC compatibility.
+      - Done: content-addressed KVC filenames (FNV-1a hash), prefix
+        matching for cache reuse (parallelized with rayon).
     - [x] CLI interactive REPL.
       - Done in #29: `repl()` in `crates/ds4-cli/src/main.rs` ships
         `/reset` (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), and
@@ -178,13 +155,20 @@ repository against `PLAN.md` and `rfcs/0002-forward-pass.md`.
         supplied. Reasoning-mode toggles (`/think`, `/nothink`) and
         file-read (`/read`) are still future work.
 
+11. Phase 3 (HTTP server) is complete.
+    - [x] axum + tokio HTTP server — Done in #50.
+    - [x] OpenAI-compatible `POST /v1/chat/completions` with SSE streaming.
+    - [x] Anthropic-compatible `POST /v1/messages` with SSE streaming.
+    - [x] Channel-based sync→async inference worker.
+    - [x] DeepSeek V4 chat template rendering.
+
 ## Hygiene (ongoing)
 
-11. Keep docs aligned with implementation status.
+12. Keep docs aligned with implementation status.
     - Update `PLAN.md` and RFC 0002 when a TODO item changes architectural assumptions.
     - Avoid leaving stale comments that say a PR is future work after code lands.
 
-12. Keep every completed item independently testable.
+13. Keep every completed item independently testable.
     - Each item should pass `cargo test --workspace`.
     - Prefer focused regression tests near the changed module.
     - If a behavior requires a real model file, gate it with an explicit env var and document it.

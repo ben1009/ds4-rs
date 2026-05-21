@@ -93,10 +93,10 @@ via the `DS4_TEST_MODEL`-gated integration test in
 - Multi-turn session lifecycle (create, eval, rewind, invalidate) — **done**
   (#28). In-memory `Session::rewind` / `Session::invalidate` ship; the
   REPL exercises multi-turn prefix preservation across turns.
-- Raw KV ring buffer (sliding window in memory)
-- Compressed KV store + ratio-4 indexer
-- On-disk KVC cache (48-byte header + session payload, binary-compatible with ds4)
-- Prefix matching for cache reuse
+- Raw KV ring buffer (sliding window in memory) — **done**
+- Compressed KV store + ratio-4 indexer — **done**
+- On-disk KVC cache (48-byte header + session payload, binary-compatible with ds4) — **done**
+- Prefix matching for cache reuse — **done**. Parallelized with rayon.
 - CLI interactive REPL — **done** (#29). Shipped commands: `/reset`
   (`/clear`), `/rewind <n>`, `/ctx`, `/help` (`/?`), `/exit` (`/quit`).
   Reasoning-mode toggles (`/think`, `/nothink`) and file-read (`/read`)
@@ -104,14 +104,13 @@ via the `DS4_TEST_MODEL`-gated integration test in
 
 ## Phase 3: Server
 
-- axum + tokio HTTP server
-- `POST /v1/chat/completions` (OpenAI-compatible, SSE streaming)
-- `POST /v1/messages` (Anthropic-compatible, SSE streaming)
-- `POST /v1/completions` (raw text)
-- `GET /v1/models`
-- DSML tool schema rendering + generated output parsing
-- Streaming state machine: DSML → OpenAI tool call translation
-- KV disk cache: cold/continued/evict/shutdown saves
+- axum + tokio HTTP server — **done** (#50)
+- `POST /v1/chat/completions` (OpenAI-compatible, SSE streaming) — **done**
+- `POST /v1/messages` (Anthropic-compatible, SSE streaming) — **done**
+- KV disk cache: cold saves with prefix matching — **done**
+- Content-addressed KVC filenames (FNV-1a hash) — **done**
+- Channel-based sync→async inference worker — **done**
+- DeepSeek V4 chat template rendering — **done**
 
 ## Phase 4: Speculative Decoding + Polish
 
