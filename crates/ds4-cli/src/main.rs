@@ -153,12 +153,13 @@ fn one_shot(
         (Session::new(engine.clone(), ctx)?, tokens.clone())
     };
 
+    // Save before generation so the cache contains only prompt tokens.
+    // This allows exact-prompt prefix matches on subsequent runs.
+    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
+
     let stdout = std::io::stdout();
     let mut handle = stdout.lock();
     generate_turn(engine, &mut session, &suffix, max_tokens, &mut handle)?;
-
-    // Auto-save for future prefix reuse
-    kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
 
     Ok(())
 }
@@ -351,11 +352,19 @@ fn generate_turn<W: Write>(
     max_tokens: u32,
     out: &mut W,
 ) -> Result<()> {
-    if tokens.is_empty() {
-        return Ok(());
-    }
-
-    let logits = session.prefill(tokens)?;
+    // For exact prefix matches (empty suffix), rewind one token and
+    // re-evaluate it to recover logits for generation.
+    let logits = if tokens.is_empty() {
+        let all = session.tokens();
+        if all.is_empty() {
+            return Ok(());
+        }
+        let last = *all.last().unwrap();
+        session.rewind(session.pos() - 1)?;
+        session.eval_token(last)?
+    } else {
+        session.prefill(tokens)?
+    };
     let mut token =
         Session::argmax(logits).ok_or_else(|| anyhow::anyhow!("prefill returned empty logits"))?;
     let eos = engine.tokenizer.eos_token();
