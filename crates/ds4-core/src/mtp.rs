@@ -156,6 +156,10 @@ impl MtpState {
 
     /// Store a snapshot of `prev_hidden` into the pre-allocated flat buffer.
     pub fn store_hidden_snapshot(&mut self, n_embd: usize) {
+        assert!(
+            self.hidden_snapshots_count < MAX_DRAFT_TOKENS,
+            "MtpState: hidden snapshot overflow"
+        );
         let idx = self.hidden_snapshots_count * n_embd;
         self.hidden_snapshots_flat[idx..idx + n_embd].copy_from_slice(&self.prev_hidden);
         self.hidden_snapshots_count += 1;
