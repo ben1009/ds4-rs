@@ -225,10 +225,11 @@ impl Session {
         let saved_pos = self.pos;
         let saved_logits = self.logits.clone();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
-        // Pop last token and decrement pos so eval_token_inner writes
-        // to the same KV row position.
+        // Pop last token, decrement pos, and rewind KV watermark so
+        // eval_token_inner overwrites the last KV row instead of appending.
         self.tokens.pop();
         self.pos -= 1;
+        self.kv_cache.pop_last_row();
         // eval_token_inner pushes the token back and attempts forward.
         // On failure it pops and restores pos, but we must also
         // restore the token vec, logits, and KV to the pre-call state.
