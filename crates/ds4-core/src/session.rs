@@ -221,15 +221,22 @@ impl Session {
             .tokens
             .last()
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
-        // Snapshot KV + state before modification for atomic rollback.
+        // Snapshot everything before modification for atomic rollback.
         let saved_len = self.tokens.len();
         let saved_pos = self.pos;
         let saved_logits = self.logits.clone();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+        // Pop last token and decrement pos so eval_token_inner writes
+        // to the same KV row position.
         self.tokens.pop();
         self.pos -= 1;
+        // eval_token_inner pushes the token back and attempts forward.
+        // On failure it pops and restores pos, but we must also
+        // restore the token vec, logits, and KV to the pre-call state.
         if let Err(err) = self.eval_token_inner(last, false) {
-            self.tokens.truncate(saved_len);
+            // eval_token_inner already popped `last` on error, so
+            // tokens.len() == saved_len - 1. Push it back.
+            self.tokens.push(last);
             self.pos = saved_pos;
             self.logits = saved_logits;
             self.kv_cache.restore(&self.kv_snapshot);
