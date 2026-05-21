@@ -49,6 +49,8 @@ pub struct Session {
     pub(crate) s_out_norm: Vec<f32>,
     /// Reusable scratch for copying prev_hidden in speculative decoding.
     pub(crate) s_prev_hidden: Vec<f32>,
+    /// Reusable scratch for snapshotting logits during speculative decoding or prefill.
+    pub(crate) logits_snapshot: Vec<f32>,
     /// Optional MTP state for speculative decoding. Created when the engine
     /// has MTP weights loaded.
     pub(crate) mtp_state: Option<MtpState>,
@@ -93,6 +95,7 @@ impl Session {
             s_out_plain: vec![0.0f32; n_embd],
             s_out_norm: vec![0.0f32; n_embd],
             s_prev_hidden: vec![0.0f32; n_embd],
+            logits_snapshot: vec![0.0f32; n_vocab],
             mtp_state,
         })
     }
@@ -122,14 +125,14 @@ impl Session {
         // include rows that need to be undone).
         let start_len = self.tokens.len();
         let start_pos = self.pos;
-        let logits_snapshot = self.logits.clone();
+        self.snapshot_logits();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         self.tokens.reserve(tokens.len());
         for &token in tokens {
             if let Err(err) = self.eval_token_inner(token, false) {
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
-                self.logits = logits_snapshot;
+                self.restore_logits();
                 self.kv_cache.restore(&self.kv_snapshot);
                 return Err(err);
             }
@@ -311,7 +314,7 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
         // Snapshot everything before modification for atomic rollback.
         let saved_pos = self.pos;
-        let saved_logits = self.logits.clone();
+        self.snapshot_logits();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         // Pop last token, decrement pos, and rewind KV watermark so
         // eval_token_inner overwrites the last KV row instead of appending.
@@ -326,7 +329,7 @@ impl Session {
             // tokens.len() == saved_len - 1. Push it back.
             self.tokens.push(last);
             self.pos = saved_pos;
-            self.logits = saved_logits;
+            self.restore_logits();
             self.kv_cache.restore(&self.kv_snapshot);
             return Err(err);
         }
@@ -399,6 +402,16 @@ impl Session {
     /// Restore the KV cache from the rollback snapshot.
     pub fn restore_kv(&mut self) {
         self.kv_cache.restore(&self.kv_snapshot);
+    }
+
+    /// Snapshot current logits into the reusable rollback buffer.
+    pub fn snapshot_logits(&mut self) {
+        self.logits_snapshot.copy_from_slice(&self.logits);
+    }
+
+    /// Restore logits from the rollback snapshot.
+    pub fn restore_logits(&mut self) {
+        self.logits.copy_from_slice(&self.logits_snapshot);
     }
 }
 

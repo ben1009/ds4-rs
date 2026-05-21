@@ -121,7 +121,7 @@ pub fn generate_speculative(
     // does not overwrite this snapshot with per-token rollback state.
     session.snapshot_kv();
     let tokens_snapshot = session.tokens().len();
-    let logits_snapshot = session.logits.clone();
+    session.snapshot_logits();
 
     // Evaluate main_token (always accepted).
     // Use a closure to capture errors and restore KV cache + tokens on failure.
@@ -152,7 +152,7 @@ pub fn generate_speculative(
         Err(e) => {
             session.restore_kv();
             session.truncate_tokens(tokens_snapshot);
-            session.logits = logits_snapshot;
+            session.restore_logits();
             return Err(e);
         }
     };
