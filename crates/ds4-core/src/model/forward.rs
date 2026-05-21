@@ -1045,7 +1045,6 @@ pub(crate) fn run_transformer_block(
     let n_hc = config.n_hc as usize;
 
     // Attention sublayer.
-    attn_out.fill(0.0);
     let (attn_post, attn_comb) = layer_attention_decode(
         attn_out,
         engine,
@@ -1107,7 +1106,6 @@ pub(crate) fn output_head_reduce(
     let n_embd = config.n_embd as usize;
     let n_hc = config.n_hc as usize;
 
-    flat.fill(0.0);
     rms_norm_no_weight(residual_hc, 1e-6, flat);
 
     let hc_fn = model.f16("output_hc_fn.weight")?;

@@ -132,7 +132,12 @@ impl MtpState {
             prev_hidden: vec![0.0f32; n_embd],
             heads_scratch: vec![0.0f32; q_dim],
             logits: vec![0.0f32; n_vocab],
-            hidden_snapshots_flat: vec![0.0f32; MAX_DRAFT_TOKENS * n_embd],
+            hidden_snapshots_flat: vec![
+                0.0f32;
+                MAX_DRAFT_TOKENS.checked_mul(n_embd).ok_or_else(
+                    || anyhow::anyhow!("MtpState: snapshots overflow")
+                )?
+            ],
             hidden_snapshots_count: 0,
             s_plain: vec![0.0f32; n_embd],
             s_enormed: vec![0.0f32; n_embd],
@@ -229,7 +234,6 @@ pub fn mtp_forward(
     let n_hc = config.n_hc as usize;
 
     // 1. Embed token from main model's embedding table.
-    mtp_state.s_plain.fill(0.0);
     embed_token(main_weights, token, &mut mtp_state.s_plain)?;
 
     // 2. RMSNorm embedding.
@@ -306,14 +310,12 @@ pub fn mtp_forward(
         .ok_or_else(|| anyhow::anyhow!("mtp_forward: no valid token"))?;
 
     // 12. Collapse HC → prev_hidden for next step.
-    // Use the learned HC head output (s_out_plain) with RMSNorm, matching
-    // how the main model captures last_hidden after HC reduction.
-    rms_norm(
-        &mtp_state.s_out_plain,
-        mtp_weights.norm,
-        1e-6,
-        &mut mtp_state.prev_hidden,
-    );
+    // Store the un-normed state (s_out_plain), matching how the main model
+    // captures last_hidden. The caller (mtp_forward Step 5) applies hnorm
+    // to this state before projection, so we must not double-normalize.
+    mtp_state
+        .prev_hidden
+        .copy_from_slice(&mtp_state.s_out_plain);
 
     Ok(draft_token)
 }
