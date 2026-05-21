@@ -1,5 +1,5 @@
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     thread::{self, JoinHandle},
 };
@@ -34,12 +34,17 @@ pub fn spawn_worker(
     engine: Arc<Engine>,
     kv_cache_dir: Option<PathBuf>,
 ) -> Result<(InferenceHandle, JoinHandle<()>)> {
-    let (tx, mut rx) = mpsc::channel::<InferenceRequest>(4);
+    let (tx, mut rx) = mpsc::channel::<InferenceRequest>(32);
 
     let handle = thread::spawn(move || {
         let ctx_size = engine.config.ctx_size;
-        let mut session =
-            Session::new(engine.clone(), ctx_size).expect("failed to create initial session");
+        let mut session = match Session::new(engine.clone(), ctx_size) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("failed to create initial session: {e}");
+                return;
+            }
+        };
 
         while let Some(request) = rx.blocking_recv() {
             let result = process_request(&engine, &mut session, &request, &kv_cache_dir);
@@ -55,6 +60,18 @@ pub fn spawn_worker(
     Ok((InferenceHandle { tx }, handle))
 }
 
+fn kvc_save_path(cache_dir: &Path, tokens: &[u32]) -> PathBuf {
+    use std::{
+        collections::hash_map::DefaultHasher,
+        hash::{Hash, Hasher},
+    };
+
+    let mut hasher = DefaultHasher::new();
+    tokens.hash(&mut hasher);
+    let hash = hasher.finish();
+    cache_dir.join(format!("{hash:016x}.kvc"))
+}
+
 fn process_request(
     engine: &Arc<Engine>,
     session: &mut Session,
@@ -62,7 +79,6 @@ fn process_request(
     kv_cache_dir: &Option<PathBuf>,
 ) -> Result<()> {
     let eos_token = engine.tokenizer.eos_token();
-    let ctx_size = engine.config.ctx_size;
 
     // Try prefix match if cache dir is set
     let suffix = if let Some(dir) = kv_cache_dir {
@@ -72,12 +88,12 @@ fn process_request(
             std::mem::swap(session, &mut loaded);
             suffix
         } else {
-            // No match — reset session and prefill everything
-            *session = Session::new(engine.clone(), ctx_size)?;
+            // No match — reuse session memory, just clear state
+            session.invalidate();
             request.prompt_tokens.clone()
         }
     } else {
-        *session = Session::new(engine.clone(), ctx_size)?;
+        session.invalidate();
         request.prompt_tokens.clone()
     };
 
@@ -90,7 +106,8 @@ fn process_request(
 
     // Save after prefill
     if let Some(dir) = kv_cache_dir {
-        let _ = kv_disk::save_session(&dir.join("session.kvc"), session, kv_disk::SaveReason::Cold);
+        let path = kvc_save_path(dir, &request.prompt_tokens);
+        let _ = kv_disk::save_session(&path, session, kv_disk::SaveReason::Cold);
     }
 
     // Generate tokens
@@ -127,11 +144,8 @@ fn process_request(
 
     // Save after generation
     if let Some(dir) = kv_cache_dir {
-        let _ = kv_disk::save_session(
-            &dir.join("session.kvc"),
-            session,
-            kv_disk::SaveReason::Continued,
-        );
+        let path = kvc_save_path(dir, &request.prompt_tokens);
+        let _ = kv_disk::save_session(&path, session, kv_disk::SaveReason::Continued);
     }
 
     let _ = request.response_tx.blocking_send(GenerationEvent::Done {

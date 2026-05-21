@@ -35,7 +35,9 @@ pub async fn openai_chat_completions(
         .collect();
 
     let prompt = chat_template::render(&messages);
-    let prompt_tokens = state.engine.tokenizer.encode(&prompt, true);
+    // Template already starts with BOS-equivalent (<｜begin▁of▁sentence｜>),
+    // so don't add another BOS via encode.
+    let prompt_tokens = state.engine.tokenizer.encode(&prompt, false);
 
     let (tx, rx) = mpsc::channel(64);
     let request = InferenceRequest {
@@ -121,7 +123,7 @@ pub async fn anthropic_messages(
     }
 
     let prompt = chat_template::render(&messages);
-    let prompt_tokens = state.engine.tokenizer.encode(&prompt, true);
+    let prompt_tokens = state.engine.tokenizer.encode(&prompt, false);
 
     let (tx, rx) = mpsc::channel(64);
     let request = InferenceRequest {
