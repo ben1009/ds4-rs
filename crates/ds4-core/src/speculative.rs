@@ -62,12 +62,11 @@ pub fn generate_speculative(
 
     // === Drafting phase ===
     // Take ownership of mtp_state to avoid borrowing session mutably and
-    // immutably at the same time. We still need .to_vec() for last_hidden
-    // because mtp_state is passed mutably to draft_tokens while main_hidden
-    // (from session.last_hidden()) must live across the call. The allocation
-    // is bounded by n_embd (typically 16KB).
+    // immutably at the same time. Since mtp_state is taken, session no longer
+    // holds a mutable reference, so we can borrow last_hidden immutably and
+    // s_prev_hidden mutably via split borrowing.
     let mut mtp_state = session.mtp_state.take().unwrap();
-    let main_hidden = session.last_hidden().to_vec();
+    let main_hidden = &session.last_hidden;
     let pos = session.pos();
     // The last token in the sequence (at position pos). MTP embeds this token
     // and predicts the next position (pos + 1), which is what main_token is.
@@ -114,10 +113,11 @@ pub fn generate_speculative(
         session.eval_token_no_snapshot(main_token)?;
         let mut accepted = vec![main_token];
 
-        // Verify each draft token against the main model's prediction.
-        // After evaluating main_token, the main model's logits predict position P+1.
-        // drafts[0] is MTP's prediction for position P+1, so we should compare them.
-        for &draft in drafts.iter() {
+        // Verify draft tokens against the main model's prediction.
+        // After evaluating main_token, the session predicts position P+2.
+        // Skip drafts[0] because it was already verified equal to main_token
+        // (both predict P+1), and the session has already advanced past it.
+        for &draft in drafts.iter().skip(1) {
             let main_pred = Session::argmax(session.logits())
                 .ok_or_else(|| anyhow::anyhow!("speculative: empty logits during verification"))?;
             if main_pred != draft {
