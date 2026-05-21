@@ -70,13 +70,16 @@ pub fn generate_speculative(
     let pos = session.pos();
     // The last token in the sequence (at position pos). MTP embeds this token
     // and predicts the next position (pos + 1), which is what main_token is.
-    let input_token = *session.tokens().last().unwrap();
+    let input_token = *session
+        .tokens()
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("speculative: session tokens are empty"))?;
 
     // Parse MTP weights outside the mutable borrow of mtp_state.
     let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
     let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
 
-    let drafts = {
+    let draft_result = {
         let s_prev_hidden = &mut session.s_prev_hidden;
 
         draft_tokens(
@@ -90,7 +93,16 @@ pub fn generate_speculative(
             main_hidden,
             spec_config.mtp_draft_tokens,
             s_prev_hidden,
-        )?
+        )
+    };
+    let drafts = match draft_result {
+        Ok(d) => d,
+        Err(e) => {
+            // Restore mtp_state to session before returning the error,
+            // otherwise subsequent calls will find session.mtp_state == None.
+            session.mtp_state = Some(mtp_state);
+            return Err(e);
+        }
     };
     // Restore mtp_state to session.
     session.mtp_state = Some(mtp_state);
@@ -104,11 +116,12 @@ pub fn generate_speculative(
     }
 
     // === Verification phase ===
-    // Snapshot the KV cache and token length before verification.
+    // Snapshot the KV cache, token length, and logits before verification.
     // We use eval_token_no_snapshot during verification so that eval_token_inner
     // does not overwrite this snapshot with per-token rollback state.
     session.snapshot_kv();
     let tokens_snapshot = session.tokens().len();
+    let logits_snapshot = session.logits.clone();
 
     // Evaluate main_token (always accepted).
     // Use a closure to capture errors and restore KV cache + tokens on failure.
@@ -133,12 +146,13 @@ pub fn generate_speculative(
         Ok(accepted)
     })();
 
-    // If verification failed, restore KV cache, tokens, and pos.
+    // If verification failed, restore KV cache, tokens, pos, and logits.
     let accepted = match verify_result {
         Ok(accepted) => accepted,
         Err(e) => {
             session.restore_kv();
             session.truncate_tokens(tokens_snapshot);
+            session.logits = logits_snapshot;
             return Err(e);
         }
     };
