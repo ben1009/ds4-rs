@@ -111,21 +111,21 @@ pub fn generate_speculative(
     session.mtp_state = Some(mtp_state);
 
     // If no drafts were generated, skip speculation.
-    // Pop the MTP KV cache entry from the failed mtp_forward call.
+    // Keep the MTP KV entry — it's for input_token which is part of the
+    // accepted sequence, so the MTP stays in sync with the main model.
     if drafts.is_empty() {
-        session.mtp_state.as_mut().unwrap().kv_cache.pop_last_row();
         session.eval_token(main_token)?;
         return Ok(vec![main_token]);
     }
 
     // === Verification phase ===
-    // Snapshot main model and MTP KV caches, token length, and logits before
+    // Snapshot the main model's KV cache, token length, and logits before
     // verification. We use eval_token_no_snapshot during verification so that
     // eval_token_inner does not overwrite this snapshot with per-token rollback state.
+    // The MTP KV cache is not modified during verification, so no snapshot needed.
     session.snapshot_kv();
     let tokens_snapshot = session.tokens().len();
     session.snapshot_logits();
-    session.mtp_state.as_mut().unwrap().snapshot_kv();
 
     // Evaluate main_token (always accepted).
     // Use a closure to capture errors and restore KV cache + tokens on failure.
@@ -150,14 +150,13 @@ pub fn generate_speculative(
         Ok(accepted)
     })();
 
-    // If verification failed, restore KV cache, tokens, pos, logits, and MTP KV.
+    // If verification failed, restore main model's KV cache, tokens, and logits.
     let accepted = match verify_result {
         Ok(accepted) => accepted,
         Err(e) => {
             session.restore_kv();
             session.truncate_tokens(tokens_snapshot);
             session.restore_logits();
-            session.mtp_state.as_mut().unwrap().restore_kv();
             return Err(e);
         }
     };
