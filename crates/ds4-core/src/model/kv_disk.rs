@@ -22,6 +22,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use rayon::prelude::*;
 
 use super::kv_cache::{HEAD_DIM, IDX_DIM, SWA};
 use crate::{config::layer_compress_ratio, engine::Engine, session::Session};
@@ -501,37 +502,25 @@ pub fn find_prefix_match(
         Err(_) => return None,
     };
 
-    let mut best: Option<(std::path::PathBuf, usize)> = None;
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_none_or(|e| e != "kvc") {
-            continue;
-        }
-        let (cached_tokens, _ctx, total) = match read_token_ids_limited(&path, query_tokens.len()) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::debug!("KVC: skipping {}: {e}", path.display());
-                continue;
+    entries
+        .flatten()
+        .par_bridge()
+        .filter(|entry| entry.path().extension().is_some_and(|e| e == "kvc"))
+        .filter_map(|entry| {
+            let path = entry.path();
+            let (cached_tokens, _ctx, total) =
+                read_token_ids_limited(&path, query_tokens.len()).ok()?;
+            let common = common_prefix_len(&cached_tokens, query_tokens);
+            // The entire cached sequence must be a prefix of the query.
+            // Allow exact matches (total == query_tokens.len()) — the caller
+            // handles the empty-suffix case by re-evaluating the last token.
+            if common > 0 && common == cached_tokens.len() && total <= query_tokens.len() {
+                Some((path, common))
+            } else {
+                None
             }
-        };
-        let common = common_prefix_len(&cached_tokens, query_tokens);
-        // The entire cached sequence must be a prefix of the query.
-        // If cached_tokens was truncated (total > cached.len()), the full
-        // sequence can't be a prefix since we already matched all we read
-        // but there are more tokens in the file.
-        // Allow exact matches (total == query_tokens.len()) — the caller
-        // handles the empty-suffix case by re-evaluating the last token.
-        if common > 0
-            && common == cached_tokens.len()
-            && total <= query_tokens.len()
-            && best.as_ref().is_none_or(|(_, prev)| common > *prev)
-        {
-            best = Some((path, common));
-        }
-    }
-
-    best
+        })
+        .reduce_with(|a, b| if a.1 >= b.1 { a } else { b })
 }
 
 /// Load the best prefix-matching KVC session from `cache_dir` for

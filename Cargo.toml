@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/ds4-cli", "crates/ds4-core"]
+members = ["crates/ds4-cli", "crates/ds4-core", "crates/ds4-server"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,9 @@ license = "MIT"
 # Error handling
 anyhow = "1"
 
+# Web framework
+axum = "0.8"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -19,6 +22,14 @@ memmap2 = "0.9"
 
 # Concurrency
 parking_lot = "0.12"
+rayon = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
 
 # Logging
 tracing = "0.1"
