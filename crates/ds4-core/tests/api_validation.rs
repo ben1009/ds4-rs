@@ -21,7 +21,7 @@ use std::{path::PathBuf, sync::Arc};
 use ds4_core::{engine::Engine, session::Session};
 
 /// DeepSeek V4 chat template prefix.
-const TEMPLATE_PREFIX: &str = "<｜begin▁of▁sentence｜><｜User｜>";
+const TEMPLATE_PREFIX: &str = "<｜User｜>";
 const TEMPLATE_INFIX: &str = "<｜Assistant｜>";
 
 fn model_path() -> Option<PathBuf> {
@@ -108,8 +108,7 @@ fn apply_chat_template(prompt: &str) -> String {
 /// Generate text from ds4-rs using greedy decoding, up to `max_bytes` of output.
 fn generate_greedy(engine: &Arc<Engine>, prompt: &str, max_tokens: u32) -> String {
     let full_prompt = apply_chat_template(prompt);
-    // Template already includes BOS (<｜begin▁of▁sentence｜>), so don't add another.
-    let tokens = engine.tokenizer.encode(&full_prompt, false);
+    let tokens = engine.tokenizer.encode(&full_prompt, true);
     assert!(
         !tokens.is_empty(),
         "tokenizer returned empty tokens for prompt: {prompt:?}"
