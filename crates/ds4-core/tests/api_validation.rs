@@ -39,6 +39,7 @@ struct Reference {
     prompt: String,
     expected_text: String,
     max_tokens: u32,
+    model: String,
 }
 
 fn load_references() -> Vec<Reference> {
@@ -80,11 +81,16 @@ fn load_references() -> Vec<Reference> {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(64);
+        let model = v["model"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
         refs.push(Reference {
             name,
             prompt,
             expected_text,
             max_tokens,
+            model,
         });
     }
 
@@ -192,8 +198,15 @@ fn api_validation_greedy() {
         path.display()
     );
 
+    // Log model metadata from references for traceability.
+    let models: std::collections::HashSet<&str> = refs.iter().map(|r| r.model.as_str()).collect();
+    eprintln!("  reference models: {:?}", models);
+
     for reference in &refs {
-        eprintln!("  generating: {} ({})", reference.name, reference.prompt);
+        eprintln!(
+            "  generating: {} (model={}, max_tokens={})",
+            reference.name, reference.model, reference.max_tokens
+        );
         let actual = generate_greedy(&engine, &reference.prompt, reference.max_tokens);
         compare_outputs(&reference.name, &reference.expected_text, &actual);
     }

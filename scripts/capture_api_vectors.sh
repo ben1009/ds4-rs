@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/crates/ds4-core/tests/vectors/api"
 
-MODEL="${DS4_API_MODEL:-deepseek-chat}"
+MODEL="${DS4_API_MODEL:-deepseek-v3}"
 BASE_URL="${DS4_API_URL:-https://api.deepseek.com}"
 
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
@@ -79,29 +79,24 @@ save_reference() {
         return 1
     fi
 
-    local text
-    text=$(echo "$response" | jq -r '.choices[0].message.content')
-    local api_model
-    api_model=$(echo "$response" | jq -r '.model')
+    # Pipe response directly through jq to preserve trailing newlines
+    # that command substitution would strip.
+    local text_len
+    text_len=$(echo "$response" | jq -r '.choices[0].message.content // ""' | wc -c)
 
-    if [ -z "$text" ] || [ "$text" = "null" ]; then
+    if [ "$text_len" -eq 0 ]; then
         echo "FAILED: empty response" >&2
         return 1
     fi
 
-    jq -n \
-        --arg prompt "$prompt" \
-        --arg expected_text "$text" \
-        --arg model "$api_model" \
-        --argjson max_tokens "$max_tokens" \
-        '{
-            prompt: $prompt,
-            expected_text: $expected_text,
-            model: $model,
-            max_tokens: $max_tokens
-        }' > "$OUT_DIR/$name.json"
+    echo "$response" | jq '{
+        prompt: "'"${prompt}"'",
+        expected_text: .choices[0].message.content,
+        model: .model,
+        max_tokens: '"${max_tokens}"'
+    }' > "$OUT_DIR/$name.json"
 
-    echo "OK ($(echo "$text" | wc -c) bytes)" >&2
+    echo "OK (${text_len} bytes)" >&2
 }
 
 echo "Model: $MODEL" >&2
