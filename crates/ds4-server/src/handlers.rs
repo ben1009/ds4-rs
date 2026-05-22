@@ -54,9 +54,10 @@ pub async fn openai_chat_completions(
             .into_response();
     }
 
+    let req_id = request_id();
+    let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
+
     if req.stream {
-        let req_id = request_id();
-        let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
         let created = timestamp();
         sse::stream_from_receiver(req_id, model_name, created, rx).into_response()
     } else {
@@ -91,10 +92,10 @@ pub async fn openai_chat_completions(
         }
 
         let response = OpenaiChatResponse {
-            id: request_id(),
+            id: req_id,
             object: "chat.completion".into(),
             created: timestamp(),
-            model: req.model.unwrap_or_else(|| state.model_id.clone()),
+            model: model_name,
             choices: vec![OpenaiChoice {
                 index: 0,
                 message: OpenaiMessage {
