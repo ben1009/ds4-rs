@@ -9,7 +9,7 @@
 #   scripts/capture_api_vectors.sh
 #
 # Optional env:
-#   DS4_API_MODEL   Model ID (default: deepseek-chat)
+#   DS4_API_MODEL   Model ID (default: deepseek-v3)
 #   DS4_API_URL     API base URL (default: https://api.deepseek.com)
 #
 # Output:
@@ -51,7 +51,8 @@ call_api() {
             messages: [{"role": "user", "content": $prompt}],
             temperature: 0,
             max_tokens: $max_tokens,
-            stream: false
+            stream: false,
+            thinking: {type: "disabled"}
         }')
 
     curl -sS --connect-timeout 10 --max-time 60 \
@@ -79,24 +80,34 @@ save_reference() {
         return 1
     fi
 
-    # Pipe response directly through jq to preserve trailing newlines
-    # that command substitution would strip.
-    local text_len
-    text_len=$(echo "$response" | jq -r '.choices[0].message.content // ""' | wc -c)
-
-    if [ "$text_len" -eq 0 ]; then
-        echo "FAILED: empty response" >&2
+    # Check finish reason — reject partial/filter responses
+    local finish_reason
+    finish_reason=$(echo "$response" | jq -r '.choices[0].finish_reason // "unknown"')
+    if [ "$finish_reason" != "stop" ]; then
+        echo "FAILED: finish_reason=$finish_reason (expected 'stop')" >&2
         return 1
     fi
 
-    echo "$response" | jq '{
-        prompt: "'"${prompt}"'",
-        expected_text: .choices[0].message.content,
-        model: .model,
-        max_tokens: '"${max_tokens}"'
-    }' > "$OUT_DIR/$name.json"
+    # Check content length via jq (not wc -c, which counts the trailing newline jq adds)
+    local text_len
+    text_len=$(echo "$response" | jq '(.choices[0].message.content // "") | length')
+    if [ "$text_len" -eq 0 ]; then
+        echo "FAILED: empty response content" >&2
+        return 1
+    fi
 
-    echo "OK (${text_len} bytes)" >&2
+    # Use jq --arg for prompt to avoid shell injection via string interpolation.
+    echo "$response" | jq \
+        --arg prompt "$prompt" \
+        --argjson max_tokens "$max_tokens" \
+        '{
+            prompt: $prompt,
+            expected_text: (.choices[0].message.content // ""),
+            model: .model,
+            max_tokens: $max_tokens
+        }' > "$OUT_DIR/$name.json"
+
+    echo "OK (${text_len} chars)" >&2
 }
 
 echo "Model: $MODEL" >&2
