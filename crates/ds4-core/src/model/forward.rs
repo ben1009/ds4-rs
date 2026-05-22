@@ -115,8 +115,9 @@ pub fn forward_decode(session: &mut Session, engine: &Arc<Engine>) -> Result<Vec
         )?;
         session.last_hidden.copy_from_slice(&s_out_plain);
         // Reuse session.logits buffer to avoid per-token heap allocation.
+        // resize is a no-op after the first call (Vec already sized).
+        // matmul_row in output_head_project fully overwrites, so no fill needed.
         session.logits.resize(config.n_vocab as usize, 0.0);
-        session.logits.fill(0.0);
         output_head_project(
             model,
             config,
