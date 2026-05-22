@@ -36,7 +36,7 @@ impl Default for SpecConfig {
 
 /// Perform one speculative decoding step.
 ///
-/// Returns the accepted tokens (always at least 1). The session state
+/// Returns the number of accepted tokens (always at least 1). The session state
 /// (tokens, pos, logits, KV cache) is updated to reflect all accepted tokens.
 /// The caller should read `session.logits()` for the next-token prediction
 /// after this returns.
@@ -44,20 +44,20 @@ pub fn generate_speculative(
     session: &mut Session,
     engine: &Engine,
     spec_config: &SpecConfig,
-) -> Result<Vec<u32>> {
+) -> Result<usize> {
     let main_token = Session::argmax(session.logits())
         .ok_or_else(|| anyhow::anyhow!("speculative: no logits"))?;
 
     // Check MTP availability.
     if engine.mtp_weights.is_none() || session.mtp_state.is_none() {
         session.eval_token(main_token)?;
-        return Ok(vec![main_token]);
+        return Ok(1);
     }
 
     // Confidence gate: skip speculation if the main model is not confident.
     if !confidence_check(session.logits(), spec_config.mtp_margin) {
         session.eval_token(main_token)?;
-        return Ok(vec![main_token]);
+        return Ok(1);
     }
 
     // === Drafting phase ===
@@ -85,6 +85,7 @@ pub fn generate_speculative(
 
     let draft_result = {
         let s_prev_hidden = &mut session.s_prev_hidden;
+        let s_draft_tokens = &mut session.s_draft_tokens;
 
         draft_tokens(
             &mut mtp_state,
@@ -97,10 +98,11 @@ pub fn generate_speculative(
             main_hidden,
             spec_config.mtp_draft_tokens,
             s_prev_hidden,
+            s_draft_tokens,
         )
     };
-    let drafts = match draft_result {
-        Ok(d) => d,
+    let (n_drafts, total_drafts) = match draft_result {
+        Ok(r) => r,
         Err(e) => {
             // Restore MTP KV cache and mtp_state to session before returning.
             mtp_state.restore_kv();
@@ -114,9 +116,9 @@ pub fn generate_speculative(
     // If no drafts were generated, skip speculation.
     // Keep the MTP KV entry — it's for input_token which is part of the
     // accepted sequence, so the MTP stays in sync with the main model.
-    if drafts.is_empty() {
+    if n_drafts == 0 {
         session.eval_token(main_token)?;
-        return Ok(vec![main_token]);
+        return Ok(1);
     }
 
     // === Verification phase ===
@@ -130,30 +132,32 @@ pub fn generate_speculative(
 
     // Evaluate main_token (always accepted).
     // Use a closure to capture errors and restore KV cache + tokens on failure.
-    let verify_result = (|| -> Result<Vec<u32>> {
+    let verify_result = (|| -> Result<usize> {
         session.eval_token_no_snapshot(main_token)?;
-        let mut accepted = vec![main_token];
+        let mut n_accepted = 1usize;
 
         // Verify draft tokens against the main model's prediction.
         // After evaluating main_token, the session predicts position P+2.
         // Skip drafts[0] because it was already verified equal to main_token
         // (both predict P+1), and the session has already advanced past it.
-        for &draft in drafts.iter().skip(1) {
+        // Access drafts from the scratch buffer via session.
+        for i in 1..n_drafts {
+            let draft = session.s_draft_tokens[i];
             let main_pred = Session::argmax(session.logits())
                 .ok_or_else(|| anyhow::anyhow!("speculative: empty logits during verification"))?;
             if main_pred != draft {
                 break;
             }
             session.eval_token_no_snapshot(draft)?;
-            accepted.push(draft);
+            n_accepted += 1;
         }
 
-        Ok(accepted)
+        Ok(n_accepted)
     })();
 
     // If verification failed, restore main model's KV cache, tokens, and logits.
-    let accepted = match verify_result {
-        Ok(accepted) => accepted,
+    let n_accepted = match verify_result {
+        Ok(n) => n,
         Err(e) => {
             session.restore_kv();
             session.truncate_tokens(tokens_snapshot);
@@ -165,8 +169,6 @@ pub fn generate_speculative(
     // === No rollback needed ===
     // eval_token_no_snapshot is only called for tokens that pass verification,
     // so the KV cache and session tokens are already in the correct state.
-    let n_accepted = accepted.len();
-    let total_drafts = drafts.len();
 
     // === MTP state alignment ===
     {
@@ -192,12 +194,16 @@ pub fn generate_speculative(
         }
     }
 
-    Ok(accepted)
+    Ok(n_accepted)
 }
 
-/// Draft tokens using the MTP model. Returns the draft tokens.
+/// Draft tokens using the MTP model. Writes drafts into `s_draft_tokens`.
 ///
-/// `drafts[0]` is the MTP prediction using the main model's hidden state.
+/// Returns `(n_drafts, total_drafts)` where `n_drafts` is the number of valid
+/// drafts written (0 means "no speculation"), and `total_drafts` is the total
+/// number of MTP forward steps performed (used for KV cache trimming).
+///
+/// `s_draft_tokens[0]` is the MTP prediction using the main model's hidden state.
 /// Subsequent drafts use MTP's own `prev_hidden`.
 ///
 /// Hidden snapshots are stored in `mtp_state.hidden_snapshots_flat` and
@@ -214,13 +220,15 @@ fn draft_tokens(
     main_hidden: &[f32],
     max_drafts: usize,
     s_prev_hidden: &mut [f32],
-) -> Result<Vec<u32>> {
+    s_draft_tokens: &mut Vec<u32>,
+) -> Result<(usize, usize)> {
     let eos = engine.tokenizer.eos_token();
     let max_drafts = max_drafts.min(crate::mtp::MAX_DRAFT_TOKENS);
     let n_embd = engine.config.n_embd as usize;
 
-    // Reset snapshot counter at start of drafting.
+    // Reset snapshot counter and draft buffer at start of drafting.
     mtp_state.reset_hidden_snapshots();
+    s_draft_tokens.clear();
 
     // Draft[0]: MTP embeds input_token (the last token in the sequence at
     // position pos - 1) and predicts the token at position pos.
@@ -236,16 +244,15 @@ fn draft_tokens(
 
     // If draft[0] != main_token, return empty to signal "no speculation".
     if draft0 != main_token {
-        return Ok(vec![]);
+        return Ok((0, 0));
     }
 
-    let mut drafts = Vec::with_capacity(max_drafts);
-    drafts.push(draft0);
+    s_draft_tokens.push(draft0);
     mtp_state.store_hidden_snapshot(n_embd);
 
     // Draft[1..N] using MTP's own prev_hidden.
     for i in 1..max_drafts {
-        let prev_token = *drafts.last().unwrap();
+        let prev_token = *s_draft_tokens.last().unwrap();
         if prev_token == eos {
             break;
         }
@@ -265,7 +272,7 @@ fn draft_tokens(
             s_prev_hidden,
         )?;
 
-        drafts.push(draft);
+        s_draft_tokens.push(draft);
         mtp_state.store_hidden_snapshot(n_embd);
 
         if draft == eos {
@@ -273,7 +280,8 @@ fn draft_tokens(
         }
     }
 
-    Ok(drafts)
+    let n = s_draft_tokens.len();
+    Ok((n, n))
 }
 
 /// Check if the main model is confident enough for speculation.

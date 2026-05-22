@@ -51,6 +51,8 @@ pub struct Session {
     pub(crate) s_prev_hidden: Vec<f32>,
     /// Reusable scratch for snapshotting logits during speculative decoding or prefill.
     pub(crate) logits_snapshot: Vec<f32>,
+    /// Reusable scratch buffer for draft tokens during speculative decoding.
+    pub(crate) s_draft_tokens: Vec<u32>,
     /// Optional MTP state for speculative decoding. Created when the engine
     /// has MTP weights loaded.
     pub(crate) mtp_state: Option<MtpState>,
@@ -96,6 +98,7 @@ impl Session {
             s_out_norm: vec![0.0f32; n_embd],
             s_prev_hidden: vec![0.0f32; n_embd],
             logits_snapshot: vec![0.0f32; n_vocab],
+            s_draft_tokens: Vec::with_capacity(crate::mtp::MAX_DRAFT_TOKENS),
             mtp_state,
         })
     }
@@ -165,7 +168,7 @@ impl Session {
         engine: &Engine,
         spec_config: &SpecConfig,
     ) -> Result<&[f32]> {
-        let _accepted = crate::speculative::generate_speculative(self, engine, spec_config)?;
+        let _n_accepted = crate::speculative::generate_speculative(self, engine, spec_config)?;
         // generate_speculative already updated self.tokens, self.pos, and
         // self.logits via eval_token calls inside it. The accepted tokens
         // are the ones that were evaluated. We just need to return logits.
