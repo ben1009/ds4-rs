@@ -6,7 +6,10 @@ use futures_util::{StreamExt, stream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::types::{GenerationEvent, OpenaiChatChunk, OpenaiChunkChoice, OpenaiDelta};
+use crate::types::{
+    GenerationEvent, OpenaiChatChunk, OpenaiChunkChoice, OpenaiCompletionChunk,
+    OpenaiCompletionChunkChoice, OpenaiDelta,
+};
 
 pub fn stream_from_receiver(
     request_id: String,
@@ -54,9 +57,66 @@ pub fn stream_from_receiver(
                     ]
                 }
                 GenerationEvent::Error(msg) => {
+                    vec![Ok(Event::default().data(
+                        serde_json::json!({"error": {"message": msg, "type": "server_error"}})
+                            .to_string(),
+                    ))]
+                }
+            }
+        })
+        .flat_map(stream::iter);
+
+    Sse::new(stream)
+}
+
+pub fn stream_completions_from_receiver(
+    request_id: String,
+    model: String,
+    created: u64,
+    rx: mpsc::Receiver<GenerationEvent>,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let stream = ReceiverStream::new(rx)
+        .map(move |event| -> Vec<Result<Event, Infallible>> {
+            match event {
+                GenerationEvent::Token(text) => {
+                    let chunk = OpenaiCompletionChunk {
+                        id: request_id.clone(),
+                        object: "text_completion".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![OpenaiCompletionChunkChoice {
+                            index: 0,
+                            text,
+                            finish_reason: None,
+                        }],
+                    };
                     vec![Ok(
-                        Event::default().data(serde_json::json!({"error": msg}).to_string())
+                        Event::default().data(serde_json::to_string(&chunk).unwrap_or_default())
                     )]
+                }
+                GenerationEvent::Done { finish_reason, .. } => {
+                    let chunk = OpenaiCompletionChunk {
+                        id: request_id.clone(),
+                        object: "text_completion".into(),
+                        created,
+                        model: model.clone(),
+                        choices: vec![OpenaiCompletionChunkChoice {
+                            index: 0,
+                            text: String::new(),
+                            finish_reason: Some(finish_reason.into()),
+                        }],
+                    };
+                    vec![
+                        Ok(Event::default()
+                            .data(serde_json::to_string(&chunk).unwrap_or_default())),
+                        Ok(Event::default().data("[DONE]")),
+                    ]
+                }
+                GenerationEvent::Error(msg) => {
+                    vec![Ok(Event::default().data(
+                        serde_json::json!({"error": {"message": msg, "type": "server_error"}})
+                            .to_string(),
+                    ))]
                 }
             }
         })
