@@ -51,8 +51,7 @@ call_api() {
             messages: [{"role": "user", "content": $prompt}],
             temperature: 0,
             max_tokens: $max_tokens,
-            stream: false,
-            thinking: {type: "disabled"}
+            stream: false
         }')
 
     curl -sS --connect-timeout 10 --max-time 60 \

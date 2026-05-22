@@ -80,6 +80,7 @@ fn load_references() -> Vec<Reference> {
         let max_tokens = v["max_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
+            .filter(|&n| n <= 4096)
             .unwrap_or(64);
         let model = v["model"].as_str().unwrap_or("unknown").to_string();
         refs.push(Reference {
