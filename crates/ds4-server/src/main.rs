@@ -46,6 +46,7 @@ struct AppState {
     engine: Arc<Engine>,
     inference: InferenceHandle,
     model_id: String,
+    model_created: u64,
 }
 
 #[tokio::main]
@@ -81,10 +82,18 @@ async fn main() -> Result<()> {
         .unwrap_or("ds4")
         .to_string();
 
+    let model_created = std::fs::metadata(&args.model)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
     let state = AppState {
         engine,
         inference,
         model_id,
+        model_created,
     };
 
     let app = axum::Router::new()
