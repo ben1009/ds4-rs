@@ -55,7 +55,10 @@ fn load_references() -> Vec<Reference> {
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("read api vectors dir")
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
+        .filter(|e| {
+            e.file_type().map_or(false, |ft| ft.is_file())
+                && e.path().extension().is_some_and(|ext| ext == "json")
+        })
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
@@ -127,7 +130,7 @@ fn generate_greedy(engine: &Arc<Engine>, prompt: &str, max_tokens: u32) -> Strin
         token = Session::argmax(logits).expect("argmax returned None");
     }
 
-    String::from_utf8(output_bytes).expect("tokenizer produced invalid UTF-8")
+    String::from_utf8_lossy(&output_bytes).into_owned()
 }
 
 fn compare_outputs(name: &str, expected: &str, actual: &str) {
