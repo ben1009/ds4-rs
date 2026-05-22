@@ -203,7 +203,7 @@ pub async fn openai_models(State(state): State<AppState>) -> Response {
         data: vec![OpenaiModel {
             id: state.model_id.clone(),
             object: "model".into(),
-            created: 0,
+            created: timestamp(),
             owned_by: "ds4".into(),
         }],
     };
