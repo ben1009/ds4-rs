@@ -51,6 +51,9 @@ fn manifest_matches_committed_vectors() {
     // Also catch committed vectors that aren't in the manifest.
     for entry in fs::read_dir(&vectors_dir).unwrap() {
         let e = entry.unwrap();
+        if e.file_type().map_or(true, |ft| ft.is_dir()) {
+            continue;
+        }
         let name = e.file_name().to_string_lossy().into_owned();
         if name == "manifest.toml" {
             continue;

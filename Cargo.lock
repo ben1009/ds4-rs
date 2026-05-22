@@ -304,6 +304,7 @@ dependencies = [
  "anyhow",
  "memmap2",
  "rayon",
+ "serde_json",
  "sha2",
  "tracing",
 ]
