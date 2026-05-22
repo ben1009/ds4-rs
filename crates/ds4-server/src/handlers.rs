@@ -138,9 +138,10 @@ pub async fn openai_completions(
             .into_response();
     }
 
+    let req_id = format!("cmpl-{}", Uuid::new_v4().as_simple());
+    let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
+
     if req.stream {
-        let req_id = format!("cmpl-{}", Uuid::new_v4().as_simple());
-        let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
         let created = timestamp();
         sse::stream_completions_from_receiver(req_id, model_name, created, rx).into_response()
     } else {
@@ -175,10 +176,10 @@ pub async fn openai_completions(
         }
 
         let response = OpenaiCompletionResponse {
-            id: format!("cmpl-{}", Uuid::new_v4().as_simple()),
+            id: req_id,
             object: "text_completion".into(),
             created: timestamp(),
-            model: req.model.unwrap_or_else(|| state.model_id.clone()),
+            model: model_name,
             choices: vec![OpenaiCompletionChoice {
                 index: 0,
                 text,
