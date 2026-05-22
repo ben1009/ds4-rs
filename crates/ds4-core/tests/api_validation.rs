@@ -81,10 +81,7 @@ fn load_references() -> Vec<Reference> {
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
             .unwrap_or(64);
-        let model = v["model"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let model = v["model"].as_str().unwrap_or("unknown").to_string();
         refs.push(Reference {
             name,
             prompt,
