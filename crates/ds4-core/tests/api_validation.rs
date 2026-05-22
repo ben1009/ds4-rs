@@ -73,7 +73,10 @@ fn load_references() -> Vec<Reference> {
             .as_str()
             .expect("expected_text field")
             .to_string();
-        let max_tokens = v["max_tokens"].as_u64().unwrap_or(64) as u32;
+        let max_tokens = v["max_tokens"]
+            .as_u64()
+            .and_then(|n| u32::try_from(n).ok())
+            .unwrap_or(64);
         refs.push(Reference {
             name,
             prompt,
@@ -99,7 +102,12 @@ fn generate_greedy(engine: &Arc<Engine>, prompt: &str, max_tokens: u32) -> Strin
         "tokenizer returned empty tokens for prompt: {prompt:?}"
     );
 
-    let ctx_size = (tokens.len() as u32 + max_tokens + 64).next_power_of_two();
+    let prompt_len = u32::try_from(tokens.len()).expect("prompt too long for u32");
+    let ctx_size = prompt_len
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(64))
+        .and_then(|n| n.checked_next_power_of_two())
+        .expect("requested context size exceeds u32 limits");
     let mut session = Session::new(engine.clone(), ctx_size).expect("Session::new failed");
 
     session.prefill(&tokens).expect("prefill failed");

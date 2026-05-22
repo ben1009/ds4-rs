@@ -94,13 +94,11 @@ save_reference() {
         --arg expected_text "$text" \
         --arg model "$api_model" \
         --argjson max_tokens "$max_tokens" \
-        --arg captured_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         '{
             prompt: $prompt,
             expected_text: $expected_text,
             model: $model,
-            max_tokens: $max_tokens,
-            captured_at: $captured_at
+            max_tokens: $max_tokens
         }' > "$OUT_DIR/$name.json"
 
     echo "OK ($(echo "$text" | wc -c) bytes)" >&2
