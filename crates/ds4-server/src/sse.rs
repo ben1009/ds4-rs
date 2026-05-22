@@ -57,9 +57,10 @@ pub fn stream_from_receiver(
                     ]
                 }
                 GenerationEvent::Error(msg) => {
-                    vec![Ok(
-                        Event::default().data(serde_json::json!({"error": msg}).to_string())
-                    )]
+                    vec![Ok(Event::default().data(
+                        serde_json::json!({"error": {"message": msg, "type": "server_error"}})
+                            .to_string(),
+                    ))]
                 }
             }
         })
@@ -112,9 +113,10 @@ pub fn stream_completions_from_receiver(
                     ]
                 }
                 GenerationEvent::Error(msg) => {
-                    vec![Ok(
-                        Event::default().data(serde_json::json!({"error": msg}).to_string())
-                    )]
+                    vec![Ok(Event::default().data(
+                        serde_json::json!({"error": {"message": msg, "type": "server_error"}})
+                            .to_string(),
+                    ))]
                 }
             }
         })

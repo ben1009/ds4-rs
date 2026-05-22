@@ -56,7 +56,7 @@ pub async fn openai_chat_completions(
 
     if req.stream {
         let req_id = request_id();
-        let model_name = req.model.unwrap_or_else(|| "ds4".into());
+        let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
         let created = timestamp();
         sse::stream_from_receiver(req_id, model_name, created, rx).into_response()
     } else {
@@ -94,7 +94,7 @@ pub async fn openai_chat_completions(
             id: request_id(),
             object: "chat.completion".into(),
             created: timestamp(),
-            model: req.model.unwrap_or_else(|| "ds4".into()),
+            model: req.model.unwrap_or_else(|| state.model_id.clone()),
             choices: vec![OpenaiChoice {
                 index: 0,
                 message: OpenaiMessage {
@@ -140,7 +140,7 @@ pub async fn openai_completions(
 
     if req.stream {
         let req_id = format!("cmpl-{}", Uuid::new_v4().as_simple());
-        let model_name = req.model.unwrap_or_else(|| "ds4".into());
+        let model_name = req.model.unwrap_or_else(|| state.model_id.clone());
         let created = timestamp();
         sse::stream_completions_from_receiver(req_id, model_name, created, rx).into_response()
     } else {
@@ -178,7 +178,7 @@ pub async fn openai_completions(
             id: format!("cmpl-{}", Uuid::new_v4().as_simple()),
             object: "text_completion".into(),
             created: timestamp(),
-            model: req.model.unwrap_or_else(|| "ds4".into()),
+            model: req.model.unwrap_or_else(|| state.model_id.clone()),
             choices: vec![OpenaiCompletionChoice {
                 index: 0,
                 text,
@@ -246,7 +246,7 @@ pub async fn anthropic_messages(
     }
 
     let msg_id = format!("msg_{}", Uuid::new_v4().as_simple());
-    let model = req.model.unwrap_or_else(|| "ds4".into());
+    let model = req.model.unwrap_or_else(|| state.model_id.clone());
 
     if req.stream {
         let stream = async_stream::stream! {
