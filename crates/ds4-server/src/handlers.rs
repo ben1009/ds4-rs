@@ -114,6 +114,102 @@ pub async fn openai_chat_completions(
     }
 }
 
+// ── OpenAI /v1/completions (raw text) ────────────────────────────────────────
+
+pub async fn openai_completions(
+    State(state): State<AppState>,
+    Json(req): Json<OpenaiCompletionRequest>,
+) -> Response {
+    // No chat template — encode the raw prompt with BOS prepended.
+    let prompt_tokens = state.engine.tokenizer.encode(&req.prompt, true);
+
+    let (tx, rx) = mpsc::channel(64);
+    let request = InferenceRequest {
+        prompt_tokens,
+        max_tokens: req.max_tokens,
+        response_tx: tx,
+    };
+
+    if let Err(e) = state.inference.submit(request).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": {"message": e.to_string(), "type": "server_error"}})),
+        )
+            .into_response();
+    }
+
+    if req.stream {
+        let req_id = format!("cmpl-{}", Uuid::new_v4().as_simple());
+        let model_name = req.model.unwrap_or_else(|| "ds4".into());
+        let created = timestamp();
+        sse::stream_completions_from_receiver(req_id, model_name, created, rx).into_response()
+    } else {
+        let mut text = String::new();
+        let mut prompt_tok_count = 0u32;
+        let mut completion_tok_count = 0u32;
+        let mut finish_reason = "stop";
+        let mut stream = rx;
+
+        while let Some(event) = stream.recv().await {
+            match event {
+                GenerationEvent::Token(t) => text.push_str(&t),
+                GenerationEvent::Done {
+                    prompt_tokens,
+                    completion_tokens,
+                    finish_reason: reason,
+                } => {
+                    prompt_tok_count = prompt_tokens;
+                    completion_tok_count = completion_tokens;
+                    finish_reason = reason;
+                }
+                GenerationEvent::Error(msg) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(
+                            serde_json::json!({"error": {"message": msg, "type": "server_error"}}),
+                        ),
+                    )
+                        .into_response();
+                }
+            }
+        }
+
+        let response = OpenaiCompletionResponse {
+            id: format!("cmpl-{}", Uuid::new_v4().as_simple()),
+            object: "text_completion".into(),
+            created: timestamp(),
+            model: req.model.unwrap_or_else(|| "ds4".into()),
+            choices: vec![OpenaiCompletionChoice {
+                index: 0,
+                text,
+                finish_reason: Some(finish_reason.into()),
+            }],
+            usage: OpenaiUsage {
+                prompt_tokens: prompt_tok_count,
+                completion_tokens: completion_tok_count,
+                total_tokens: prompt_tok_count + completion_tok_count,
+            },
+        };
+
+        Json(response).into_response()
+    }
+}
+
+// ── OpenAI /v1/models ────────────────────────────────────────────────────────
+
+pub async fn openai_models(State(state): State<AppState>) -> Response {
+    let response = OpenaiModelList {
+        object: "list".into(),
+        data: vec![OpenaiModel {
+            id: state.model_id.clone(),
+            object: "model".into(),
+            created: 0,
+            owned_by: "ds4".into(),
+        }],
+    };
+    Json(response).into_response()
+}
+
 // ── Anthropic /v1/messages ───────────────────────────────────────────────────
 
 pub async fn anthropic_messages(

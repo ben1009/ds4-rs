@@ -69,6 +69,67 @@ pub struct OpenaiDelta {
     pub content: Option<String>,
 }
 
+// ── OpenAI Completions (raw text) ────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct OpenaiCompletionRequest {
+    pub model: Option<String>,
+    pub prompt: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default)]
+    pub stream: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiCompletionResponse {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<OpenaiCompletionChoice>,
+    pub usage: OpenaiUsage,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiCompletionChoice {
+    pub index: u32,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiCompletionChunk {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub model: String,
+    pub choices: Vec<OpenaiCompletionChunkChoice>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiCompletionChunkChoice {
+    pub index: u32,
+    pub text: String,
+    pub finish_reason: Option<String>,
+}
+
+// ── OpenAI Models ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiModelList {
+    pub object: String,
+    pub data: Vec<OpenaiModel>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenaiModel {
+    pub id: String,
+    pub object: String,
+    pub created: u64,
+    pub owned_by: String,
+}
+
 // ── Anthropic Messages ───────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
@@ -360,5 +421,59 @@ mod tests {
         assert!(format!("{e:?}").contains("Done"));
         let e = GenerationEvent::Error("fail".into());
         assert!(format!("{e:?}").contains("Error"));
+    }
+
+    #[test]
+    fn openai_completion_request_defaults() {
+        let json = r#"{"prompt":"Once upon a time"}"#;
+        let req: OpenaiCompletionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.prompt, "Once upon a time");
+        assert_eq!(req.max_tokens, 512);
+        assert!(!req.stream);
+        assert!(req.model.is_none());
+    }
+
+    #[test]
+    fn openai_completion_response_serializes() {
+        let resp = OpenaiCompletionResponse {
+            id: "cmpl-123".into(),
+            object: "text_completion".into(),
+            created: 1000,
+            model: "ds4".into(),
+            choices: vec![OpenaiCompletionChoice {
+                index: 0,
+                text: "...there was a model.".into(),
+                finish_reason: Some("stop".into()),
+            }],
+            usage: OpenaiUsage {
+                prompt_tokens: 5,
+                completion_tokens: 6,
+                total_tokens: 11,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["object"], "text_completion");
+        assert_eq!(parsed["choices"][0]["text"], "...there was a model.");
+        assert_eq!(parsed["choices"][0]["finish_reason"], "stop");
+        assert_eq!(parsed["usage"]["total_tokens"], 11);
+    }
+
+    #[test]
+    fn openai_model_list_serializes() {
+        let list = OpenaiModelList {
+            object: "list".into(),
+            data: vec![OpenaiModel {
+                id: "ds4flash".into(),
+                object: "model".into(),
+                created: 0,
+                owned_by: "ds4".into(),
+            }],
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["object"], "list");
+        assert_eq!(parsed["data"][0]["id"], "ds4flash");
+        assert_eq!(parsed["data"][0]["owned_by"], "ds4");
     }
 }

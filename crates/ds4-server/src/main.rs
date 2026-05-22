@@ -45,6 +45,7 @@ struct Args {
 struct AppState {
     engine: Arc<Engine>,
     inference: InferenceHandle,
+    model_id: String,
 }
 
 #[tokio::main]
@@ -73,13 +74,29 @@ async fn main() -> Result<()> {
     let (inference, _worker) =
         generation::spawn_worker(engine.clone(), args.kv_cache_dir.clone(), spec_config)?;
 
-    let state = AppState { engine, inference };
+    let model_id = args
+        .model
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("ds4")
+        .to_string();
+
+    let state = AppState {
+        engine,
+        inference,
+        model_id,
+    };
 
     let app = axum::Router::new()
         .route(
             "/v1/chat/completions",
             axum::routing::post(handlers::openai_chat_completions),
         )
+        .route(
+            "/v1/completions",
+            axum::routing::post(handlers::openai_completions),
+        )
+        .route("/v1/models", axum::routing::get(handlers::openai_models))
         .route(
             "/v1/messages",
             axum::routing::post(handlers::anthropic_messages),
