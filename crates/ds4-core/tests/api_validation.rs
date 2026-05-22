@@ -99,7 +99,8 @@ fn apply_chat_template(prompt: &str) -> String {
 /// Generate text from ds4-rs using greedy decoding, up to `max_bytes` of output.
 fn generate_greedy(engine: &Arc<Engine>, prompt: &str, max_tokens: u32) -> String {
     let full_prompt = apply_chat_template(prompt);
-    let tokens = engine.tokenizer.encode(&full_prompt, true);
+    // Template already includes BOS (<｜begin▁of▁sentence｜>), so don't add another.
+    let tokens = engine.tokenizer.encode(&full_prompt, false);
     assert!(
         !tokens.is_empty(),
         "tokenizer returned empty tokens for prompt: {prompt:?}"
