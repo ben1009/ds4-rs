@@ -6,6 +6,8 @@ use crate::{
     engine::Engine,
     model,
     model::kv_cache::{KvCache, KvCacheSnapshot},
+    mtp::MtpState,
+    speculative::SpecConfig,
 };
 
 /// An inference session holding mutable state.
@@ -14,7 +16,7 @@ pub struct Session {
     tokens: Vec<u32>,
     pos: u32,
     ctx_size: u32,
-    logits: Vec<f32>,
+    pub(crate) logits: Vec<f32>,
     kv_cache: KvCache,
     /// Reusable rollback buffer. Sized once at session creation; refilled
     /// by `kv_cache.snapshot_into` on each `eval_token` so a mid-forward
@@ -25,18 +27,57 @@ pub struct Session {
     /// forward pass takes ownership for the duration of one decode step
     /// via `mem::take` and puts it back, avoiding a per-token alloc.
     pub(crate) heads_scratch: Vec<f32>,
+    /// Reusable scratch for attention output `[n_embd]`.
+    pub(crate) attn_out: Vec<f32>,
+    /// Reusable scratch for post-attention HC state `[n_hc * n_embd]`.
+    pub(crate) after_attn_hc: Vec<f32>,
+    /// Reusable scratch for FFN output `[n_embd]`.
+    pub(crate) ffn_out: Vec<f32>,
+    /// Collapsed hidden state from the most recent forward pass.
+    /// `[n_embd]` vector captured after HC reduction but before output norm.
+    /// Used by MTP speculative decoding as the "previous hidden state" input.
+    pub(crate) last_hidden: Vec<f32>,
+    /// Reusable scratch for output head HC reduction `[n_hc * n_embd]`.
+    pub(crate) s_out_flat: Vec<f32>,
+    /// Reusable scratch for output head HC weights `[n_hc]`.
+    pub(crate) s_out_pre: Vec<f32>,
+    /// Reusable scratch for output head HC weights `[n_hc]`.
+    pub(crate) s_out_weights: Vec<f32>,
+    /// Reusable scratch for output head plain hidden state `[n_embd]`.
+    pub(crate) s_out_plain: Vec<f32>,
+    /// Reusable scratch for output head normed hidden state `[n_embd]`.
+    pub(crate) s_out_norm: Vec<f32>,
+    /// Reusable scratch for copying prev_hidden in speculative decoding.
+    pub(crate) s_prev_hidden: Vec<f32>,
+    /// Reusable scratch for snapshotting logits during speculative decoding or prefill.
+    pub(crate) logits_snapshot: Vec<f32>,
+    /// Reusable scratch buffer for draft tokens during speculative decoding.
+    pub(crate) s_draft_tokens: Vec<u32>,
+    /// Optional MTP state for speculative decoding. Created when the engine
+    /// has MTP weights loaded.
+    pub(crate) mtp_state: Option<MtpState>,
 }
 
 impl Session {
     pub fn new(engine: Arc<Engine>, ctx_size: u32) -> Result<Self> {
         tracing::info!("Creating session with ctx_size={ctx_size}");
         let n_vocab = engine.config.n_vocab as usize;
+        let n_embd = engine.config.n_embd as usize;
         let n_layer = engine.config.n_layer as usize;
         let q_dim = (engine.config.n_head as usize)
             .checked_mul(engine.config.head_dim as usize)
             .ok_or_else(|| anyhow::anyhow!("Session: Q dimension overflow"))?;
+        let n_hc = engine.config.n_hc as usize;
+        let hc_dim = n_hc
+            .checked_mul(n_embd)
+            .ok_or_else(|| anyhow::anyhow!("Session: HC dim overflow"))?;
         let kv_cache = KvCache::new(n_layer, ctx_size as usize)?;
         let kv_snapshot = KvCacheSnapshot::with_shape(&kv_cache);
+        let mtp_state = if engine.mtp_weights.is_some() {
+            Some(MtpState::new(&engine.config, ctx_size)?)
+        } else {
+            None
+        };
         Ok(Self {
             engine,
             tokens: Vec::new(),
@@ -46,6 +87,19 @@ impl Session {
             kv_cache,
             kv_snapshot,
             heads_scratch: vec![0.0f32; q_dim],
+            attn_out: vec![0.0f32; n_embd],
+            after_attn_hc: vec![0.0f32; hc_dim],
+            ffn_out: vec![0.0f32; n_embd],
+            last_hidden: vec![0.0f32; n_embd],
+            s_out_flat: vec![0.0f32; hc_dim],
+            s_out_pre: vec![0.0f32; n_hc],
+            s_out_weights: vec![0.0f32; n_hc],
+            s_out_plain: vec![0.0f32; n_embd],
+            s_out_norm: vec![0.0f32; n_embd],
+            s_prev_hidden: vec![0.0f32; n_embd],
+            logits_snapshot: vec![0.0f32; n_vocab],
+            s_draft_tokens: Vec::with_capacity(crate::mtp::MAX_DRAFT_TOKENS),
+            mtp_state,
         })
     }
 
@@ -74,14 +128,14 @@ impl Session {
         // include rows that need to be undone).
         let start_len = self.tokens.len();
         let start_pos = self.pos;
-        let logits_snapshot = self.logits.clone();
+        self.snapshot_logits();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         self.tokens.reserve(tokens.len());
         for &token in tokens {
             if let Err(err) = self.eval_token_inner(token, false) {
                 self.tokens.truncate(start_len);
                 self.pos = start_pos;
-                self.logits = logits_snapshot;
+                self.restore_logits();
                 self.kv_cache.restore(&self.kv_snapshot);
                 return Err(err);
             }
@@ -92,6 +146,33 @@ impl Session {
     /// Evaluate one decode token. Returns logits for the next token.
     pub fn eval_token(&mut self, token: u32) -> Result<&[f32]> {
         self.eval_token_inner(token, true)
+    }
+
+    /// Evaluate one decode token without snapshotting the KV cache first.
+    ///
+    /// Use this during speculative verification where the caller manages its
+    /// own snapshot and must not have `kv_snapshot` overwritten.
+    pub(crate) fn eval_token_no_snapshot(&mut self, token: u32) -> Result<&[f32]> {
+        self.eval_token_inner(token, false)
+    }
+
+    /// Perform one speculative decoding step using the MTP draft model.
+    ///
+    /// Returns logits for the next token after the last accepted one. Multiple
+    /// tokens may be accepted per call; they are appended to `self.tokens`
+    /// and `self.pos` is advanced accordingly.
+    ///
+    /// Falls back to standard single-token `eval_token` if MTP is not loaded.
+    pub fn eval_token_speculative(
+        &mut self,
+        engine: &Engine,
+        spec_config: &SpecConfig,
+    ) -> Result<&[f32]> {
+        let _n_accepted = crate::speculative::generate_speculative(self, engine, spec_config)?;
+        // generate_speculative already updated self.tokens, self.pos, and
+        // self.logits via eval_token calls inside it. The accepted tokens
+        // are the ones that were evaluated. We just need to return logits.
+        Ok(&self.logits)
     }
 
     /// Inner decode step. When `take_snapshot` is true, the KV ring is
@@ -153,6 +234,18 @@ impl Session {
         self.pos = 0;
         self.kv_cache.clear_all();
         self.logits.fill(0.0);
+        if let Some(ref mut mtp) = self.mtp_state {
+            mtp.clear();
+        }
+    }
+
+    /// Truncate the token list to `len` and reset `pos` accordingly.
+    ///
+    /// Used by speculative decoding to undo tokens pushed during verification
+    /// before re-evaluating only the accepted prefix.
+    pub(crate) fn truncate_tokens(&mut self, len: usize) {
+        self.tokens.truncate(len);
+        self.pos = self.tokens.len() as u32;
     }
 
     /// Restore session tokens and position from a loaded cache.
@@ -223,7 +316,7 @@ impl Session {
             .ok_or_else(|| anyhow::anyhow!("recompute_last_logits: session is empty"))?;
         // Snapshot everything before modification for atomic rollback.
         let saved_pos = self.pos;
-        let saved_logits = self.logits.clone();
+        self.snapshot_logits();
         self.kv_cache.snapshot_into(&mut self.kv_snapshot);
         // Pop last token, decrement pos, and rewind KV watermark so
         // eval_token_inner overwrites the last KV row instead of appending.
@@ -238,7 +331,7 @@ impl Session {
             // tokens.len() == saved_len - 1. Push it back.
             self.tokens.push(last);
             self.pos = saved_pos;
-            self.logits = saved_logits;
+            self.restore_logits();
             self.kv_cache.restore(&self.kv_snapshot);
             return Err(err);
         }
@@ -278,6 +371,11 @@ impl Session {
         &self.logits
     }
 
+    /// Collapsed hidden state from the most recent forward pass.
+    pub fn last_hidden(&self) -> &[f32] {
+        &self.last_hidden
+    }
+
     pub fn engine(&self) -> &Engine {
         &self.engine
     }
@@ -288,6 +386,34 @@ impl Session {
 
     pub fn kv_cache_mut(&mut self) -> &mut KvCache {
         &mut self.kv_cache
+    }
+
+    pub fn kv_snapshot(&self) -> &KvCacheSnapshot {
+        &self.kv_snapshot
+    }
+
+    pub fn kv_snapshot_mut(&mut self) -> &mut KvCacheSnapshot {
+        &mut self.kv_snapshot
+    }
+
+    /// Snapshot the KV cache into the reusable rollback buffer.
+    pub fn snapshot_kv(&mut self) {
+        self.kv_cache.snapshot_into(&mut self.kv_snapshot);
+    }
+
+    /// Restore the KV cache from the rollback snapshot.
+    pub fn restore_kv(&mut self) {
+        self.kv_cache.restore(&self.kv_snapshot);
+    }
+
+    /// Snapshot current logits into the reusable rollback buffer.
+    pub fn snapshot_logits(&mut self) {
+        self.logits_snapshot.copy_from_slice(&self.logits);
+    }
+
+    /// Restore logits from the rollback snapshot.
+    pub fn restore_logits(&mut self) {
+        self.logits.copy_from_slice(&self.logits_snapshot);
     }
 }
 

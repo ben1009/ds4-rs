@@ -5,7 +5,7 @@ use std::{
 };
 
 use anyhow::Result;
-use ds4_core::{engine::Engine, model::kv_disk, session::Session};
+use ds4_core::{engine::Engine, model::kv_disk, session::Session, speculative::SpecConfig};
 use tokio::sync::mpsc;
 
 use crate::types::GenerationEvent;
@@ -33,6 +33,7 @@ impl InferenceHandle {
 pub fn spawn_worker(
     engine: Arc<Engine>,
     kv_cache_dir: Option<PathBuf>,
+    spec_config: Option<SpecConfig>,
 ) -> Result<(InferenceHandle, JoinHandle<()>)> {
     let (tx, mut rx) = mpsc::channel::<InferenceRequest>(32);
 
@@ -47,7 +48,13 @@ pub fn spawn_worker(
         };
 
         while let Some(request) = rx.blocking_recv() {
-            let result = process_request(&engine, &mut session, &request, &kv_cache_dir);
+            let result = process_request(
+                &engine,
+                &mut session,
+                &request,
+                &kv_cache_dir,
+                spec_config.as_ref(),
+            );
 
             if let Err(e) = result {
                 let _ = request
@@ -78,6 +85,7 @@ fn process_request(
     session: &mut Session,
     request: &InferenceRequest,
     kv_cache_dir: &Option<PathBuf>,
+    spec_config: Option<&SpecConfig>,
 ) -> Result<()> {
     let eos_token = engine.tokenizer.eos_token();
 
@@ -127,21 +135,63 @@ fn process_request(
             break;
         }
 
-        let text = engine.tokenizer.decode(token).to_string();
-
-        if request
-            .response_tx
-            .blocking_send(GenerationEvent::Token(text))
-            .is_err()
-        {
-            return Ok(()); // client disconnected
+        if let Some(spec) = spec_config {
+            // Speculative decoding: may accept multiple tokens per step.
+            let old_len = session.tokens().len();
+            let next_token = {
+                let logits = session.eval_token_speculative(engine, spec)?;
+                Session::argmax(logits)
+                    .ok_or_else(|| anyhow::anyhow!("speculative returned empty logits"))?
+            };
+            let new_tokens = &session.tokens()[old_len..];
+            for &t in new_tokens {
+                if t == eos_token {
+                    finish_reason = "stop";
+                    let _ = request.response_tx.blocking_send(GenerationEvent::Done {
+                        prompt_tokens: request.prompt_tokens.len() as u32,
+                        completion_tokens,
+                        finish_reason,
+                    });
+                    return Ok(());
+                }
+                if completion_tokens >= request.max_tokens {
+                    finish_reason = "length";
+                    break;
+                }
+                let text = engine.tokenizer.decode(t).to_string();
+                if request
+                    .response_tx
+                    .blocking_send(GenerationEvent::Token(text))
+                    .is_err()
+                {
+                    return Ok(()); // client disconnected
+                }
+                completion_tokens += 1;
+            }
+            token = next_token;
+            if next_token == eos_token {
+                finish_reason = "stop";
+                break;
+            }
+            if completion_tokens >= request.max_tokens {
+                finish_reason = "length";
+                break;
+            }
+        } else {
+            // Standard single-token generation.
+            let text = engine.tokenizer.decode(token).to_string();
+            if request
+                .response_tx
+                .blocking_send(GenerationEvent::Token(text))
+                .is_err()
+            {
+                return Ok(()); // client disconnected
+            }
+            completion_tokens += 1;
+            session.eval_token(token)?;
+            token = Session::argmax(session.logits())
+                .ok_or_else(|| anyhow::anyhow!("no logits after eval"))?;
         }
-
-        completion_tokens += 1;
-
-        session.eval_token(token)?;
-        token = Session::argmax(session.logits())
-            .ok_or_else(|| anyhow::anyhow!("no logits after eval"))?;
     }
 
     let _ = request.response_tx.blocking_send(GenerationEvent::Done {

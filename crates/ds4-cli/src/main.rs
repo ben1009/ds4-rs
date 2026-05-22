@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use ds4_core::{engine::Engine, model::kv_disk, session::Session};
+use ds4_core::{engine::Engine, model::kv_disk, session::Session, speculative::SpecConfig};
 
 /// Split `bytes` into (valid UTF-8 prefix length, invalid-sequence length).
 /// If invalid_len > 0, those bytes should be replaced with U+FFFD and drained
@@ -103,6 +103,18 @@ struct Args {
     /// best match, and only prefills the suffix tokens.
     #[arg(long)]
     kv_cache_dir: Option<PathBuf>,
+
+    /// Path to MTP draft model GGUF (enables speculative decoding)
+    #[arg(long)]
+    mtp: Option<PathBuf>,
+
+    /// Maximum number of MTP draft tokens per step
+    #[arg(long, default_value = "1")]
+    mtp_draft: usize,
+
+    /// Logit margin threshold for MTP confidence gating
+    #[arg(long, default_value = "3.0")]
+    mtp_margin: f32,
 }
 
 fn main() -> Result<()> {
@@ -115,12 +127,33 @@ fn main() -> Result<()> {
 
     let args = Args::parse();
 
-    let engine = Engine::open(&args.model)?;
+    let engine = match &args.mtp {
+        Some(mtp_path) => Engine::open_with_mtp(&args.model, mtp_path)?,
+        None => Engine::open(&args.model)?,
+    };
+
+    let spec_config = args.mtp.as_ref().map(|_| SpecConfig {
+        mtp_draft_tokens: args.mtp_draft,
+        mtp_margin: args.mtp_margin,
+    });
 
     let cache_dir = args.kv_cache_dir.as_deref();
     match args.prompt {
-        Some(prompt) => one_shot(&engine, &prompt, args.max_tokens, args.ctx, cache_dir)?,
-        None => repl(&engine, args.max_tokens, args.ctx, cache_dir)?,
+        Some(prompt) => one_shot(
+            &engine,
+            &prompt,
+            args.max_tokens,
+            args.ctx,
+            cache_dir,
+            spec_config.as_ref(),
+        )?,
+        None => repl(
+            &engine,
+            args.max_tokens,
+            args.ctx,
+            cache_dir,
+            spec_config.as_ref(),
+        )?,
     }
 
     Ok(())
@@ -132,6 +165,7 @@ fn one_shot(
     max_tokens: u32,
     ctx: u32,
     kv_cache_dir: Option<&std::path::Path>,
+    spec_config: Option<&SpecConfig>,
 ) -> Result<()> {
     let tokens = engine.tokenizer.encode(prompt, true);
     tracing::info!("Prompt: {} tokens", tokens.len());
@@ -168,7 +202,7 @@ fn one_shot(
         session.prefill(&suffix)?;
     }
     kvc_auto_save(kv_cache_dir, &session, kv_disk::SaveReason::Cold);
-    generate_turn(engine, &mut session, max_tokens, &mut handle)?;
+    generate_turn(engine, &mut session, max_tokens, &mut handle, spec_config)?;
 
     Ok(())
 }
@@ -255,6 +289,7 @@ fn repl(
     max_tokens: u32,
     ctx: u32,
     kv_cache_dir: Option<&std::path::Path>,
+    spec_config: Option<&SpecConfig>,
 ) -> Result<()> {
     let mut session = Session::new(engine.clone(), ctx)?;
     let stdin = std::io::stdin();
@@ -336,9 +371,13 @@ fn repl(
                                 writeln!(out, "error: {err}")?;
                                 continue;
                             }
-                            if let Err(err) =
-                                generate_turn(engine, &mut session, max_tokens, &mut out)
-                            {
+                            if let Err(err) = generate_turn(
+                                engine,
+                                &mut session,
+                                max_tokens,
+                                &mut out,
+                                spec_config,
+                            ) {
                                 writeln!(out, "error: {err}")?;
                             }
                             continue;
@@ -352,7 +391,9 @@ fn repl(
                     writeln!(out, "error: {err}")?;
                     continue;
                 }
-                if let Err(err) = generate_turn(engine, &mut session, max_tokens, &mut out) {
+                if let Err(err) =
+                    generate_turn(engine, &mut session, max_tokens, &mut out, spec_config)
+                {
                     writeln!(out, "error: {err}")?;
                 }
             }
@@ -374,23 +415,58 @@ fn generate_turn<W: Write>(
     session: &mut Session,
     max_tokens: u32,
     out: &mut W,
+    spec_config: Option<&SpecConfig>,
 ) -> Result<()> {
     let logits = session.logits();
     let mut token = Session::argmax(logits)
         .ok_or_else(|| anyhow::anyhow!("no logits available for generation"))?;
     let eos = engine.tokenizer.eos_token();
     let mut pending: Vec<u8> = Vec::new();
+    let mut generated = 0u32;
 
-    for _ in 0..max_tokens {
+    while generated < max_tokens {
         if token == eos {
             break;
         }
-        engine.tokenizer.append_token_bytes(token, &mut pending);
-        write_utf8(out, &mut pending, false)?;
-        out.flush()?;
-        let logits = session.eval_token(token)?;
-        token = Session::argmax(logits)
-            .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
+
+        if let Some(spec) = spec_config {
+            // Speculative decoding: may accept multiple tokens per step.
+            let old_len = session.tokens().len();
+            let next_token = {
+                let logits = session.eval_token_speculative(engine, spec)?;
+                Session::argmax(logits)
+                    .ok_or_else(|| anyhow::anyhow!("speculative returned empty logits"))?
+            };
+            let new_tokens = &session.tokens()[old_len..];
+            let mut stop = false;
+            for &t in new_tokens {
+                if t == eos {
+                    stop = true;
+                    break;
+                }
+                engine.tokenizer.append_token_bytes(t, &mut pending);
+                write_utf8(out, &mut pending, false)?;
+                generated += 1;
+                if generated >= max_tokens {
+                    stop = true;
+                    break;
+                }
+            }
+            out.flush()?;
+            token = next_token;
+            if stop || next_token == eos || generated >= max_tokens {
+                break;
+            }
+        } else {
+            // Standard single-token generation.
+            engine.tokenizer.append_token_bytes(token, &mut pending);
+            write_utf8(out, &mut pending, false)?;
+            out.flush()?;
+            generated += 1;
+            let logits = session.eval_token(token)?;
+            token = Session::argmax(logits)
+                .ok_or_else(|| anyhow::anyhow!("eval_token returned empty logits"))?;
+        }
     }
     write_utf8(out, &mut pending, true)?;
     writeln!(out)?;
