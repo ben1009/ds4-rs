@@ -120,6 +120,7 @@ impl Engine {
             ("n_kv_head", main.n_kv_head, mtp_cfg.n_kv_head),
             ("q_lora_rank", main.q_lora_rank, mtp_cfg.q_lora_rank),
             ("n_hc", main.n_hc, mtp_cfg.n_hc),
+            ("n_ff", main.n_ff, mtp_cfg.n_ff),
         ];
         for (name, main_val, mtp_val) in checks {
             if main_val != mtp_val {
