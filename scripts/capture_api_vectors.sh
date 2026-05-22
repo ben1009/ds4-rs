@@ -9,7 +9,7 @@
 #   scripts/capture_api_vectors.sh
 #
 # Optional env:
-#   DS4_API_MODEL   Model ID (default: deepseek-chat)
+#   DS4_API_MODEL   Model ID (default: deepseek-v4-flash)
 #   DS4_API_URL     API base URL (default: https://api.deepseek.com)
 #
 # Output:
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/crates/ds4-core/tests/vectors/api"
 
-MODEL="${DS4_API_MODEL:-deepseek-chat}"
+MODEL="${DS4_API_MODEL:-deepseek-v4-flash}"
 BASE_URL="${DS4_API_URL:-https://api.deepseek.com}"
 
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
@@ -51,7 +51,8 @@ call_api() {
             messages: [{"role": "user", "content": $prompt}],
             temperature: 0,
             max_tokens: $max_tokens,
-            stream: false
+            stream: false,
+            thinking: {type: "disabled"}
         }')
 
     curl -sS --connect-timeout 10 --max-time 60 \

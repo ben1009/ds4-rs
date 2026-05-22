@@ -55,11 +55,12 @@ fn load_references() -> Vec<Reference> {
     let mut refs = Vec::new();
     let mut entries: Vec<_> = std::fs::read_dir(&dir)
         .expect("read api vectors dir")
-        .filter_map(|e| e.ok())
         .filter(|e| {
-            e.file_type().is_ok_and(|ft| ft.is_file())
-                && e.path().extension().is_some_and(|ext| ext == "json")
+            e.as_ref()
+                .is_ok_and(|e| e.file_type().is_ok_and(|ft| ft.is_file()))
         })
+        .map(|e| e.expect("read api vectors entry"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .collect();
     entries.sort_by_key(|e| e.file_name());
 
