@@ -61,6 +61,11 @@ pub fn generate_speculative(
     }
 
     // === Drafting phase ===
+    // Parse MTP weights first — if this fails, mtp_state is still in the
+    // session so no cleanup is needed.
+    let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
+    let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
+
     // Take ownership of mtp_state to avoid borrowing session mutably and
     // immutably at the same time. Since mtp_state is taken, session no longer
     // holds a mutable reference, so we can borrow last_hidden immutably and
@@ -68,16 +73,12 @@ pub fn generate_speculative(
     let mut mtp_state = session.mtp_state.take().unwrap();
     let main_hidden = &session.last_hidden;
     let pos = session.pos();
-    // The last token in the sequence (at position pos). MTP embeds this token
-    // and predicts the next position (pos + 1), which is what main_token is.
+    // The last token in the sequence (at position pos - 1). MTP embeds this
+    // token at its position and predicts the next one.
     let input_token = *session
         .tokens()
         .last()
         .ok_or_else(|| anyhow::anyhow!("speculative: session tokens are empty"))?;
-
-    // Parse MTP weights outside the mutable borrow of mtp_state.
-    let mtp_weight_map = engine.mtp_weights.as_ref().unwrap();
-    let mtp_weights = MtpWeights::from_map(mtp_weight_map)?;
 
     // Snapshot MTP KV cache before drafting for atomic rollback on error.
     mtp_state.snapshot_kv();
@@ -221,15 +222,15 @@ fn draft_tokens(
     // Reset snapshot counter at start of drafting.
     mtp_state.reset_hidden_snapshots();
 
-    // Draft[0]: MTP embeds input_token (the last token in the sequence at position pos)
-    // and predicts the next position (pos + 1). main_token is also for pos + 1.
+    // Draft[0]: MTP embeds input_token (the last token in the sequence at
+    // position pos - 1) and predicts the token at position pos.
     let draft0 = mtp_forward(
         mtp_state,
         mtp_weights,
         main_weights,
         engine,
         input_token,
-        pos,
+        pos - 1,
         main_hidden,
     )?;
 
@@ -248,7 +249,7 @@ fn draft_tokens(
         if prev_token == eos {
             break;
         }
-        let draft_pos = pos + i as u32;
+        let draft_pos = pos + i as u32 - 1;
 
         // Copy prev_hidden to scratch buffer before calling mtp_forward,
         // which will overwrite prev_hidden with the new hidden state.
