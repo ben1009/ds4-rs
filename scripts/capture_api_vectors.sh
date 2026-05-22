@@ -9,7 +9,7 @@
 #   scripts/capture_api_vectors.sh
 #
 # Optional env:
-#   DS4_API_MODEL   Model ID (default: deepseek-v3)
+#   DS4_API_MODEL   Model ID (default: deepseek-chat)
 #   DS4_API_URL     API base URL (default: https://api.deepseek.com)
 #
 # Output:
@@ -21,7 +21,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 OUT_DIR="$REPO_ROOT/crates/ds4-core/tests/vectors/api"
 
-MODEL="${DS4_API_MODEL:-deepseek-v3}"
+MODEL="${DS4_API_MODEL:-deepseek-chat}"
 BASE_URL="${DS4_API_URL:-https://api.deepseek.com}"
 
 if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
