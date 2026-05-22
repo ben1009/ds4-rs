@@ -80,8 +80,12 @@ fn load_references() -> Vec<Reference> {
         let max_tokens = v["max_tokens"]
             .as_u64()
             .and_then(|n| u32::try_from(n).ok())
-            .filter(|&n| n <= 4096)
-            .unwrap_or(64);
+            .expect("max_tokens must be a valid u32");
+        assert!(
+            max_tokens <= 4096,
+            "max_tokens {max_tokens} exceeds 4096 limit in {}",
+            path.display()
+        );
         let model = v["model"].as_str().unwrap_or("unknown").to_string();
         refs.push(Reference {
             name,
